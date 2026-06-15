@@ -1,0 +1,28 @@
+=== TPC-C Benchmark Run (subagent) ===
+Date (UTC): 2026-06-15T04:50:30Z
+Results: /Users/vthota/mysql-benchmark/results/tpcc_run_20260615_102030
+
+Step 1 — MySQL connectivity (--ssl-mode=REQUIRED): FAILED
+  ERROR 2005 (HY000): Unknown MySQL server host 'localclusterstring1024-rtvyp.ondbaasdev.com' (8)
+  DNS: nslookup timed out ("connection timed out; no servers could be reached")
+  Shell environment: network sandbox (Limited allowlist only)
+
+Step 2 — cleanup (./run_tpcc.sh cleanup): NOT COMPLETED
+  Script started; exited before sysbench cleanup due to setup_tpcc_ssl.sh:
+  cp: client-key.pem and ssl-certs/client-key.pem are identical (not copied) + set -e
+
+Step 3 — prepare (TPCC_TABLES=1 TPCC_SCALE=10 TPCC_THREADS=4 TPCC_FORCE_PK=1): FAILED
+  Duration: ~0s
+  Did not reach data load (SSL setup exit and/or no DNS)
+  Direct sysbench 1.1 with --mysql-ssl=REQUIRED: FATAL error 2005 Unknown server host
+
+Step 4 — run (TPCC_THREADS=8 TPCC_TIME=300 TPCC_WARMUP=30): NOT EXECUTED (prepare failed)
+
+MySQL version: N/A (could not connect)
+
+Benchmark metrics: N/A
+  TPS, QPS, latency avg/p95/p99, total transactions, errors — not collected
+
+Note: run_tpcc.sh detects SSL mode via grep "DISABLED, PREFERRED, REQUIRED" which does not match sysbench 1.1 help text; it falls back to 1.0 SSL path (--mysql-ssl=on + PEM copy). Recommend fixing detection or using --mysql-ssl=REQUIRED for 1.1.
+
+Full log: full_run.log

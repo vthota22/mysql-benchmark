@@ -1,0 +1,9 @@
+=== sysbench 1.1+ installer ===
+Install prefix: /Users/vthota/mysql-benchmark/sysbench-1.1
+
+--- Checking build dependencies ---
+Installing missing tools via Homebrew: autoconf automake pkg-config
+Warning: packages.arm64_sequoia.jws.json: update failed, falling back to cached version.
+Error: Failure while executing; `/usr/bin/env /opt/homebrew/Library/Homebrew/shims/shared/curl --disable --cookie /dev/null --globoff --user-agent Homebrew/6.0.1\ \(Macintosh\;\ arm64\ Mac\ OS\ X\ 15.7.4\)\ curl/8.7.1 --header Accept-Language:\ en --fail --progress-bar --silent --remote-time --output /Users/vthota/Library/Caches/Homebrew/api/internal/packages.arm64_sequoia.jws.json --location --disable --cookie /dev/null --globoff --show-error --user-agent Homebrew/6.0.1\ \(Macintosh\;\ arm64\ Mac\ OS\ X\ 15.7.4\)\ curl/8.7.1 --header Accept-Language:\ en --fail --progress-bar --silent --compressed --speed-limit 100 --speed-time 5 --write-out \%\{stderr\}HTTP\ status:\ \%\{http_code\} https://formulae.brew.sh/api/internal/packages.arm64_sequoia.jws.json` exited with 28. Here's the output:
+curl: (28) Operation too slow. Less than 100 bytes/sec transferred the last 5 seconds
+HTTP status: 000

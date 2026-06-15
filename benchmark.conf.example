@@ -1,0 +1,40 @@
+# MySQL Standard vs Advanced Edition — benchmark configuration
+# Copy to benchmark.conf and fill in your credentials:
+#   cp benchmark.conf.example benchmark.conf
+
+# --- Standard Edition (DigitalOcean Managed MySQL) ---
+STANDARD_MYSQL_HOST=your-standard-cluster.db.ondigitalocean.com
+STANDARD_MYSQL_PORT=25060
+STANDARD_MYSQL_USER=doadmin
+STANDARD_MYSQL_PASSWORD=CHANGE_ME
+STANDARD_MYSQL_DB=benchmark
+
+# --- Advanced Edition (DigitalOcean Managed MySQL) ---
+ADVANCED_MYSQL_HOST=your-advanced-cluster.db.ondigitalocean.com
+ADVANCED_MYSQL_PORT=25060
+ADVANCED_MYSQL_USER=doadmin
+ADVANCED_MYSQL_PASSWORD=CHANGE_ME
+ADVANCED_MYSQL_DB=benchmark
+
+# --- TPC-C dataset (identical on both editions for fair comparison) ---
+TPCC_TABLES=10
+TPCC_SCALE=100
+TPCC_FORCE_PK=1
+TPCC_TRX_LEVEL=RR
+
+# --- Test matrix ---
+# Thread counts (space-separated)
+THREADS="8 16 32 64"
+# Run durations in seconds: 600=10m, 1200=20m
+DURATIONS="600 1200"
+WARMUP_SEC=60
+PREP_THREADS=16
+TPCC_REPORT_INTERVAL=10
+
+# --- Behavior ---
+# Editions to run: "standard advanced" or just one
+EDITIONS="standard advanced"
+# Drop TPC-C tables after all runs (0=keep, 1=cleanup)
+CLEANUP_AFTER=0
+# Skip prepare if tables already exist (0=always prepare, 1=skip)
+SKIP_PREPARE=0

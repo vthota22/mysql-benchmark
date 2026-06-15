@@ -1,0 +1,21 @@
+=== MySQL OLTP Baseline ===
+Host:     localclusterstring1024-rtvyp.ondbaasdev.com:3306
+Database: defaultdb
+Tables:   10 x 100000 rows
+Warmup:   30s | Run: 120s per thread count
+Run dir:  /Users/vthota/mysql-benchmark/results/run_20260613_214118
+
+--- Connectivity check ---
+WARNING: mysql CLI check failed (sysbench may still work)
+
+--- Preparing dataset (this may take a few minutes) ---
+
+=== Agent connectivity report ===
+Connection: FAILED
+MySQL CLI error: ERROR 2005 (HY000): Unknown MySQL server host 'localclusterstring1024-rtvyp.ondbaasdev.com' (8)
+DNS (host/nslookup): connection timed out; no servers could be reached — hostname did not resolve
+Sysbench prepare: FATAL error 2005: Unknown server host (connection creation failed)
+Benchmark runs: NOT EXECUTED (prepare failed)
+
+Threads  TPS  QPS  Lat_avg  Lat_p95  Lat_p99
+(none — benchmark did not run)

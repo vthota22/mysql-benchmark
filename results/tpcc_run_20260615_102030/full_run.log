@@ -1,0 +1,28 @@
+=== Step 1: MySQL connectivity ===
+2026-06-15T04:50:30Z
+mysql: [Warning] Using a password on the command line interface can be insecure.
+ERROR 2005 (HY000): Unknown MySQL server host 'localclusterstring1024-rtvyp.ondbaasdev.com' (8)
+step1_exit=1
+
+=== Step 2: cleanup ===
+TPC-C dir:  ./TPCC/sysbench-tpcc
+Command:    cleanup
+Tables:     1  Scale (warehouses): 10  Threads: 4
+sysbench:   /Users/vthota/mysql-benchmark/sysbench-1.1/bin/sysbench (v1.1.0-3ceba0b, SSL: 1.0)
+
+Setting up SSL files in: ./TPCC/sysbench-tpcc
+cp: ./TPCC/sysbench-tpcc/client-key.pem and ./ssl-certs/client-key.pem are identical (not copied).
+step2_done (errors ignored)
+
+=== Step 3: prepare ===
+TPC-C dir:  ./TPCC/sysbench-tpcc
+Command:    prepare
+Tables:     1  Scale (warehouses): 10  Threads: 4
+sysbench:   /Users/vthota/mysql-benchmark/sysbench-1.1/bin/sysbench (v1.1.0-3ceba0b, SSL: 1.0)
+
+Setting up SSL files in: ./TPCC/sysbench-tpcc
+cp: ./TPCC/sysbench-tpcc/client-key.pem and ./ssl-certs/client-key.pem are identical (not copied).
+prepare_duration_sec=0
+step3_exit=1
+
+=== Step 4: run (short fallback skipped - prepare failed) ===

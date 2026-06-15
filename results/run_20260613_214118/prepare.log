@@ -1,0 +1,5 @@
+sysbench 1.0.20 (using system LuaJIT 2.1.1727870382)
+
+FATAL: unable to connect to MySQL server on host 'localclusterstring1024-rtvyp.ondbaasdev.com', port 3306, aborting...
+FATAL: error 2005: Unknown server host 'localclusterstring1024-rtvyp.ondbaasdev.com' (8)
+FATAL: `sysbench.cmdline.call_command' function failed: .../Cellar/sysbench/1.0.20_7/share/sysbench/oltp_common.lua:83: connection creation failed
