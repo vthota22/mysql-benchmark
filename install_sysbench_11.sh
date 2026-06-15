@@ -42,7 +42,8 @@ if is_macos; then
     brew install zstd
   fi
 else
-  for cmd in git gcc make autoconf automake libtool pkg-config mysql_config; do
+  # Ubuntu/Debian: libtool package provides libtoolize (not always `libtool` on PATH)
+  for cmd in git gcc make autoconf automake libtoolize pkg-config mysql_config; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       echo "ERROR: Missing '${cmd}'. Run setup_benchmark.sh or:"
       echo "  sudo apt-get install git build-essential autoconf automake libtool pkg-config libmysqlclient-dev libssl-dev luajit libluajit-5.1-dev"
