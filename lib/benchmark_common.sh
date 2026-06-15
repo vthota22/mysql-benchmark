@@ -34,6 +34,8 @@ set_mysql_env_for_edition() {
   export MYSQL_USER="${!user_var:?Set ${user_var} in config}"
   export MYSQL_PASSWORD="${!pass_var:?Set ${pass_var} in config}"
   export MYSQL_DB="${!db_var:?Set ${db_var} in config}"
+
+  build_mysql_base_opts
 }
 
 mysql_connectivity_check() {
@@ -62,6 +64,8 @@ tpcc_dir() {
 run_tpcc_command() {
   local command="${1:?prepare|run|check|cleanup}"
   shift
+
+  build_mysql_base_opts
 
   local tpcc
   tpcc="$(tpcc_dir)"
