@@ -38,3 +38,15 @@ EDITIONS="standard advanced"
 CLEANUP_AFTER=0
 # Skip prepare if tables already exist (0=always prepare, 1=skip)
 SKIP_PREPARE=0
+
+# --- MySQL server settings audit (fair comparison) ---
+# Run settings comparison before benchmark (1=yes, 0=skip)
+MYSQL_SETTINGS_CHECK=1
+# Fail benchmark if Standard and Advanced settings differ (0=warn only, 1=abort)
+MYSQL_FAIL_ON_SETTINGS_MISMATCH=0
+# Variables to capture from both clusters (space-separated)
+# Align these in DigitalOcean cluster settings before benchmarking.
+MYSQL_VARS="version version_comment innodb_buffer_pool_size innodb_buffer_pool_instances innodb_log_file_size innodb_flush_log_at_trx_commit innodb_io_capacity innodb_io_capacity_max innodb_read_io_threads innodb_write_io_threads max_connections sql_require_primary_key transaction_isolation binlog_format sync_binlog character_set_server collation_server"
+# Optional: document your intended cluster config (informational — set in DO control panel)
+# MYSQL_CLUSTER_PLAN="db-s-4vcpu-8gb"
+# MYSQL_NOTES="Buffer pool and CPU/RAM must match between Standard and Advanced clusters"

@@ -39,6 +39,10 @@ echo "Dataset:  tables=${TPCC_TABLES:-10} scale=${TPCC_SCALE:-100} force_pk=${TP
 echo "Matrix:   threads=[${THREADS}] durations=[${DURATIONS}] warmup=${WARMUP_SEC:-60}s"
 echo ""
 
+if [[ "${MYSQL_SETTINGS_CHECK:-1}" == "1" ]]; then
+  run_mysql_settings_check "${RESULTS_DIR}"
+fi
+
 echo "edition,threads,duration_sec,tps,qps,lat_avg,lat_p95,lat_p99,tx_total,errors,reconnects" > "${CSV}"
 
 run_edition() {
