@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # One-time setup for MySQL Standard vs Advanced benchmarking on Ubuntu DO droplet
-# Installs: sysbench 1.1+, sysbench-tpcc, mysql client, build deps
+# Installs: sysbench 1.1+, sysbench-tpcc, mysql client, doctl, build deps
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PREFIX="${SYSBENCH_PREFIX:-${SCRIPT_DIR}/sysbench-1.1}"
 TPCC_DIR="${TPCC_DIR:-${SCRIPT_DIR}/TPCC/sysbench-tpcc}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+DOCTL_VERSION="${DOCTL_VERSION:-1.118.0}"
 
 echo "=== MySQL Benchmark Setup ==="
 echo "Install dir: ${SCRIPT_DIR}"
@@ -32,7 +33,7 @@ install_deps_linux() {
   echo "--- Installing build dependencies (apt) ---"
   sudo apt-get update -qq
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    git build-essential autoconf automake libtool pkg-config \
+    git curl build-essential autoconf automake libtool pkg-config \
     libmysqlclient-dev libssl-dev luajit libluajit-5.1-dev \
     mysql-client openssl ca-certificates
 }
@@ -46,6 +47,49 @@ install_deps_macos() {
   if [[ ${#missing[@]} -gt 0 ]]; then
     brew install automake libtool pkgconf autoconf luajit openssl mysql-client
   fi
+}
+
+doctl_arch_suffix() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *)
+      echo "ERROR: unsupported architecture for doctl: $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+}
+
+install_doctl() {
+  if command -v doctl >/dev/null 2>&1; then
+    echo "--- doctl already installed: $(doctl version) ---"
+    return 0
+  fi
+
+  echo "--- Installing doctl ${DOCTL_VERSION} ---"
+  case "${OS}" in
+    ubuntu|debian|linux)
+      local arch suffix tmpdir
+      arch="$(doctl_arch_suffix)"
+      suffix="linux-${arch}"
+      tmpdir="$(mktemp -d)"
+      curl -fsSL \
+        "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-${suffix}.tar.gz" \
+        -o "${tmpdir}/doctl.tar.gz"
+      tar -xzf "${tmpdir}/doctl.tar.gz" -C "${tmpdir}"
+      sudo install -m 755 "${tmpdir}/doctl" /usr/local/bin/doctl
+      rm -rf "${tmpdir}"
+      ;;
+    macos)
+      brew install doctl
+      ;;
+    *)
+      echo "WARNING: skipping doctl install on unknown OS '${OS}'"
+      return 0
+      ;;
+  esac
+
+  doctl version
 }
 
 case "${OS}" in
@@ -82,11 +126,16 @@ if [[ ! -f "${TPCC_DIR}/tpcc.lua" ]]; then
 fi
 
 echo ""
+install_doctl
+
+echo ""
 echo "--- Verification ---"
 export PATH="${PREFIX}/bin:${PATH}"
 sysbench --version
 echo ""
 sysbench --help 2>&1 | grep -E 'mysql-ssl|mysql-host' | head -5 || true
+echo ""
+command -v doctl >/dev/null 2>&1 && doctl version || echo "doctl: not installed"
 echo ""
 ls -la "${TPCC_DIR}/tpcc.lua"
 
@@ -94,8 +143,8 @@ echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "Next steps:"
-echo "  1. cp ${SCRIPT_DIR}/benchmark.conf.example ${SCRIPT_DIR}/benchmark.conf"
-echo "  2. Edit benchmark.conf with Standard & Advanced DB credentials"
-echo "  3. export PATH=\"${PREFIX}/bin:\$PATH\""
-echo "  4. ${SCRIPT_DIR}/run_standard_vs_advanced.sh"
+echo "  1. export PATH=\"${PREFIX}/bin:\$PATH\""
+echo "  2. Standard vs Advanced: cp benchmark.conf.example benchmark.conf && ./run_standard_vs_advanced.sh"
+echo "  3. Scaling benchmark:   cp scaling-benchmarking/benchmark.conf.example scaling-benchmarking/benchmark.conf"
+echo "     Edit DO_API_TOKEN + CLUSTER_ID, then: cd scaling-benchmarking && ./run_benchmark.sh"
 echo ""
