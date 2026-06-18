@@ -1,0 +1,4 @@
+--- standard connectivity ---
+version	hostname	require_pk
+8.4.8	db-mysql-nyc3-58008-1	1
+standard: connection OK

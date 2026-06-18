@@ -1,0 +1,4 @@
+--- advanced connectivity ---
+version	hostname	require_pk
+8.4.8-8	db-adv-mysql-nyc3-93171-mysql-0	1
+advanced: connection OK

@@ -1,0 +1,17 @@
+edition,threads,duration_sec,tps,qps,lat_avg,lat_p95,lat_p99,tx_total,errors,reconnects
+standard,8,600,291.59,8287.48,27.43,73.13,N/A,N/A,errors:,0
+standard,8,1200,312.95,8879.50,25.56,66.84,N/A,N/A,errors:,0
+standard,16,600,429.19,12190.92,37.27,101.13,N/A,N/A,errors:,0
+standard,16,1200,448.22,12726.82,35.69,94.10,N/A,N/A,errors:,0
+standard,32,600,391.63,11157.17,81.71,200.47,N/A,N/A,errors:,0
+standard,32,1200,424.83,12079.04,75.32,183.21,N/A,N/A,errors:,0
+standard,64,600,417.94,11851.71,153.07,369.77,N/A,N/A,errors:,0
+standard,64,1200,414.92,11790.55,154.22,369.77,N/A,N/A,errors:,0
+advanced,8,600,70.57,2001.76,113.37,303.33,N/A,N/A,errors:,0
+advanced,8,1200,74.62,2115.85,107.20,287.38,N/A,N/A,errors:,0
+advanced,16,600,85.60,2445.16,186.91,530.08,N/A,N/A,errors:,0
+advanced,16,1200,80.19,2272.58,199.50,539.71,N/A,N/A,errors:,0
+advanced,32,600,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A
+advanced,32,1200,82.53,2360.59,387.70,1149.76,N/A,N/A,errors:,0
+advanced,64,600,80.62,2292.51,794.55,2045.74,N/A,N/A,errors:,0
+advanced,64,1200,79.28,2251.26,807.42,2120.76,N/A,N/A,errors:,0

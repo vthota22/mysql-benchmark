@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# Failover benchmark: continuous TPC-C load, trigger failover mid-run, capture RTO metrics.
+#
+# Usage:
+#   cp benchmark.conf.example benchmark.conf   # fill in credentials + failover settings
+#   ./run_failover_benchmark.sh
+#
+# Optional:
+#   BENCHMARK_CONF=/path/to/benchmark.conf ./run_failover_benchmark.sh
+#   FAILOVER_EDITIONS="advanced" ./run_failover_benchmark.sh   # single edition
+#
+# Run inside tmux/nohup on the benchmark droplet — total runtime ~20 min per edition.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CONFIG="${BENCHMARK_CONF:-${SCRIPT_DIR}/benchmark.conf}"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+RESULTS_ROOT="${SCRIPT_DIR}/results/failover_${TIMESTAMP}"
+FULL_LOG="${RESULTS_ROOT}/full_run.log"
+
+export PATH="${SCRIPT_DIR}/sysbench-1.1/bin:${PATH}"
+
+# shellcheck source=lib/failover_common.sh
+source "${SCRIPT_DIR}/lib/failover_common.sh"
+load_benchmark_config "${CONFIG}"
+failover_defaults
+
+mkdir -p "${RESULTS_ROOT}"
+exec > >(tee -a "${FULL_LOG}") 2>&1
+
+echo "=== MySQL Failover Benchmark (TPC-C under load) ==="
+echo "Started:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "Results:  ${RESULTS_ROOT}"
+echo "Config:   ${CONFIG}"
+echo "Sysbench: $("${SCRIPT_DIR}/which_sysbench.sh")"
+echo ""
+echo "Load:     threads=${FAILOVER_THREADS} report-interval=${FAILOVER_REPORT_INTERVAL}s"
+echo "Timeline: warmup=${FAILOVER_WARMUP_SEC}s + baseline=${FAILOVER_BASELINE_SEC}s + observe=${FAILOVER_OBSERVE_SEC}s"
+echo "          trigger at second $(failover_trigger_second) | total=$(failover_total_runtime_sec)s"
+echo "Editions: ${FAILOVER_EDITIONS}"
+echo ""
+
+run_failover_edition() {
+  local edition="${1:?edition required}"
+  local edition_dir="${RESULTS_ROOT}/${edition}"
+  mkdir -p "${edition_dir}"
+
+  echo ""
+  echo "========================================"
+  echo " Failover test: ${edition}"
+  echo "========================================"
+  echo ""
+
+  export FAILOVER_EDITION="${edition}"
+  set_mysql_env_for_edition "${edition}"
+
+  export TPCC_TABLES="${TPCC_TABLES:-10}"
+  export TPCC_SCALE="${TPCC_SCALE:-100}"
+  export TPCC_FORCE_PK="${TPCC_FORCE_PK:-1}"
+  export TPCC_TRX_LEVEL="${TPCC_TRX_LEVEL:-RR}"
+
+  echo "Host: ${MYSQL_HOST}:${MYSQL_PORT}  DB: ${MYSQL_DB}"
+  echo "Trigger: $(
+    if [[ "${edition}" == "standard" ]]; then
+      echo "${FAILOVER_STANDARD_TRIGGER_METHOD:-install_update}"
+    else
+      echo "kubectl_delete_pod"
+    fi
+  )"
+  echo ""
+
+  mysql_connectivity_check "${edition}" "${edition_dir}/mysql_info.txt" \
+    || { echo "Aborting ${edition}: cannot connect"; return 1; }
+  echo ""
+
+  if [[ "${SKIP_PREPARE:-0}" != "1" ]]; then
+    echo "--- Prepare TPC-C data (threads=${PREP_THREADS:-16}) ---"
+    export TPCC_THREADS="${PREP_THREADS:-16}"
+    run_tpcc_command cleanup 2>&1 | tee "${edition_dir}/cleanup_before.log" || true
+    run_tpcc_command prepare 2>&1 | tee "${edition_dir}/prepare.log"
+    echo ""
+  else
+    echo "--- Skipping prepare (SKIP_PREPARE=1) ---"
+    echo ""
+  fi
+
+  if [[ "${FAILOVER_MONITOR_HOSTNAME:-0}" == "1" ]]; then
+    echo "--- Starting hostname monitor (FAILOVER_MONITOR_HOSTNAME=1) ---"
+    start_primary_monitor "${edition_dir}"
+  fi
+
+  echo "--- Starting continuous TPC-C load ---"
+  run_tpcc_failover_load "${edition_dir}"
+
+  if ! wait_for_sysbench_start "${edition_dir}" 180; then
+    [[ "${FAILOVER_MONITOR_HOSTNAME:-0}" == "1" ]] && stop_primary_monitor "${edition_dir}"
+    stop_sysbench_load "${edition_dir}"
+    return 1
+  fi
+
+  echo "--- Baseline load period, then failover trigger ---"
+  sleep_until_failover_trigger
+
+  echo "--- Triggering failover ---"
+  BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${edition_dir}" \
+    2>&1 | tee "${edition_dir}/failover_trigger.log"
+
+  echo "--- Observing recovery for ${FAILOVER_OBSERVE_SEC}s ---"
+  sleep "${FAILOVER_OBSERVE_SEC}"
+
+  echo "--- Stopping load ---"
+  stop_sysbench_load "${edition_dir}"
+  [[ "${FAILOVER_MONITOR_HOSTNAME:-0}" == "1" ]] && stop_primary_monitor "${edition_dir}"
+
+  echo "--- Analyzing failover metrics ---"
+  analyze_failover_metrics "${edition_dir}"
+
+  echo ""
+  echo "${edition}: failover benchmark complete"
+  echo "  Analysis:   ${edition_dir}/failover_analysis.txt"
+  echo "  Metrics:    ${edition_dir}/failover_metrics.csv"
+  echo "  Time series:${edition_dir}/failover_timeseries.csv"
+  echo "  Graphs:     ${edition_dir}/graphs/"
+}
+
+FAILED=0
+for edition in ${FAILOVER_EDITIONS}; do
+  if ! run_failover_edition "${edition}"; then
+    FAILED=$((FAILED + 1))
+  fi
+done
+
+echo ""
+echo "--- Failover comparison report ---"
+write_failover_comparison "${RESULTS_ROOT}"
+generate_failover_graphs "${RESULTS_ROOT}"
+
+echo "${RESULTS_ROOT}" > "${SCRIPT_DIR}/results/LATEST_FAILOVER.txt"
+
+echo ""
+echo "=== Failover benchmark complete ==="
+echo "Results:   ${RESULTS_ROOT}"
+echo "Summary:   ${RESULTS_ROOT}/failover_comparison.txt"
+echo "Full log:  ${FULL_LOG}"
+
+if [[ "${FAILED}" -gt 0 ]]; then
+  echo ""
+  echo "WARNING: ${FAILED} edition(s) failed"
+  exit 1
+fi

@@ -1,0 +1,36 @@
+=== MySQL Standard vs Advanced — TPC-C Comparison ===
+Generated: 2026-06-16T01:08:04Z
+
+Edition     Threads   Duration          TPS          QPS      Lat_avg      Lat_p95   Errors
+--------------------------------------------------------------------------------
+standard          8       600s       291.59      8287.48        27.43        73.13  errors:
+standard          8      1200s       312.95      8879.50        25.56        66.84  errors:
+standard         16       600s       429.19     12190.92        37.27       101.13  errors:
+standard         16      1200s       448.22     12726.82        35.69        94.10  errors:
+standard         32       600s       391.63     11157.17        81.71       200.47  errors:
+standard         32      1200s       424.83     12079.04        75.32       183.21  errors:
+standard         64       600s       417.94     11851.71       153.07       369.77  errors:
+standard         64      1200s       414.92     11790.55       154.22       369.77  errors:
+advanced          8       600s        70.57      2001.76       113.37       303.33  errors:
+advanced          8      1200s        74.62      2115.85       107.20       287.38  errors:
+advanced         16       600s        85.60      2445.16       186.91       530.08  errors:
+advanced         16      1200s        80.19      2272.58       199.50       539.71  errors:
+advanced         32       600s          N/A          N/A          N/A          N/A      N/A
+advanced         32      1200s        82.53      2360.59       387.70      1149.76  errors:
+advanced         64       600s        80.62      2292.51       794.55      2045.74  errors:
+advanced         64      1200s        79.28      2251.26       807.42      2120.76  errors:
+
+--- Head-to-head (same threads + duration) ---
+
+Threads  Duration     Standard TPS   Advanced TPS       Winner
+----------------------------------------------------------------
+8        600s               291.59          70.57     Standard
+8        1200s              312.95          74.62     Standard
+16       600s               429.19          85.60     Standard
+16       1200s              448.22          80.19     Standard
+32       600s               391.63            N/A          N/A
+32       1200s              424.83          82.53     Standard
+64       600s               417.94          80.62     Standard
+64       1200s              414.92          79.28     Standard
+
+Full CSV: /root/mysql-benchmark/results/comparison_20260615_181254/comparison.csv

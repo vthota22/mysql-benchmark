@@ -1,0 +1,33 @@
+=== MySQL Server Settings — Standard vs Advanced ===
+Generated: 2026-06-16T03:59:13Z
+
+NOTE: sysbench does NOT configure these values. They come from each
+DigitalOcean Managed MySQL cluster. Align cluster size and parameters
+in the DO control panel before benchmarking for a fair comparison.
+
+
+Variable                                 Standard                            Advanced                            Match
+----------------------------------------------------------------------------------------------------------------
+version                                                                                                          OK
+version_comment                                                                                                  OK
+innodb_buffer_pool_size                                                                                          OK
+innodb_buffer_pool_instances                                                                                     OK
+innodb_log_file_size                                                                                             OK
+innodb_flush_log_at_trx_commit                                                                                   OK
+innodb_io_capacity                                                                                               OK
+innodb_io_capacity_max                                                                                           OK
+innodb_read_io_threads                                                                                           OK
+innodb_write_io_threads                                                                                          OK
+max_connections                                                                                                  OK
+sql_require_primary_key                                                                                          OK
+transaction_isolation                                                                                            OK
+binlog_format                                                                                                    OK
+sync_binlog                                                                                                      OK
+character_set_server                                                                                             OK
+collation_server                                                                                                 OK
+
+All captured settings match between Standard and Advanced.
+
+Raw dumps:
+  /root/mysql-benchmark/results/settings_check_20260616_035913/standard_mysql_variables.tsv
+  /root/mysql-benchmark/results/settings_check_20260616_035913/advanced_mysql_variables.tsv
