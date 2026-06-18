@@ -1,0 +1,56 @@
+# scaling-benchmarking — sysbench TPC-C under load while scaling
+# Copy and edit:
+#   cp benchmark.conf.example benchmark.conf
+
+# MySQL engine edition for this run (standard or advanced).
+ENGINE="standard"
+
+# --- MySQL connection ---
+MYSQL_HOST="your-cluster.db.ondigitalocean.com"
+MYSQL_PORT=25060
+MYSQL_USER="doadmin"
+MYSQL_PASSWORD="CHANGE_ME"
+MYSQL_DB="sbtest_tpcc"
+
+# --- Sysbench TPC-C ---
+TPCC_SCALE=10
+TPCC_TABLES=10
+TPCC_THREADS=16
+TPCC_PREP_THREADS=16
+TPCC_WARMUP_SEC=30
+TPCC_REPORT_INTERVAL=1
+TPCC_FORCE_PK=1
+TPCC_TRX_LEVEL=RR
+
+# 1 = skip prepare when TPC-C tables already exist; 0 = drop DB and reload dataset
+SKIP_PREPARE=0
+
+# Total TPC-C run duration (seconds, including warmup). Workload is independent of scaling.
+TPCC_MAX_TIME=3600
+
+# --- Scaling trigger ---
+# Seconds after TPC-C run starts (including warmup) before cluster resize fires.
+SCALE_TRIGGER_DELAY=180
+
+# Cluster resize — always uses production API (not stage2 / internal doctl).
+# Create DO_API_TOKEN at https://cloud.digitalocean.com/account/api/tokens (read+write).
+# Verify before running:
+#   doctl -u https://api.digitalocean.com -t "$DO_API_TOKEN" databases get "$CLUSTER_ID"
+# SCALE_TARGET_SIZE must be a valid slug for your engine (e.g. gd-8vcpu-32gb for MySQL).
+# Poll waits until status=online and size slug match; also checks num_nodes / storage only when non-empty below.
+# Leave SCALE_NUM_NODES empty to keep current node count (passed to API unchanged, not polled).
+# Leave SCALE_STORAGE_SIZE_MIB empty to skip storage resize (not passed, not polled).
+# Validate slugs: doctl -u https://api.digitalocean.com -t "$DO_API_TOKEN" databases options slugs --engine mysql
+CLUSTER_ID="your-cluster-uuid"
+SCALE_TARGET_SIZE="gd-8vcpu-32gb"
+SCALE_NUM_NODES=
+SCALE_STORAGE_SIZE_MIB=
+SCALE_POLL_INTERVAL_SEC=10
+SCALE_POLL_TIMEOUT_SEC=1800
+
+DO_API_TOKEN=
+DO_API_URL="https://api.digitalocean.com"
+
+# --- Output ---
+# Each run creates results/run_YYYYMMDD_HHMMSS_<engine>/ with all logs, CSVs, and a copy of benchmark.conf.
+RESULTS_DIR="results"

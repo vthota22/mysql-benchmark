@@ -1,0 +1,6 @@
+scripts/.venv/
+benchmark.conf
+scaling-benchmarking/benchmark.conf
+scaling-benchmarking/results/
+scaling-benchmarking/logs/
+secrets/
