@@ -41,12 +41,20 @@ else
   "${_SYSBENCH_OPTS_DIR}/setup_sysbench_ssl.sh" >/dev/null
 fi
 
+_sysbench_bin_invocation() {
+  if [[ "${SYSBENCH_LINE_BUFFER:-0}" == "1" ]] && command -v stdbuf >/dev/null 2>&1; then
+    stdbuf -oL -eL "${SYSBENCH_BIN}" "$@"
+  else
+    "${SYSBENCH_BIN}" "$@"
+  fi
+}
+
 run_sysbench() {
   build_mysql_base_opts
   if [[ "${SYSBENCH_SSL_MODE}" == "1.0" ]]; then
-    (cd "${SSL_DIR}" && "${SYSBENCH_BIN}" "$@")
+    (cd "${SSL_DIR}" && _sysbench_bin_invocation "$@")
   else
-    "${SYSBENCH_BIN}" "$@"
+    _sysbench_bin_invocation "$@"
   fi
 }
 
@@ -58,7 +66,7 @@ run_sysbench_tpcc() {
   if [[ "${SYSBENCH_SSL_MODE}" == "1.0" ]]; then
     "${_SYSBENCH_OPTS_DIR}/setup_tpcc_ssl.sh" "${tpcc_dir}"
   fi
-  (cd "${tpcc_dir}" && "${SYSBENCH_BIN}" tpcc.lua "$@")
+  (cd "${tpcc_dir}" && _sysbench_bin_invocation tpcc.lua "$@")
 }
 
 # Auto-build when sourced by single-DB scripts that already export MYSQL_*

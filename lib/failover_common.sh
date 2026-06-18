@@ -35,6 +35,25 @@ failover_trigger_second() {
   echo $((FAILOVER_WARMUP_SEC + FAILOVER_BASELINE_SEC))
 }
 
+_failover_tee_linebuffer() {
+  if command -v stdbuf >/dev/null 2>&1; then
+    stdbuf -oL -eL tee "$@"
+  else
+    tee "$@"
+  fi
+}
+
+_failover_kill_process_tree() {
+  local pid="${1:?pid required}"
+  local signal="${2:-INT}"
+  local child
+
+  for child in $(pgrep -P "${pid}" 2>/dev/null || true); do
+    _failover_kill_process_tree "${child}" "${signal}"
+  done
+  kill "-${signal}" "${pid}" 2>/dev/null || true
+}
+
 mysql_cli() {
   mysql -h "${MYSQL_HOST}" -P "${MYSQL_PORT}" -u "${MYSQL_USER}" -p"${MYSQL_PASSWORD}" \
     --ssl-mode=REQUIRED "${MYSQL_DB}" "$@"
@@ -98,12 +117,17 @@ run_tpcc_failover_load() {
   echo "FAILOVER_TRIGGER_SECOND=$(failover_trigger_second)" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_TOTAL_SEC=${total_time}" >> "${results_dir}/sysbench_timing.txt"
 
-  (
-    run_tpcc_command run 2>&1 | tee "${log_file}"
-  ) &
+  : > "${log_file}"
 
-  echo $! > "${pid_file}"
-  echo "Sysbench TPC-C started (pid=$(cat "${pid_file}"), time=${total_time}s, report-interval=${FAILOVER_REPORT_INTERVAL}s)"
+  # Foreground load job (not a wrapper subshell) so $! is the sysbench driver process.
+  # Line-buffer sysbench + tee so wait_for_sysbench_start sees log lines immediately.
+  export SYSBENCH_LINE_BUFFER=1
+  run_tpcc_command run > >(_failover_tee_linebuffer "${log_file}") 2>&1 &
+  local load_pid=$!
+  unset SYSBENCH_LINE_BUFFER
+
+  echo "${load_pid}" > "${pid_file}"
+  echo "Sysbench TPC-C started (pid=${load_pid}, time=${total_time}s, report-interval=${FAILOVER_REPORT_INTERVAL}s)"
 }
 
 stop_sysbench_load() {
@@ -114,13 +138,13 @@ stop_sysbench_load() {
     local pid
     pid=$(cat "${pid_file}")
     if kill -0 "${pid}" 2>/dev/null; then
-      kill -INT "${pid}" 2>/dev/null || true
+      _failover_kill_process_tree "${pid}" INT
       local i
       for i in $(seq 1 30); do
         kill -0 "${pid}" 2>/dev/null || break
         sleep 1
       done
-      kill -KILL "${pid}" 2>/dev/null || true
+      _failover_kill_process_tree "${pid}" KILL
       wait "${pid}" 2>/dev/null || true
     fi
     rm -f "${pid_file}"
@@ -131,16 +155,25 @@ stop_sysbench_load() {
 wait_for_sysbench_start() {
   local results_dir="${1:?results dir required}"
   local log_file="${results_dir}/sysbench_run.log"
+  local pid_file="${results_dir}/sysbench.pid"
   local timeout="${2:-120}"
   local i
 
   for i in $(seq 1 "${timeout}"); do
-    if [[ -f "${log_file}" ]] && grep -qE '^\[[[:space:]]*[0-9]+s \]' "${log_file}"; then
+    if [[ -f "${pid_file}" ]]; then
+      local pid
+      pid=$(cat "${pid_file}")
+      if ! kill -0 "${pid}" 2>/dev/null; then
+        echo "ERROR: sysbench process (pid=${pid}) exited before load started — see ${log_file}" >&2
+        return 1
+      fi
+    fi
+    if [[ -f "${log_file}" ]] && grep -qE 'Threads started!|^\[[[:space:]]*[0-9]+s \]' "${log_file}"; then
       return 0
     fi
     sleep 1
   done
-  echo "ERROR: sysbench did not produce interval output within ${timeout}s" >&2
+  echo "ERROR: sysbench did not reach running state within ${timeout}s — see ${log_file}" >&2
   return 1
 }
 
