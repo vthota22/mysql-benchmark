@@ -131,6 +131,7 @@ run_failover_edition() {
   echo ""
   echo "${edition}: failover benchmark complete"
   echo "  Analysis:         ${edition_dir}/failover_analysis.txt"
+  echo "  KPI CSV:          ${edition_dir}/failover_kpi.csv"
   echo "  Extended metrics: ${edition_dir}/failover_extended_metrics.txt"
   echo "  Metrics CSV:      ${edition_dir}/failover_metrics.csv"
   echo "  Time series:      ${edition_dir}/failover_timeseries.csv"
@@ -155,6 +156,7 @@ echo ""
 echo "=== Failover benchmark complete ==="
 echo "Results:   ${RESULTS_ROOT}"
 echo "Summary:   ${RESULTS_ROOT}/failover_comparison.txt"
+echo "KPI CSV:   ${RESULTS_ROOT}/failover_kpi.csv"
 echo "Full log:  ${FULL_LOG}"
 
 if [[ "${FAILED}" -gt 0 ]]; then

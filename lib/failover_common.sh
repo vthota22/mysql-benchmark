@@ -26,7 +26,7 @@ failover_defaults() {
   : "${FAILOVER_MONITOR_PRIMARY:=1}"
   : "${FAILOVER_COLLECT_K8S_EVENTS:=1}"
   : "${FAILOVER_RUN_TPCC_CHECK:=0}"
-  : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,2006,3100}"
+  : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011}"
   : "${FAILOVER_TRIGGER_ENABLED:=1}"
   : "${FAILOVER_POD_DELETE:=${FAILOVER_TRIGGER_ENABLED}}"
 }
@@ -72,7 +72,7 @@ _failover_kill_process_tree() {
 
 mysql_cli() {
   mysql -h "${MYSQL_HOST}" -P "${MYSQL_PORT}" -u "${MYSQL_USER}" -p"${MYSQL_PASSWORD}" \
-    --ssl-mode=REQUIRED "${MYSQL_DB}" "$@"
+    --ssl-mode=REQUIRED "${MYSQL_DB}" 2>/dev/null "$@"
 }
 
 failover_monitor_enabled() {
@@ -109,7 +109,7 @@ start_primary_monitor() {
                    FROM performance_schema.replication_group_members
                   WHERE MEMBER_ID = @@server_uuid
                   LIMIT 1
-               ), 'N/A');" 2>&1) || row=""
+               ), 'N/A');" 2>/dev/null) || row=""
       if [[ "${row}" == *$'\t'* && "${row}" != *"ERROR"* ]]; then
         echo -e "${ts}\t${elapsed}\t1\t${row}\t" >> "${out_file}"
       else
@@ -422,7 +422,7 @@ function parse_line(line,    i, n, f, sec, tps, qps, err, reconn, lat95) {
   for (i = 1; i <= n; i++) {
     if (f[i] == "tps:") tps = f[i + 1] + 0
     if (f[i] == "qps:") qps = f[i + 1] + 0
-    if (f[i] == "err/s:") err = f[i + 1] + 0
+    if (f[i] == "err/s:" || f[i] == "err/s") err = f[i + 1] + 0
     if (f[i] == "reconn/s:") reconn = f[i + 1] + 0
     if (f[i] ~ /^lat/ && f[i + 1] ~ /\(ms,95%\):/) lat95 = f[i + 2] + 0
   }
@@ -500,7 +500,7 @@ function parse_interval_line(line,    i, sec, tps, qps, err, reconn, lat95, n) {
   for (i = 1; i <= n; i++) {
     if (f[i] == "tps:") tps = f[i + 1] + 0
     if (f[i] == "qps:") qps = f[i + 1] + 0
-    if (f[i] == "err/s:") err = f[i + 1] + 0
+    if (f[i] == "err/s:" || f[i] == "err/s") err = f[i + 1] + 0
     if (f[i] == "reconn/s:") reconn = f[i + 1] + 0
     if (f[i] ~ /^lat/ && f[i + 1] ~ /\(ms,95%\):/) lat95 = f[i + 2] + 0
   }
@@ -509,7 +509,7 @@ function parse_interval_line(line,    i, sec, tps, qps, err, reconn, lat95, n) {
   err_arr[sec] = err
   reconn_arr[sec] = reconn
   lat_arr[sec] = lat95
-  if (sec < trigger) {
+  if (sec < trigger && err == 0 && tps > 0) {
     baseline_sum += tps
     baseline_count++
   }
@@ -681,10 +681,251 @@ analyze_failover_metrics() {
   generate_failover_graphs "${results_dir}"
 
   write_failover_extended_metrics "${results_dir}"
+  write_failover_kpi "${results_dir}"
 
   echo "Analysis written: ${analysis_file}"
   echo "Metrics CSV:      ${csv_file}"
+  echo "KPI CSV:          ${results_dir}/failover_kpi.csv"
   echo "Extended metrics: ${results_dir}/failover_extended_metrics.txt"
+}
+
+# Seven core failover KPIs — phase durations (see benchmark.conf.example).
+write_failover_kpi() {
+  local results_dir="${1:?results dir required}"
+  local kpi_csv="${results_dir}/failover_kpi.csv"
+  local timeseries="${results_dir}/failover_timeseries.csv"
+  local monitor="${results_dir}/primary_monitor.tsv"
+  local event_file="${results_dir}/failover_event.txt"
+  local check_result="${results_dir}/tpcc_check_result.env"
+  local sysbench_log="${results_dir}/sysbench_run.log"
+  local timing_file="${results_dir}/sysbench_timing.txt"
+
+  failover_defaults
+
+  local trigger_second edition trigger_utc
+  trigger_second=$(failover_trigger_second)
+  edition="unknown"
+  trigger_utc=""
+
+  if [[ -f "${timing_file}" ]]; then
+    # shellcheck disable=SC1090
+    source "${timing_file}" 2>/dev/null || true
+    trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
+  fi
+  if [[ -f "${event_file}" ]]; then
+    edition=$(grep -E '^FAILOVER_EDITION=' "${event_file}" | tail -1 | cut -d= -f2- || echo "unknown")
+    trigger_utc=$(grep -E '^FAILOVER_TRIGGER_UTC=' "${event_file}" | tail -1 | cut -d= -f2- || true)
+  fi
+
+  local monitor_offset=0
+  if [[ -f "${results_dir}/primary_monitor_meta.txt" && -f "${timing_file}" ]]; then
+    local monitor_start sysbench_ready
+    monitor_start=$(grep -E '^MONITOR_START_EPOCH=' "${results_dir}/primary_monitor_meta.txt" | cut -d= -f2- || true)
+    sysbench_ready=$(grep -E '^SYSBENCH_READY_EPOCH=' "${timing_file}" | cut -d= -f2- || true)
+    if [[ -n "${monitor_start}" && -n "${sysbench_ready}" ]]; then
+      monitor_offset=$((sysbench_ready - monitor_start))
+    fi
+  fi
+
+  local primary_before="N/A"
+  if [[ -f "${monitor}" ]]; then
+    primary_before=$(analyze_primary_change "${monitor}" "${trigger_utc}" 2>/dev/null \
+      | grep '^PRIMARY_BEFORE=' | cut -d= -f2- || echo "N/A")
+  fi
+
+  local tpcc_check="SKIPPED"
+  [[ -f "${check_result}" ]] && tpcc_check=$(grep TPCC_CHECK_RESULT "${check_result}" | cut -d= -f2-)
+
+  local sysbench_max_lat=""
+  if [[ -f "${sysbench_log}" ]]; then
+    sysbench_max_lat=$(grep -E '^[[:space:]]+max:' "${sysbench_log}" | tail -1 | awk '{print $2}' || true)
+  fi
+
+  if [[ ! -f "${timeseries}" ]]; then
+    echo "WARNING: missing ${timeseries} — skipping failover_kpi.csv" >&2
+    return 1
+  fi
+
+  awk -v trigger="${trigger_second}" \
+      -v edition="${edition}" \
+      -v recovery_pct="${FAILOVER_RECOVERY_THRESHOLD}" \
+      -v stable="${FAILOVER_RECOVERY_STABLE_SEC}" \
+      -v outage_ratio="${FAILOVER_OUTAGE_TPS_RATIO}" \
+      -v observe_sec="${FAILOVER_OBSERVE_SEC}" \
+      -v monitor="${monitor}" \
+      -v monitor_offset="${monitor_offset}" \
+      -v primary_before="${primary_before}" \
+      -v tpcc_check="${tpcc_check}" \
+      -v sysbench_max_lat="${sysbench_max_lat}" \
+      -v tsfile="${timeseries}" \
+      -f - > "${kpi_csv}" <<'AWK'
+function load_timeseries(    line, f, sec) {
+  while ((getline line < tsfile) > 0) {
+    split(line, f, ",")
+    if (f[1] == "elapsed_sec") continue
+    sec = f[1] + 0
+    tps_arr[sec] = f[3] + 0
+    qps_arr[sec] = f[4] + 0
+    err_arr[sec] = f[5] + 0
+    reconn_arr[sec] = f[6] + 0
+    lat_arr[sec] = f[7] + 0
+    if (sec > load_end) load_end = sec
+    if (sec < trigger && tps_arr[sec] > 0) {
+      pre_tps_sum += tps_arr[sec]
+      pre_tps_cnt++
+    }
+    if (sec < trigger && qps_arr[sec] > 0) {
+      pre_qps_sum += qps_arr[sec]
+      pre_qps_cnt++
+    }
+  }
+  close(tsfile)
+  if (pre_tps_cnt > 0) baseline_tps = pre_tps_sum / pre_tps_cnt
+  if (pre_qps_cnt > 0) baseline_qps = pre_qps_sum / pre_qps_cnt
+  tps_thresh = baseline_tps * recovery_pct
+  qps_thresh = baseline_qps * recovery_pct
+  outage_tps = baseline_tps * outage_ratio
+  outage_qps = baseline_qps * outage_ratio
+  observe_end = trigger + observe_sec
+  if (load_end > observe_end) observe_end = load_end
+}
+function detect_failure(    sec, app, db, sysbench_sec) {
+  app = -1
+  db = -1
+  for (sec = trigger; sec <= observe_end; sec++) {
+    if (!(sec in tps_arr)) continue
+    if (app < 0 && (err_arr[sec] > 0 || reconn_arr[sec] > 0 \
+        || (baseline_tps > 0 && tps_arr[sec] < outage_tps) \
+        || (baseline_qps > 0 && qps_arr[sec] < outage_qps)))
+      app = sec - trigger
+  }
+  if (monitor != "" && ( (getline _ < monitor) > 0 )) {
+    close(monitor)
+    while ((getline line < monitor) > 0) {
+      split(line, f, "\t")
+      if (f[1] == "timestamp_utc") continue
+      sysbench_sec = (f[2] + 0) - monitor_offset
+      if (sysbench_sec >= trigger && f[3] != "1" && db < 0)
+        db = sysbench_sec - trigger
+    }
+    close(monitor)
+  }
+  if (app >= 0 && db >= 0) return (app < db ? app : db)
+  if (app >= 0) return app
+  if (db >= 0) return db
+  return -1
+}
+function detect_primary_election(    saw_fail, host, ro, gr, sysbench_sec) {
+  if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
+  close(monitor)
+  while ((getline line < monitor) > 0) {
+    split(line, f, "\t")
+    if (f[1] == "timestamp_utc") continue
+    sysbench_sec = (f[2] + 0) - monitor_offset
+    if (sysbench_sec < trigger) continue
+    if (f[3] != "1") {
+      saw_fail = 1
+      continue
+    }
+    host = f[4]
+    ro = f[5] + 0
+    gr = f[7]
+    if (ro == 0 && (gr == "ONLINE" || gr == "PRIMARY") \
+        && (saw_fail || (primary_before != "N/A" && host != primary_before)))
+      return sysbench_sec - trigger
+  }
+  close(monitor)
+  return -1
+}
+function detect_qps_recovery(start_sec,    sec) {
+  for (sec = start_sec; sec <= observe_end; sec++) {
+    if (!(sec in qps_arr)) continue
+    if (baseline_qps > 0 && qps_arr[sec] >= qps_thresh)
+      return sec - trigger
+  }
+  return -1
+}
+function dip_duration(failure_rel, recovery_rel,    sec, start, end, count) {
+  count = 0
+  start = trigger + (failure_rel >= 0 ? failure_rel : 0)
+  end = observe_end
+  if (recovery_rel >= 0) end = trigger + recovery_rel - 1
+  for (sec = start; sec <= end; sec++) {
+    if (!(sec in tps_arr)) continue
+    if (baseline_tps > 0 && tps_arr[sec] < tps_thresh) count++
+  }
+  return count
+}
+function peak_latency(failure_rel, recovery_rel,    sec, start, end, peak) {
+  peak = 0
+  start = trigger + (failure_rel >= 0 ? failure_rel : 0)
+  end = observe_end
+  if (recovery_rel >= 0) {
+    end = trigger + recovery_rel + stable
+    if (end > observe_end) end = observe_end
+  }
+  for (sec = start; sec <= end; sec++) {
+    if (!(sec in lat_arr)) continue
+    if (lat_arr[sec] > peak) peak = lat_arr[sec]
+  }
+  if (peak > 0) return peak
+  if (sysbench_max_lat != "" && sysbench_max_lat + 0 > 0) return sysbench_max_lat + 0
+  return -1
+}
+function errors_in_window(fail_rel, recovery_rel,    sec, start, end, sum) {
+  sum = 0
+  start = trigger + (fail_rel >= 0 ? fail_rel : 0)
+  end = observe_end
+  if (recovery_rel >= 0) end = trigger + recovery_rel
+  for (sec = start; sec <= end; sec++) {
+    if (sec in err_arr) sum += err_arr[sec]
+    if (sec in reconn_arr) sum += reconn_arr[sec]
+  }
+  return int(sum + 0.5)
+}
+function fmt_sec(v) {
+  if (v < 0) return "NOT_DETECTED"
+  return sprintf("%d", v)
+}
+function fmt_phase_duration(v) {
+  if (v < 0) return "NOT_REACHED"
+  return sprintf("%d", v)
+}
+function phase_duration(end_rel, start_rel) {
+  if (end_rel < 0 || start_rel < 0) return -1
+  return end_rel - start_rel
+}
+function fmt_lat(v) {
+  if (v < 0) return "N/A"
+  return sprintf("%.2f", v)
+}
+END {
+  load_timeseries()
+  failure_sec = detect_failure()
+  election_sec = detect_primary_election()
+  recovery_start_sec = trigger
+  if (election_sec >= 0) recovery_start_sec = trigger + election_sec
+  recovery_rel = detect_qps_recovery(recovery_start_sec)
+  election_duration = phase_duration(election_sec, failure_sec)
+  recovery_duration = phase_duration(recovery_rel, election_sec)
+  dip_sec = dip_duration(failure_sec, recovery_rel)
+  peak_lat = peak_latency(failure_sec, recovery_rel)
+  tx_failed = errors_in_window(failure_sec, recovery_rel)
+
+  print "edition,failure_detection_sec,primary_election_sec,app_recovery_sec,tps_dip_duration_sec,peak_latency_failover_ms,transactions_failed_during_failover,data_loss"
+  printf "%s,%s,%s,%s,%d,%s,%d,%s\n", \
+    edition, \
+    fmt_sec(failure_sec), \
+    fmt_sec(election_duration), \
+    fmt_phase_duration(recovery_duration), \
+    dip_sec, \
+    fmt_lat(peak_lat), \
+    tx_failed, \
+    tpcc_check
+}
+AWK
+
+  echo "KPI CSV: ${kpi_csv}"
 }
 
 run_failover_tpcc_check() {
@@ -751,6 +992,9 @@ write_failover_extended_metrics() {
   local parsed_env=""
   [[ -f "${parsed_file}" ]] && parsed_env="${parsed_file}"
 
+  local generated_utc
+  generated_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
   local monitor_offset=0
   local primary_before="N/A" primary_after="N/A" primary_changed="unknown"
   if [[ -f "${primary_env}" ]]; then
@@ -789,6 +1033,7 @@ write_failover_extended_metrics() {
       -v do_log="${do_log}" \
       -v trigger_log="${trigger_log}" \
       -v sysbench_log="${sysbench_log}" \
+      -v generated_utc="${generated_utc}" \
       -f - > "${out_file}" <<'AWK'
 BEGIN {
   failure_detect = -1
@@ -901,9 +1146,7 @@ function summarize_k8s(    block, in_block) {
       if (block != "") print block
       block = line
       in_block = 1
-      next
-    }
-    if (in_block && line ~ /Killing|Unhealthy|Started|BackOff|Failed|Deleted|Created|Pulling|Pulled/) {
+    } else if (in_block && line ~ /Killing|Unhealthy|Started|BackOff|Failed|Deleted|Created|Pulling|Pulled/) {
       if (block != "") block = block "\n  " line
       else block = "  " line
     }
@@ -927,7 +1170,7 @@ END {
   }
 
   print "=== Failover Extended Metrics ==="
-  print "Generated:              " strftime("%Y-%m-%dT%H:%M:%SZ", systime())
+  print "Generated:              " generated_utc
   print "Edition:                  " edition
   print "Trigger method:           " method
   print "Trigger UTC:              " (trigger_utc != "" ? trigger_utc : "N/A")
@@ -973,6 +1216,8 @@ END {
   printf "Sysbench data ends at sec:      %d (expect ~%d)\n", load_end_sec, trigger + stable
   if (load_end_sec > 0 && load_end_sec < trigger + 10)
     print "WARNING: Sysbench stopped early — reconnect metrics may be incomplete"
+  if (load_end_sec > 0 && load_end_sec < trigger)
+    print "WARNING: Load ended BEFORE trigger second — failover metrics invalid"
   if (fatal_count > 0)
     printf "FATAL errors in sysbench log:   %d\n", fatal_count
   else
@@ -1002,8 +1247,10 @@ write_failover_comparison() {
   local results_root="${1:?results root required}"
   local summary="${results_root}/failover_comparison.txt"
   local combined_csv="${results_root}/failover_comparison.csv"
+  local kpi_csv="${results_root}/failover_kpi.csv"
 
   echo "edition,trigger_method,trigger_utc,baseline_tps,outage_start_sec,outage_duration_sec,rto_sec,peak_err_per_sec,peak_reconn_per_sec,peak_lat_p95_ms" > "${combined_csv}"
+  echo "edition,failure_detection_sec,primary_election_sec,app_recovery_sec,tps_dip_duration_sec,peak_latency_failover_ms,transactions_failed_during_failover,data_loss" > "${kpi_csv}"
 
   {
     echo "=== Failover Benchmark — Standard vs Advanced ==="
@@ -1014,12 +1261,16 @@ write_failover_comparison() {
   for edition_dir in "${results_root}"/*/; do
     [[ -d "${edition_dir}" ]] || continue
     local metrics="${edition_dir}/failover_metrics.csv"
+    local kpi="${edition_dir}/failover_kpi.csv"
     local analysis="${edition_dir}/failover_analysis.txt"
     local edition
     edition=$(basename "${edition_dir}")
 
     if [[ -f "${metrics}" ]]; then
       tail -n +2 "${metrics}" >> "${combined_csv}"
+    fi
+    if [[ -f "${kpi}" ]]; then
+      tail -n +2 "${kpi}" >> "${kpi_csv}"
     fi
     if [[ -f "${analysis}" ]]; then
       {
@@ -1034,4 +1285,5 @@ write_failover_comparison() {
 
   echo "Comparison summary: ${summary}"
   echo "Comparison CSV:     ${combined_csv}"
+  echo "KPI CSV:            ${kpi_csv}"
 }
