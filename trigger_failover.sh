@@ -23,6 +23,20 @@ set_mysql_env_for_edition "${EDITION}"
 
 : > "${RESULTS_DIR}/failover_event.txt"
 echo "FAILOVER_EDITION=${EDITION}" >> "${RESULTS_DIR}/failover_event.txt"
+echo "FAILOVER_TRIGGER_ENABLED=${FAILOVER_TRIGGER_ENABLED:-1}" >> "${RESULTS_DIR}/failover_event.txt"
+echo "FAILOVER_POD_DELETE=${FAILOVER_POD_DELETE:-${FAILOVER_TRIGGER_ENABLED:-1}}" >> "${RESULTS_DIR}/failover_event.txt"
+
+record_trigger_skipped() {
+  local reason="${1:?reason required}"
+  echo "FAILOVER_METHOD=skipped" >> "${RESULTS_DIR}/failover_event.txt"
+  echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${RESULTS_DIR}/failover_event.txt"
+  echo "FAILOVER_SKIP_REASON=${reason}" >> "${RESULTS_DIR}/failover_event.txt"
+  {
+    echo "Failover trigger SKIPPED at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "Reason: ${reason}"
+    echo "Load continues through observe window; no pod delete / API trigger."
+  } | tee -a "${RESULTS_DIR}/failover_trigger.log"
+}
 
 trigger_standard_failover() {
   local method="${FAILOVER_STANDARD_TRIGGER_METHOD:-install_update}"
@@ -229,6 +243,11 @@ find_advanced_primary_pod() {
 }
 
 trigger_advanced_failover() {
+  if ! failover_pod_delete_enabled; then
+    record_trigger_skipped "FAILOVER_POD_DELETE=0 (load-only control run)"
+    return 0
+  fi
+
   echo "FAILOVER_METHOD=kubectl_delete_pod" >> "${RESULTS_DIR}/failover_event.txt"
   echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${RESULTS_DIR}/failover_event.txt"
   echo "FAILOVER_POD_DELETE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${RESULTS_DIR}/failover_event.txt"
@@ -270,9 +289,13 @@ log_do_events() {
 
 case "${EDITION}" in
   standard)
-    trigger_standard_failover
-    : > "${RESULTS_DIR}/do_events.log"
-    log_do_events
+    if failover_trigger_enabled; then
+      trigger_standard_failover
+      : > "${RESULTS_DIR}/do_events.log"
+      log_do_events
+    else
+      record_trigger_skipped "FAILOVER_TRIGGER_ENABLED=0"
+    fi
     ;;
   advanced)
     : > "${RESULTS_DIR}/do_events.log"

@@ -40,6 +40,11 @@ echo "          trigger at second $(failover_trigger_second) | total=$(failover_
 echo "Editions: ${FAILOVER_EDITIONS}"
 echo "Reconnect: mysql-ignore-errors=${FAILOVER_MYSQL_IGNORE_ERRORS}"
 echo "Monitor:   primary=${FAILOVER_MONITOR_PRIMARY:-1} k8s_events=${FAILOVER_COLLECT_K8S_EVENTS:-1}"
+if failover_trigger_enabled; then
+  echo "Trigger:  enabled (FAILOVER_TRIGGER_ENABLED=1, pod delete=${FAILOVER_POD_DELETE})"
+else
+  echo "Trigger:  DISABLED — load-only control run (FAILOVER_TRIGGER_ENABLED=0)"
+fi
 echo ""
 
 run_failover_edition() {
@@ -100,7 +105,11 @@ run_failover_edition() {
   echo "--- Baseline load period, then failover trigger ---"
   sleep_until_failover_trigger
 
-  echo "--- Triggering failover ---"
+  if failover_trigger_enabled; then
+    echo "--- Triggering failover ---"
+  else
+    echo "--- Failover trigger skipped (FAILOVER_TRIGGER_ENABLED=0) — recording trigger time only ---"
+  fi
   BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${edition_dir}" \
     2>&1 | tee "${edition_dir}/failover_trigger.log"
 

@@ -27,6 +27,18 @@ failover_defaults() {
   : "${FAILOVER_COLLECT_K8S_EVENTS:=1}"
   : "${FAILOVER_RUN_TPCC_CHECK:=0}"
   : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,1047,1158,1159,1161,3011}"
+  : "${FAILOVER_TRIGGER_ENABLED:=1}"
+  : "${FAILOVER_POD_DELETE:=${FAILOVER_TRIGGER_ENABLED}}"
+}
+
+failover_trigger_enabled() {
+  failover_defaults
+  [[ "${FAILOVER_TRIGGER_ENABLED}" == "1" ]]
+}
+
+failover_pod_delete_enabled() {
+  failover_defaults
+  [[ "${FAILOVER_POD_DELETE}" == "1" ]]
 }
 
 failover_total_runtime_sec() {
