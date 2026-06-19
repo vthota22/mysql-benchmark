@@ -26,7 +26,7 @@ failover_defaults() {
   : "${FAILOVER_MONITOR_PRIMARY:=1}"
   : "${FAILOVER_COLLECT_K8S_EVENTS:=1}"
   : "${FAILOVER_RUN_TPCC_CHECK:=0}"
-  : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,1047,1158,1159,1161,3011}"
+  : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,2006,3100}"
   : "${FAILOVER_TRIGGER_ENABLED:=1}"
   : "${FAILOVER_POD_DELETE:=${FAILOVER_TRIGGER_ENABLED}}"
 }
@@ -261,12 +261,13 @@ run_tpcc_failover_load() {
     --trx_level="${TPCC_TRX_LEVEL:-RR}"
     --force_pk="${TPCC_FORCE_PK:-1}"
     --mysql-ignore-errors="${ignore_errors}"
+    --db-ps-mode=disable
     --time="${total_time}"
     --warmup-time="${FAILOVER_WARMUP_SEC}"
     --report-interval="${FAILOVER_REPORT_INTERVAL}"
   )
 
-  echo "Sysbench failover opts: mysql-ignore-errors=${ignore_errors}"
+  echo "Sysbench failover opts: mysql-ignore-errors=${ignore_errors} db-ps-mode=disable"
 
   # Foreground load job (not a wrapper subshell) so $! is the sysbench driver process.
   export SYSBENCH_LINE_BUFFER=1
