@@ -231,6 +231,7 @@ find_advanced_primary_pod() {
 trigger_advanced_failover() {
   echo "FAILOVER_METHOD=kubectl_delete_pod" >> "${RESULTS_DIR}/failover_event.txt"
   echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${RESULTS_DIR}/failover_event.txt"
+  echo "FAILOVER_POD_DELETE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${RESULTS_DIR}/failover_event.txt"
 
   if ! command -v kubectl >/dev/null 2>&1; then
     echo "ERROR: kubectl not found in PATH" >&2
@@ -252,37 +253,30 @@ trigger_advanced_failover() {
     kubectl+=(--context="${ADVANCED_K8S_CONTEXT}")
   fi
 
+  _failover_snapshot_k8s_events "${RESULTS_DIR}" "pre_delete"
+  log_failover_do_events "${RESULTS_DIR}" "advanced" "pre_delete"
+
   "${kubectl[@]}" delete pod -n "${ns}" "${pod}" --wait=false \
     2>&1 | tee -a "${RESULTS_DIR}/failover_trigger.log"
 
   echo "Pod delete issued at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${RESULTS_DIR}/failover_trigger.log"
+  _failover_snapshot_k8s_events "${RESULTS_DIR}" "post_delete"
+  log_failover_do_events "${RESULTS_DIR}" "advanced" "post_delete"
 }
 
 log_do_events() {
-  local uuid_var="${1}_CLUSTER_UUID"
-  local uuid="${!uuid_var:-}"
-  local token="${DIGITALOCEAN_TOKEN:-${DO_API_TOKEN:-}}"
-
-  [[ -n "${uuid}" && -n "${token}" ]] || return 0
-
-  if command -v doctl >/dev/null 2>&1; then
-    DIGITALOCEAN_ACCESS_TOKEN="${token}" doctl databases events list "${uuid}" \
-      >> "${RESULTS_DIR}/do_events.log" 2>&1 || true
-  else
-    curl -sS -H "Authorization: Bearer ${token}" \
-      "https://api.digitalocean.com/v2/databases/${uuid}/events" \
-      >> "${RESULTS_DIR}/do_events.log" 2>&1 || true
-  fi
+  log_failover_do_events "${RESULTS_DIR}" "${EDITION}" "trigger"
 }
 
 case "${EDITION}" in
   standard)
     trigger_standard_failover
-    log_do_events "STANDARD"
+    : > "${RESULTS_DIR}/do_events.log"
+    log_do_events
     ;;
   advanced)
+    : > "${RESULTS_DIR}/do_events.log"
     trigger_advanced_failover
-    log_do_events "ADVANCED"
     ;;
   *)
     echo "ERROR: Unknown edition '${EDITION}' (use standard or advanced)" >&2

@@ -38,6 +38,8 @@ echo "Load:     threads=${FAILOVER_THREADS} report-interval=${FAILOVER_REPORT_IN
 echo "Timeline: warmup=${FAILOVER_WARMUP_SEC}s + baseline=${FAILOVER_BASELINE_SEC}s + observe=${FAILOVER_OBSERVE_SEC}s"
 echo "          trigger at second $(failover_trigger_second) | total=$(failover_total_runtime_sec)s"
 echo "Editions: ${FAILOVER_EDITIONS}"
+echo "Reconnect: mysql-ignore-errors=${FAILOVER_MYSQL_IGNORE_ERRORS}"
+echo "Monitor:   primary=${FAILOVER_MONITOR_PRIMARY:-1} k8s_events=${FAILOVER_COLLECT_K8S_EVENTS:-1}"
 echo ""
 
 run_failover_edition() {
@@ -84,16 +86,13 @@ run_failover_edition() {
     echo ""
   fi
 
-  if [[ "${FAILOVER_MONITOR_HOSTNAME:-0}" == "1" ]]; then
-    echo "--- Starting hostname monitor (FAILOVER_MONITOR_HOSTNAME=1) ---"
-    start_primary_monitor "${edition_dir}"
-  fi
+  start_failover_watchers "${edition_dir}" "${edition}"
 
   echo "--- Starting continuous TPC-C load ---"
   run_tpcc_failover_load "${edition_dir}"
 
   if ! wait_for_sysbench_start "${edition_dir}" 180; then
-    [[ "${FAILOVER_MONITOR_HOSTNAME:-0}" == "1" ]] && stop_primary_monitor "${edition_dir}"
+    stop_failover_watchers "${edition_dir}"
     stop_sysbench_load "${edition_dir}"
     return 1
   fi
@@ -108,19 +107,25 @@ run_failover_edition() {
   echo "--- Observing recovery for ${FAILOVER_OBSERVE_SEC}s ---"
   sleep "${FAILOVER_OBSERVE_SEC}"
 
+  _failover_snapshot_k8s_events "${edition_dir}" "post_observe"
+  log_failover_do_events "${edition_dir}" "${edition}" "post_observe"
+
   echo "--- Stopping load ---"
   stop_sysbench_load "${edition_dir}"
-  [[ "${FAILOVER_MONITOR_HOSTNAME:-0}" == "1" ]] && stop_primary_monitor "${edition_dir}"
+  stop_failover_watchers "${edition_dir}"
+
+  run_failover_tpcc_check "${edition_dir}" || true
 
   echo "--- Analyzing failover metrics ---"
   analyze_failover_metrics "${edition_dir}"
 
   echo ""
   echo "${edition}: failover benchmark complete"
-  echo "  Analysis:   ${edition_dir}/failover_analysis.txt"
-  echo "  Metrics:    ${edition_dir}/failover_metrics.csv"
-  echo "  Time series:${edition_dir}/failover_timeseries.csv"
-  echo "  Graphs:     ${edition_dir}/graphs/"
+  echo "  Analysis:         ${edition_dir}/failover_analysis.txt"
+  echo "  Extended metrics: ${edition_dir}/failover_extended_metrics.txt"
+  echo "  Metrics CSV:      ${edition_dir}/failover_metrics.csv"
+  echo "  Time series:      ${edition_dir}/failover_timeseries.csv"
+  echo "  Graphs:           ${edition_dir}/graphs/"
 }
 
 FAILED=0

@@ -23,6 +23,10 @@ failover_defaults() {
   : "${FAILOVER_TRIGGER_DELAY_SEC:=}"
   : "${FAILOVER_GENERATE_GRAPHS:=1}"
   : "${FAILOVER_MONITOR_HOSTNAME:=0}"
+  : "${FAILOVER_MONITOR_PRIMARY:=1}"
+  : "${FAILOVER_COLLECT_K8S_EVENTS:=1}"
+  : "${FAILOVER_RUN_TPCC_CHECK:=0}"
+  : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,1047,1158,1159,1161,3011}"
 }
 
 failover_total_runtime_sec() {
@@ -59,20 +63,48 @@ mysql_cli() {
     --ssl-mode=REQUIRED "${MYSQL_DB}" "$@"
 }
 
+failover_monitor_enabled() {
+  [[ "${FAILOVER_MONITOR_PRIMARY:-1}" == "1" || "${FAILOVER_MONITOR_HOSTNAME:-0}" == "1" ]]
+}
+
 start_primary_monitor() {
   local results_dir="${1:?results dir required}"
   local pid_file="${results_dir}/primary_monitor.pid"
   local out_file="${results_dir}/primary_monitor.tsv"
+  local meta_file="${results_dir}/primary_monitor_meta.txt"
   local interval="${FAILOVER_MONITOR_INTERVAL:-1}"
+  local start_epoch
+  start_epoch=$(date -u +%s)
 
   : > "${out_file}"
-  echo -e "timestamp_utc\thostname\tread_only" >> "${out_file}"
+  echo -e "timestamp_utc\telapsed_sec\tconnect_ok\thostname\tread_only\tsuper_read_only\tgr_member_state\tconnect_error" >> "${out_file}"
+  {
+    echo "MONITOR_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "MONITOR_START_EPOCH=${start_epoch}"
+    echo "MONITOR_INTERVAL_SEC=${interval}"
+  } > "${meta_file}"
 
   (
     while true; do
       ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-      row=$(mysql_cli -N -B -e "SELECT @@hostname, @@global.read_only;" 2>&1 || echo "ERROR\tERROR")
-      echo -e "${ts}\t${row}" >> "${out_file}"
+      elapsed=$(( $(date -u +%s) - start_epoch ))
+      row=$(mysql_cli -N -B -e "
+        SELECT @@hostname,
+               @@global.read_only,
+               @@global.super_read_only,
+               IFNULL((
+                 SELECT MEMBER_STATE
+                   FROM performance_schema.replication_group_members
+                  WHERE MEMBER_ID = @@server_uuid
+                  LIMIT 1
+               ), 'N/A');" 2>&1) || row=""
+      if [[ "${row}" == *$'\t'* && "${row}" != *"ERROR"* ]]; then
+        echo -e "${ts}\t${elapsed}\t1\t${row}\t" >> "${out_file}"
+      else
+        err=${row//$'\t'/ }
+        err=${err//$'\n'/ }
+        echo -e "${ts}\t${elapsed}\t0\tERROR\tERROR\tERROR\tERROR\t${err}" >> "${out_file}"
+      fi
       sleep "${interval}"
     done
   ) &
@@ -94,6 +126,91 @@ stop_primary_monitor() {
     fi
     rm -f "${pid_file}"
   fi
+  if [[ -f "${results_dir}/primary_monitor_meta.txt" ]]; then
+    echo "MONITOR_END_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${results_dir}/primary_monitor_meta.txt"
+  fi
+}
+
+_failover_snapshot_k8s_events() {
+  local results_dir="${1:?results dir required}"
+  local label="${2:?label required}"
+
+  [[ "${FAILOVER_COLLECT_K8S_EVENTS:-1}" == "1" ]] || return 0
+  command -v kubectl >/dev/null 2>&1 || return 0
+
+  local kubeconfig="${results_dir}/kubeconfig"
+  if [[ ! -f "${kubeconfig}" && -n "${ADVANCED_KUBECONFIG_PATH:-}" && -f "${ADVANCED_KUBECONFIG_PATH}" ]]; then
+    kubeconfig="${ADVANCED_KUBECONFIG_PATH}"
+  fi
+  [[ -f "${kubeconfig}" ]] || return 0
+
+  local ns="${ADVANCED_K8S_NAMESPACE:-percona}"
+  local out_file="${results_dir}/k8s_events.log"
+  local kubectl=(kubectl --kubeconfig="${kubeconfig}")
+  [[ -n "${ADVANCED_K8S_CONTEXT:-}" ]] && kubectl+=(--context="${ADVANCED_K8S_CONTEXT}")
+
+  {
+    echo "=== K8s events snapshot: ${label} @ $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+    "${kubectl[@]}" get events -n "${ns}" --sort-by=.lastTimestamp 2>&1 || true
+    echo ""
+  } >> "${out_file}"
+}
+
+start_k8s_event_collector() {
+  : # snapshots taken at trigger and post-observe via _failover_snapshot_k8s_events
+}
+
+stop_k8s_event_collector() {
+  :
+}
+
+start_failover_watchers() {
+  local results_dir="${1:?results dir required}"
+  local edition="${2:?edition required}"
+
+  if failover_monitor_enabled; then
+    echo "--- Starting primary / topology monitor ---"
+    start_primary_monitor "${results_dir}"
+  fi
+  if [[ "${edition}" == "advanced" ]]; then
+    : > "${results_dir}/k8s_events.log"
+  fi
+}
+
+stop_failover_watchers() {
+  local results_dir="${1:?results dir required}"
+
+  stop_k8s_event_collector "${results_dir}"
+  if failover_monitor_enabled; then
+    stop_primary_monitor "${results_dir}"
+  fi
+}
+
+log_failover_do_events() {
+  local results_dir="${1:?results dir required}"
+  local edition="${2:?edition required}"
+  local label="${3:-snapshot}"
+  local uuid=""
+  local token="${DIGITALOCEAN_TOKEN:-${DO_API_TOKEN:-}}"
+  local out_file="${results_dir}/do_events.log"
+
+  case "${edition}" in
+    standard) uuid="${STANDARD_CLUSTER_UUID:-}" ;;
+    advanced) uuid="${ADVANCED_CLUSTER_UUID:-}" ;;
+  esac
+
+  [[ -n "${uuid}" && -n "${token}" ]] || return 0
+
+  {
+    echo "=== DO database events: ${label} @ $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+    if command -v doctl >/dev/null 2>&1; then
+      DIGITALOCEAN_ACCESS_TOKEN="${token}" doctl databases events list "${uuid}" 2>&1 || true
+    else
+      curl -sS -H "Authorization: Bearer ${token}" \
+        "https://api.digitalocean.com/v2/databases/${uuid}/events" 2>&1 || true
+    fi
+    echo ""
+  } >> "${out_file}"
 }
 
 run_tpcc_failover_load() {
@@ -104,9 +221,10 @@ run_tpcc_failover_load() {
   failover_defaults
   build_mysql_base_opts
 
-  local tpcc total_time
+  local tpcc total_time ignore_errors
   tpcc="$(tpcc_dir)"
   total_time=$(failover_total_runtime_sec)
+  ignore_errors="${FAILOVER_MYSQL_IGNORE_ERRORS}"
 
   export TPCC_THREADS="${FAILOVER_THREADS}"
   export TPCC_TIME="${total_time}"
@@ -116,13 +234,31 @@ run_tpcc_failover_load() {
   echo "SYSBENCH_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_TRIGGER_SECOND=$(failover_trigger_second)" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_TOTAL_SEC=${total_time}" >> "${results_dir}/sysbench_timing.txt"
+  echo "FAILOVER_MYSQL_IGNORE_ERRORS=${ignore_errors}" >> "${results_dir}/sysbench_timing.txt"
 
   : > "${log_file}"
 
+  local tables="${TPCC_TABLES:-10}"
+  local scale="${TPCC_SCALE:-100}"
+  local opts=(
+    "${MYSQL_BASE_OPTS[@]}"
+    "${MYSQL_SSL_OPTS[@]}"
+    --tables="${tables}"
+    --scale="${scale}"
+    --threads="${FAILOVER_THREADS}"
+    --trx_level="${TPCC_TRX_LEVEL:-RR}"
+    --force_pk="${TPCC_FORCE_PK:-1}"
+    --mysql-ignore-errors="${ignore_errors}"
+    --time="${total_time}"
+    --warmup-time="${FAILOVER_WARMUP_SEC}"
+    --report-interval="${FAILOVER_REPORT_INTERVAL}"
+  )
+
+  echo "Sysbench failover opts: mysql-ignore-errors=${ignore_errors}"
+
   # Foreground load job (not a wrapper subshell) so $! is the sysbench driver process.
-  # Line-buffer sysbench + tee so wait_for_sysbench_start sees log lines immediately.
   export SYSBENCH_LINE_BUFFER=1
-  run_tpcc_command run > >(_failover_tee_linebuffer "${log_file}") 2>&1 &
+  run_sysbench_tpcc "${tpcc}" "${opts[@]}" run > >(_failover_tee_linebuffer "${log_file}") 2>&1 &
   local load_pid=$!
   unset SYSBENCH_LINE_BUFFER
 
@@ -169,6 +305,10 @@ wait_for_sysbench_start() {
       fi
     fi
     if [[ -f "${log_file}" ]] && grep -qE 'Threads started!|^\[[[:space:]]*[0-9]+s \]' "${log_file}"; then
+      {
+        echo "SYSBENCH_READY_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "SYSBENCH_READY_EPOCH=$(date -u +%s)"
+      } >> "${results_dir}/sysbench_timing.txt"
       return 0
     fi
     sleep 1
@@ -197,23 +337,32 @@ analyze_primary_change() {
 
   awk -F'\t' -v trigger="${trigger_utc}" '
     NR <= 1 { next }
-    $2 == "ERROR" { next }
+    $3 != "1" { next }
     {
+      host = $4
+      ro = $5
       if (before == "" && (trigger == "" || $1 < trigger)) {
-        before = $2
+        before = host
+        before_ro = ro
       }
       if (trigger != "" && $1 >= trigger) {
-        after = $2
+        after = host
+        after_ro = ro
+        if (trigger_elapsed == "" && $2 != "") trigger_elapsed = $2
       } else if (trigger == "") {
-        after = $2
+        after = host
+        after_ro = ro
       }
-      last = $2
+      last = host
+      last_ro = ro
     }
     END {
       if (before == "") before = "N/A"
       if (after == "") after = last
       changed = (before != "N/A" && after != "N/A" && before != after) ? "yes" : "no"
       printf "PRIMARY_BEFORE=%s\nPRIMARY_AFTER=%s\nPRIMARY_CHANGED=%s\n", before, after, changed
+      if (before_ro != "") printf "PRIMARY_BEFORE_READ_ONLY=%s\n", before_ro
+      if (after_ro != "") printf "PRIMARY_AFTER_READ_ONLY=%s\n", after_ro
     }
   ' "${monitor_file}"
 }
@@ -386,6 +535,16 @@ END {
   }
 
   if (outage_start < 0) {
+    for (sec = trigger; sec <= trigger + 600; sec++) {
+      if (!(sec in tps_arr)) continue
+      if (err_arr[sec] > 0 || reconn_arr[sec] > 0) {
+        outage_start = sec
+        outage_end = sec
+        break
+      }
+    }
+  }
+  if (outage_start < 0) {
     outage_start = trigger
     outage_end = trigger
     outage_duration = 0
@@ -508,8 +667,322 @@ analyze_failover_metrics() {
 
   generate_failover_graphs "${results_dir}"
 
+  write_failover_extended_metrics "${results_dir}"
+
   echo "Analysis written: ${analysis_file}"
   echo "Metrics CSV:      ${csv_file}"
+  echo "Extended metrics: ${results_dir}/failover_extended_metrics.txt"
+}
+
+run_failover_tpcc_check() {
+  local results_dir="${1:?results dir required}"
+  local check_log="${results_dir}/tpcc_check.log"
+
+  failover_defaults
+  [[ "${FAILOVER_RUN_TPCC_CHECK:-0}" == "1" ]] || return 0
+
+  echo "--- Running TPC-C consistency check (FAILOVER_RUN_TPCC_CHECK=1) ---"
+  export TPCC_THREADS="${FAILOVER_THREADS}"
+  if run_tpcc_command check > "${check_log}" 2>&1; then
+    echo "TPCC_CHECK_RESULT=PASSED" > "${results_dir}/tpcc_check_result.env"
+    echo "TPC-C check: PASSED"
+    return 0
+  fi
+  echo "TPCC_CHECK_RESULT=FAILED" > "${results_dir}/tpcc_check_result.env"
+  echo "TPC-C check: FAILED — see ${check_log}"
+  return 1
+}
+
+write_failover_extended_metrics() {
+  local results_dir="${1:?results dir required}"
+  local out_file="${results_dir}/failover_extended_metrics.txt"
+  local timeseries="${results_dir}/failover_timeseries.csv"
+  local monitor="${results_dir}/primary_monitor.tsv"
+  local event_file="${results_dir}/failover_event.txt"
+  local parsed_file="${results_dir}/failover_parsed.env"
+  local check_result="${results_dir}/tpcc_check_result.env"
+  local k8s_log="${results_dir}/k8s_events.log"
+  local do_log="${results_dir}/do_events.log"
+  local trigger_log="${results_dir}/failover_trigger.log"
+  local sysbench_log="${results_dir}/sysbench_run.log"
+
+  failover_defaults
+
+  local trigger_second trigger_utc edition method target_pod
+  trigger_second=$(failover_trigger_second)
+  trigger_utc=""
+  edition="unknown"
+  method="unknown"
+  target_pod=""
+
+  if [[ -f "${results_dir}/sysbench_timing.txt" ]]; then
+    # shellcheck disable=SC1090
+    source "${results_dir}/sysbench_timing.txt" 2>/dev/null || true
+    trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
+  fi
+  if [[ -f "${event_file}" ]]; then
+    trigger_utc=$(grep -E '^FAILOVER_TRIGGER_UTC=' "${event_file}" | tail -1 | cut -d= -f2- || true)
+    edition=$(grep -E '^FAILOVER_EDITION=' "${event_file}" | tail -1 | cut -d= -f2- || echo "unknown")
+    method=$(grep -E '^FAILOVER_METHOD=' "${event_file}" | tail -1 | cut -d= -f2- || echo "unknown")
+    target_pod=$(grep -E '^FAILOVER_TARGET_POD=' "${event_file}" | tail -1 | cut -d= -f2- || true)
+  fi
+
+  local primary_env="${results_dir}/primary_change.env"
+  if [[ -f "${monitor}" ]]; then
+    analyze_primary_change "${monitor}" "${trigger_utc}" > "${primary_env}" 2>/dev/null || true
+  fi
+
+  local tpcc_check="SKIPPED"
+  [[ -f "${check_result}" ]] && tpcc_check=$(grep TPCC_CHECK_RESULT "${check_result}" | cut -d= -f2-)
+
+  local parsed_env=""
+  [[ -f "${parsed_file}" ]] && parsed_env="${parsed_file}"
+
+  local monitor_offset=0
+  local primary_before="N/A" primary_after="N/A" primary_changed="unknown"
+  if [[ -f "${primary_env}" ]]; then
+    # shellcheck disable=SC1090
+    source "${primary_env}" 2>/dev/null || true
+    primary_before="${PRIMARY_BEFORE:-N/A}"
+    primary_after="${PRIMARY_AFTER:-N/A}"
+    primary_changed="${PRIMARY_CHANGED:-unknown}"
+  fi
+  if [[ -f "${results_dir}/primary_monitor_meta.txt" && -f "${results_dir}/sysbench_timing.txt" ]]; then
+    local monitor_start sysbench_ready
+    monitor_start=$(grep -E '^MONITOR_START_EPOCH=' "${results_dir}/primary_monitor_meta.txt" | cut -d= -f2- || true)
+    sysbench_ready=$(grep -E '^SYSBENCH_READY_EPOCH=' "${results_dir}/sysbench_timing.txt" | cut -d= -f2- || true)
+    if [[ -n "${monitor_start}" && -n "${sysbench_ready}" ]]; then
+      monitor_offset=$((sysbench_ready - monitor_start))
+    fi
+  fi
+
+  awk -v trigger="${trigger_second}" \
+      -v trigger_utc="${trigger_utc}" \
+      -v edition="${edition}" \
+      -v method="${method}" \
+      -v target_pod="${target_pod}" \
+      -v tpcc_check="${tpcc_check}" \
+      -v recovery_pct="${FAILOVER_RECOVERY_THRESHOLD}" \
+      -v stable="${FAILOVER_RECOVERY_STABLE_SEC}" \
+      -v outage_ratio="${FAILOVER_OUTAGE_TPS_RATIO}" \
+      -v parsed_env="${parsed_env}" \
+      -v monitor="${monitor}" \
+      -v monitor_offset="${monitor_offset}" \
+      -v primary_before="${primary_before}" \
+      -v primary_after="${primary_after}" \
+      -v primary_changed="${primary_changed}" \
+      -v timeseries="${timeseries}" \
+      -v k8s_log="${k8s_log}" \
+      -v do_log="${do_log}" \
+      -v trigger_log="${trigger_log}" \
+      -v sysbench_log="${sysbench_log}" \
+      -f - > "${out_file}" <<'AWK'
+BEGIN {
+  failure_detect = -1
+  failure_detect_abs = -1
+  promote_sec = -1
+  connect_fail = -1
+  rto = -1
+  load_end_sec = 0
+  baseline = 0
+  recovery_threshold = 0
+  outage_start = 0
+  outage_end = 0
+  outage_duration = 0
+  min_tps_post = 0
+  min_qps_post = 0
+  max_lat_post = 0
+  peak_err_post = 0
+  peak_reconn_post = 0
+  below_recovery = 0
+  monitor_offset = monitor_offset + 0
+  if (parsed_env != "") {
+    while ((getline line < parsed_env) > 0) {
+      split(line, kv, "=")
+      key = kv[1]
+      val = substr(line, index(line, "=") + 1)
+      if (key == "BASELINE_TPS") baseline = val + 0
+      if (key == "OUTAGE_START") outage_start = val + 0
+      if (key == "OUTAGE_END") outage_end = val + 0
+      if (key == "OUTAGE_DURATION") outage_duration = val + 0
+      if (key == "RTO_SEC") rto = val + 0
+      if (key == "PEAK_ERR") peak_err = val + 0
+      if (key == "PEAK_RECONN") peak_reconn = val + 0
+      if (key == "PEAK_LAT95") peak_lat = val + 0
+      if (key == "RECOVERY_THRESHOLD") recovery_threshold = val + 0
+    }
+    close(parsed_env)
+  }
+  if (recovery_threshold == 0 && baseline > 0) recovery_threshold = baseline * recovery_pct
+}
+function load_timeseries(    f, sec, tps, qps, err, reconn, lat, max_sec) {
+  if (timeseries == "" || ( (getline _ < timeseries) <= 0 )) return
+  close(timeseries)
+  while ((getline line < timeseries) > 0) {
+    split(line, f, ",")
+    if (f[1] == "elapsed_sec") continue
+    sec = f[1] + 0
+    tps = f[3] + 0
+    qps = f[4] + 0
+    err = f[5] + 0
+    reconn = f[6] + 0
+    lat = f[7] + 0
+    if (sec > max_sec) max_sec = sec
+    if (sec < trigger && tps > 0) { pre_sum += tps; pre_cnt++ }
+    if (sec >= trigger) {
+      if (failure_detect < 0 && (err > 0 || reconn > 0 || (baseline > 0 && tps < baseline * outage_ratio))) {
+        failure_detect = sec - trigger
+        failure_detect_abs = sec
+      }
+      if (min_tps_post == 0 || tps < min_tps_post) min_tps_post = tps
+      if (min_qps_post == 0 || qps < min_qps_post) min_qps_post = qps
+      if (lat > max_lat_post) max_lat_post = lat
+      if (baseline > 0 && tps < recovery_threshold) below_recovery++
+      if (err > peak_err_post) peak_err_post = err
+      if (reconn > peak_reconn_post) peak_reconn_post = reconn
+    }
+  }
+  load_end_sec = max_sec
+  close(timeseries)
+}
+function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec, saw_fail) {
+  if (monitor == "" || ( (getline _ < monitor) <= 0 )) return
+  close(monitor)
+  while ((getline line < monitor) > 0) {
+    split(line, f, "\t")
+    if (f[1] == "timestamp_utc") continue
+    elapsed = f[2] + 0
+    sysbench_sec = elapsed - monitor_offset
+    if (f[3] != "1") {
+      if (sysbench_sec >= trigger && connect_fail < 0)
+        connect_fail = sysbench_sec - trigger
+      if (sysbench_sec >= trigger) saw_fail = 1
+      continue
+    }
+    host = f[4]
+    ro = f[5] + 0
+    gr = f[7]
+    if (primary_before == "N/A" && sysbench_sec < trigger) primary_before = host
+    if (sysbench_sec >= trigger) {
+      if (promote_sec < 0 && saw_fail && ro == 0 && (gr == "ONLINE" || gr == "PRIMARY"))
+        promote_sec = sysbench_sec - trigger
+      if (promote_sec < 0 && primary_before != "N/A" && host != primary_before && ro == 0)
+        promote_sec = sysbench_sec - trigger
+      if (primary_after == "N/A" && host != "ERROR") primary_after = host
+    }
+  }
+  close(monitor)
+}
+function count_fatal(    n) {
+  if (sysbench_log == "") return 0
+  while ((getline line < sysbench_log) > 0)
+    if (line ~ /^FATAL:/) n++
+  close(sysbench_log)
+  return n
+}
+function summarize_k8s(    block, in_block) {
+  if (k8s_log == "") return
+  print "K8s event highlights (see full log for details):"
+  while ((getline line < k8s_log) > 0) {
+    if (line ~ /^=== K8s events snapshot:/) {
+      if (block != "") print block
+      block = line
+      in_block = 1
+      next
+    }
+    if (in_block && line ~ /Killing|Unhealthy|Started|BackOff|Failed|Deleted|Created|Pulling|Pulled/) {
+      if (block != "") block = block "\n  " line
+      else block = "  " line
+    }
+  }
+  if (block != "") print block
+  close(k8s_log)
+  print ""
+}
+END {
+  load_timeseries()
+  load_monitor()
+  fatal_count = count_fatal()
+  if (baseline == 0 && pre_cnt > 0) baseline = pre_sum / pre_cnt
+  if (failure_detect < 0 && connect_fail >= 0) {
+    failure_detect = connect_fail
+    failure_detect_abs = trigger + connect_fail
+  }
+  if (failure_detect < 0 && outage_start >= trigger) {
+    failure_detect = outage_start - trigger
+    failure_detect_abs = outage_start
+  }
+
+  print "=== Failover Extended Metrics ==="
+  print "Generated:              " strftime("%Y-%m-%dT%H:%M:%SZ", systime())
+  print "Edition:                  " edition
+  print "Trigger method:           " method
+  print "Trigger UTC:              " (trigger_utc != "" ? trigger_utc : "N/A")
+  print "Trigger second:           " trigger " (from sysbench start)"
+  print "Target pod:               " (target_pod != "" ? target_pod : "N/A")
+  print ""
+  print "--- Timing (seconds from trigger unless noted) ---"
+  if (failure_detect >= 0)
+    printf "Time to detect failure:   %d s (sysbench sec %d)\n", failure_detect, failure_detect_abs
+  else
+    print "Time to detect failure:   NOT_DETECTED"
+  if (promote_sec >= 0)
+    printf "Time to promote primary:  %d s\n", promote_sec
+  else
+    print "Time to promote primary:  NOT_DETECTED (monitor off or no topology change seen)"
+  if (rto >= 0)
+    printf "Application recovery RTO: %d s (%.0f%% baseline for %ds)\n", rto, recovery_pct * 100, stable
+  else
+    print "Application recovery RTO: NOT_REACHED"
+  printf "Outage window:            sysbench sec %d-%d (%d s)\n", outage_start, outage_end, outage_duration
+  print ""
+  print "--- Topology (from monitor) ---"
+  print "Primary before:           " primary_before
+  print "Primary after:            " primary_after
+  print "Primary changed:          " primary_changed
+  print ""
+  print "--- Throughput / latency impact (post-trigger) ---"
+  if (baseline > 0) printf "Baseline TPS (pre-trigger):     %.2f\n", baseline
+  if (min_tps_post > 0 || baseline > 0) {
+    printf "Min TPS post-trigger:           %.2f\n", min_tps_post
+    if (baseline > 0) printf "Max TPS drop:                   %.1f%%\n", (1 - min_tps_post / baseline) * 100
+  }
+  if (min_qps_post > 0) printf "Min QPS post-trigger:           %.2f\n", min_qps_post
+  if (max_lat_post > 0) printf "Peak p95 latency post-trigger:  %.2f ms\n", max_lat_post
+  if (peak_err > 0) printf "Peak err/s (full run):          %.2f\n", peak_err
+  if (peak_reconn > 0) printf "Peak reconn/s (full run):       %.2f\n", peak_reconn
+  if (peak_lat > 0) printf "Peak p95 latency (full run):    %.2f ms\n", peak_lat
+  if (peak_err_post > 0) printf "Peak err/s post-trigger:        %.2f\n", peak_err_post
+  if (peak_reconn_post > 0) printf "Peak reconn/s post-trigger:     %.2f\n", peak_reconn_post
+  if (below_recovery > 0) printf "Seconds below recovery threshold: %d\n", below_recovery
+  print ""
+  print "--- Load continuity ---"
+  printf "Sysbench data ends at sec:      %d (expect ~%d)\n", load_end_sec, trigger + stable
+  if (load_end_sec > 0 && load_end_sec < trigger + 10)
+    print "WARNING: Sysbench stopped early — reconnect metrics may be incomplete"
+  if (fatal_count > 0)
+    printf "FATAL errors in sysbench log:   %d\n", fatal_count
+  else
+    print "FATAL errors in sysbench log:   0 (mysql-ignore-errors active)"
+  print ""
+  print "--- Data loss ---"
+  print "TPC-C consistency check:        " tpcc_check
+  print "Set FAILOVER_RUN_TPCC_CHECK=1 to validate TPC-C invariants after failover."
+  print ""
+  print "--- Control plane ---"
+  if (trigger_log != "") print "Trigger log:              " trigger_log
+  if (do_log != "") print "DO API events log:        " do_log
+  if (k8s_log != "") {
+    print "K8s events log:           " k8s_log
+    summarize_k8s()
+  }
+  print "--- Related artifacts ---"
+  print "Time series CSV:          " timeseries
+  print "Primary monitor TSV:      " monitor
+}
+AWK
+
+  echo "Extended metrics: ${out_file}"
 }
 
 write_failover_comparison() {
