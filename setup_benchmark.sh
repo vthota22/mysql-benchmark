@@ -34,7 +34,7 @@ install_deps_linux() {
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     git build-essential autoconf automake libtool pkg-config \
     libmysqlclient-dev libssl-dev luajit libluajit-5.1-dev \
-    mysql-client openssl ca-certificates
+    mysql-client openssl ca-certificates python3-matplotlib
 }
 
 install_deps_macos() {
@@ -80,6 +80,10 @@ if [[ ! -f "${TPCC_DIR}/tpcc.lua" ]]; then
   echo "ERROR: tpcc.lua not found after clone" >&2
   exit 1
 fi
+
+echo ""
+echo "--- Patching sysbench-tpcc for failover (safe ROLLBACK on reconnect) ---"
+"${SCRIPT_DIR}/scripts/patch_tpcc_failover.sh" "${TPCC_DIR}" || true
 
 echo ""
 echo "--- Verification ---"

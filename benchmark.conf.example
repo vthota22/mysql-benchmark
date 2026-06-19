@@ -50,3 +50,22 @@ MYSQL_VARS="version version_comment innodb_buffer_pool_size innodb_buffer_pool_i
 # Optional: document your intended cluster config (informational — set in DO control panel)
 # MYSQL_CLUSTER_PLAN="db-s-4vcpu-8gb"
 # MYSQL_NOTES="Buffer pool and CPU/RAM must match between Standard and Advanced clusters"
+
+# --- Longevity benchmark (sustained TPC-C load for days) ---
+# Run: ./run_longevity_benchmark.sh
+# Detached 7-day run: nohup ./run_longevity_benchmark.sh >> results/longevity_nohup.log 2>&1 &
+LONGEVITY_EDITIONS="advanced"
+LONGEVITY_DAYS=7                       # primary duration control (days)
+# LONGEVITY_DURATION_SEC=604800        # optional exact override in seconds (overrides LONGEVITY_DAYS)
+LONGEVITY_THREADS=32
+LONGEVITY_WARMUP_SEC=300
+LONGEVITY_REPORT_INTERVAL=60           # 60s intervals (~10k samples over 7 days)
+LONGEVITY_MONITOR_PRIMARY=1            # poll @@hostname during run (detect failovers)
+LONGEVITY_MONITOR_INTERVAL=60
+LONGEVITY_AUTO_RESTART=1               # restart sysbench if it exits before target duration
+LONGEVITY_RUN_TPCC_CHECK=1             # tpcc check before and after the run
+LONGEVITY_GENERATE_GRAPHS=1            # PNG charts at end (needs python3-matplotlib)
+
+# Reuses TPCC_TABLES=10 TPCC_SCALE=100 (~100 GB) from above.
+# After Advanced completes, switch to standard:
+#   LONGEVITY_EDITIONS="standard" SKIP_PREPARE=0 ./run_longevity_benchmark.sh
