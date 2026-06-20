@@ -24,6 +24,7 @@ failover_defaults() {
   : "${FAILOVER_GENERATE_GRAPHS:=1}"
   : "${FAILOVER_MONITOR_HOSTNAME:=0}"
   : "${FAILOVER_MONITOR_PRIMARY:=1}"
+  : "${FAILOVER_MONITOR_WRITE_PROBE:=1}"
   : "${FAILOVER_COLLECT_K8S_EVENTS:=1}"
   : "${FAILOVER_RUN_TPCC_CHECK:=0}"
   : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011}"
@@ -79,8 +80,25 @@ failover_monitor_enabled() {
   [[ "${FAILOVER_MONITOR_PRIMARY:-1}" == "1" || "${FAILOVER_MONITOR_HOSTNAME:-0}" == "1" ]]
 }
 
+_failover_ensure_write_probe_table() {
+  mysql_cli -e "
+    CREATE TABLE IF NOT EXISTS failover_write_probe (
+      id INT NOT NULL PRIMARY KEY,
+      heartbeat TIMESTAMP(6) NOT NULL
+        DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
+    ) ENGINE=InnoDB;" 2>/dev/null || true
+}
+
+_failover_write_probe_ok() {
+  [[ "${FAILOVER_MONITOR_WRITE_PROBE:-1}" == "1" ]] || return 1
+  mysql_cli -e "
+    INSERT INTO failover_write_probe (id, heartbeat) VALUES (1, NOW(6))
+    ON DUPLICATE KEY UPDATE heartbeat = NOW(6);" 2>/dev/null
+}
+
 start_primary_monitor() {
   local results_dir="${1:?results dir required}"
+  local edition="${2:-unknown}"
   local pid_file="${results_dir}/primary_monitor.pid"
   local out_file="${results_dir}/primary_monitor.tsv"
   local meta_file="${results_dir}/primary_monitor_meta.txt"
@@ -89,17 +107,24 @@ start_primary_monitor() {
   start_epoch=$(date -u +%s)
 
   : > "${out_file}"
-  echo -e "timestamp_utc\telapsed_sec\tconnect_ok\thostname\tread_only\tsuper_read_only\tgr_member_state\tconnect_error" >> "${out_file}"
+  echo -e "timestamp_utc\telapsed_sec\tconnect_ok\thostname\tread_only\tsuper_read_only\tgr_member_state\tgr_member_role\twrite_ok\tconnect_error" >> "${out_file}"
   {
     echo "MONITOR_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "MONITOR_START_EPOCH=${start_epoch}"
     echo "MONITOR_INTERVAL_SEC=${interval}"
+    echo "MONITOR_EDITION=${edition}"
   } > "${meta_file}"
+
+  _failover_ensure_write_probe_table
 
   (
     while true; do
       ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
       elapsed=$(( $(date -u +%s) - start_epoch ))
+      local write_ok=0
+      if _failover_write_probe_ok; then
+        write_ok=1
+      fi
       row=$(mysql_cli -N -B -e "
         SELECT @@hostname,
                @@global.read_only,
@@ -109,13 +134,19 @@ start_primary_monitor() {
                    FROM performance_schema.replication_group_members
                   WHERE MEMBER_ID = @@server_uuid
                   LIMIT 1
+               ), 'N/A'),
+               IFNULL((
+                 SELECT MEMBER_ROLE
+                   FROM performance_schema.replication_group_members
+                  WHERE MEMBER_ID = @@server_uuid
+                  LIMIT 1
                ), 'N/A');" 2>/dev/null) || row=""
       if [[ "${row}" == *$'\t'* && "${row}" != *"ERROR"* ]]; then
-        echo -e "${ts}\t${elapsed}\t1\t${row}\t" >> "${out_file}"
+        echo -e "${ts}\t${elapsed}\t1\t${row}\t${write_ok}\t" >> "${out_file}"
       else
         err=${row//$'\t'/ }
         err=${err//$'\n'/ }
-        echo -e "${ts}\t${elapsed}\t0\tERROR\tERROR\tERROR\tERROR\t${err}" >> "${out_file}"
+        echo -e "${ts}\t${elapsed}\t0\tERROR\tERROR\tERROR\tERROR\tERROR\t${write_ok}\t${err}" >> "${out_file}"
       fi
       sleep "${interval}"
     done
@@ -182,7 +213,7 @@ start_failover_watchers() {
 
   if failover_monitor_enabled; then
     echo "--- Starting primary / topology monitor ---"
-    start_primary_monitor "${results_dir}"
+    start_primary_monitor "${results_dir}" "${edition}"
   fi
   if [[ "${edition}" == "advanced" ]]; then
     : > "${results_dir}/k8s_events.log"
@@ -815,26 +846,87 @@ function detect_failure(    sec, app, db, sysbench_sec) {
   if (db >= 0) return db
   return -1
 }
-function detect_primary_election(    saw_fail, host, ro, gr, sysbench_sec) {
+function monitor_gr_state(f) { return f[7] }
+function monitor_gr_role(f) {
+  if (length(f) >= 9 && f[8] != "" && f[8] != "ERROR") return f[8]
+  return ""
+}
+function monitor_write_ok(f) {
+  if (length(f) >= 10 && f[9] != "" && f[9] != "ERROR") return f[9] + 0
+  return -1
+}
+function monitor_is_new_format(f) {
+  role = monitor_gr_role(f)
+  return (role == "PRIMARY" || role == "SECONDARY" || role == "ONLINE" || role == "OFFLINE")
+}
+function is_primary_elected(f, saw_fail, saw_write_fail,    wo, role, ro, gr, host) {
+  if (f[3] != "1") return 0
+  wo = monitor_write_ok(f)
+  role = monitor_gr_role(f)
+  ro = f[5] + 0
+  gr = monitor_gr_state(f)
+  host = f[4]
+  changed_host = (primary_before != "N/A" && host != primary_before && host != "ERROR")
+  if (role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY") && changed_host) return 1
+  if (wo == 1 && (saw_write_fail || saw_fail) && (changed_host || edition != "advanced")) return 1
+  if (edition == "advanced") {
+    if (wo == 1 && saw_write_fail) return 1
+    if (changed_host) return 1
+    return 0
+  }
+  if (wo == 1 && (changed_host || saw_fail)) return 1
+  if (ro == 0 && (gr == "ONLINE" || gr == "PRIMARY") && (changed_host || saw_fail)) return 1
+  return 0
+}
+function detect_primary_election_from_monitor(    saw_fail, saw_write_fail, prev_write_ok, sysbench_sec) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
   close(monitor)
   while ((getline line < monitor) > 0) {
     split(line, f, "\t")
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
-    if (sysbench_sec < trigger) continue
+    if (sysbench_sec < trigger) {
+      wo = monitor_write_ok(f)
+      if (wo >= 0) prev_write_ok = wo
+      continue
+    }
     if (f[3] != "1") {
       saw_fail = 1
       continue
     }
-    host = f[4]
-    ro = f[5] + 0
-    gr = f[7]
-    if (ro == 0 && (gr == "ONLINE" || gr == "PRIMARY") \
-        && (saw_fail || (primary_before != "N/A" && host != primary_before)))
+    wo = monitor_write_ok(f)
+    if (wo == 0) saw_write_fail = 1
+    if (is_primary_elected(f, saw_fail, saw_write_fail))
       return sysbench_sec - trigger
+    if (wo >= 0) prev_write_ok = wo
   }
   close(monitor)
+  return -1
+}
+function detect_primary_election_from_tps(failure_rel,    sec, start) {
+  if (edition != "advanced") return -1
+  start = trigger + (failure_rel >= 0 ? failure_rel : 0)
+  for (sec = start; sec <= observe_end; sec++) {
+    if (!(sec in tps_arr)) continue
+    if (baseline_tps > 0 && tps_arr[sec] >= tps_thresh)
+      return sec - trigger
+  }
+  return -1
+}
+function detect_primary_election(failure_rel,    mon, tps) {
+  mon = detect_primary_election_from_monitor()
+  if (edition != "advanced") return mon
+  tps = detect_primary_election_from_tps(failure_rel)
+  if (mon < 0) return tps
+  if (tps < 0) return mon
+  return (mon < tps ? mon : tps)
+}
+function detect_tps_recovery(start_sec,    sec) {
+  for (sec = start_sec; sec <= observe_end; sec++) {
+    if (!(sec in tps_arr)) continue
+    if (baseline_tps > 0 && tps_arr[sec] >= tps_thresh)
+      return sec - trigger
+  }
   return -1
 }
 function detect_qps_recovery(start_sec,    sec) {
@@ -902,12 +994,16 @@ function fmt_lat(v) {
 END {
   load_timeseries()
   failure_sec = detect_failure()
-  election_sec = detect_primary_election()
+  election_sec = detect_primary_election(failure_sec)
   recovery_start_sec = trigger
+  if (failure_sec >= 0) recovery_start_sec = trigger + failure_sec
   if (election_sec >= 0) recovery_start_sec = trigger + election_sec
-  recovery_rel = detect_qps_recovery(recovery_start_sec)
+  recovery_rel = detect_tps_recovery(recovery_start_sec)
+  if (recovery_rel < 0) recovery_rel = detect_qps_recovery(recovery_start_sec)
   election_duration = phase_duration(election_sec, failure_sec)
   recovery_duration = phase_duration(recovery_rel, election_sec)
+  if (recovery_rel >= 0 && election_sec >= 0 && recovery_rel < election_sec)
+    recovery_duration = 0
   dip_sec = dip_duration(failure_sec, recovery_rel)
   peak_lat = peak_latency(failure_sec, recovery_rel)
   tx_failed = errors_in_window(failure_sec, recovery_rel)
@@ -1085,6 +1181,7 @@ function load_timeseries(    f, sec, tps, qps, err, reconn, lat, max_sec) {
     err = f[5] + 0
     reconn = f[6] + 0
     lat = f[7] + 0
+    tps_arr[sec] = tps
     if (sec > max_sec) max_sec = sec
     if (sec < trigger && tps > 0) { pre_sum += tps; pre_cnt++ }
     if (sec >= trigger) {
@@ -1103,7 +1200,45 @@ function load_timeseries(    f, sec, tps, qps, err, reconn, lat, max_sec) {
   load_end_sec = max_sec
   close(timeseries)
 }
-function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec, saw_fail) {
+function monitor_gr_state(f) { return f[7] }
+function monitor_gr_role(f) {
+  if (length(f) >= 9 && f[8] != "" && f[8] != "ERROR") return f[8]
+  return ""
+}
+function monitor_write_ok(f) {
+  if (length(f) >= 10 && f[9] != "" && f[9] != "ERROR") return f[9] + 0
+  return -1
+}
+function is_primary_elected(f, saw_fail, saw_write_fail,    wo, role, ro, gr, host) {
+  if (f[3] != "1") return 0
+  wo = monitor_write_ok(f)
+  role = monitor_gr_role(f)
+  ro = f[5] + 0
+  gr = monitor_gr_state(f)
+  host = f[4]
+  changed_host = (primary_before != "N/A" && host != primary_before && host != "ERROR")
+  if (role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY") && changed_host) return 1
+  if (wo == 1 && (saw_write_fail || saw_fail) && (changed_host || edition != "advanced")) return 1
+  if (edition == "advanced") {
+    if (wo == 1 && saw_write_fail) return 1
+    if (changed_host) return 1
+    return 0
+  }
+  if (wo == 1 && (changed_host || saw_fail)) return 1
+  if (ro == 0 && (gr == "ONLINE" || gr == "PRIMARY") && (changed_host || saw_fail)) return 1
+  return 0
+}
+function detect_promote_from_tps(failure_rel,    sec, start) {
+  if (edition != "advanced") return -1
+  start = trigger + (failure_rel >= 0 ? failure_rel : 0)
+  for (sec = start; sec <= load_end_sec; sec++) {
+    if (!(sec in tps_arr)) continue
+    if (baseline > 0 && tps_arr[sec] >= recovery_threshold)
+      return sec - trigger
+  }
+  return -1
+}
+function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec, saw_fail, saw_write_fail, wo) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return
   close(monitor)
   while ((getline line < monitor) > 0) {
@@ -1119,12 +1254,12 @@ function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec, saw_fail) {
     }
     host = f[4]
     ro = f[5] + 0
-    gr = f[7]
+    gr = monitor_gr_state(f)
     if (primary_before == "N/A" && sysbench_sec < trigger) primary_before = host
     if (sysbench_sec >= trigger) {
-      if (promote_sec < 0 && saw_fail && ro == 0 && (gr == "ONLINE" || gr == "PRIMARY"))
-        promote_sec = sysbench_sec - trigger
-      if (promote_sec < 0 && primary_before != "N/A" && host != primary_before && ro == 0)
+      wo = monitor_write_ok(f)
+      if (wo == 0) saw_write_fail = 1
+      if (promote_sec < 0 && is_primary_elected(f, saw_fail, saw_write_fail))
         promote_sec = sysbench_sec - trigger
       if (primary_after == "N/A" && host != "ERROR") primary_after = host
     }
@@ -1158,6 +1293,11 @@ function summarize_k8s(    block, in_block) {
 END {
   load_timeseries()
   load_monitor()
+  if (edition == "advanced") {
+    tps_promote = detect_promote_from_tps(failure_detect)
+    if (tps_promote >= 0 && (promote_sec < 0 || tps_promote < promote_sec))
+      promote_sec = tps_promote
+  }
   fatal_count = count_fatal()
   if (baseline == 0 && pre_cnt > 0) baseline = pre_sum / pre_cnt
   if (failure_detect < 0 && connect_fail >= 0) {
@@ -1183,9 +1323,9 @@ END {
   else
     print "Time to detect failure:   NOT_DETECTED"
   if (promote_sec >= 0)
-    printf "Time to promote primary:  %d s\n", promote_sec
+    printf "Time to promote primary:  %d s (write probe / GR role / TPS recovery)\n", promote_sec
   else
-    print "Time to promote primary:  NOT_DETECTED (monitor off or no topology change seen)"
+    print "Time to promote primary:  NOT_DETECTED (monitor off or no promotion signal seen)"
   if (rto >= 0)
     printf "Application recovery RTO: %d s (%.0f%% baseline for %ds)\n", rto, recovery_pct * 100, stable
   else
