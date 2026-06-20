@@ -499,10 +499,8 @@ generate_failover_graphs() {
   fi
 
   if ! python3 -c "import matplotlib" 2>/dev/null; then
-    echo "WARNING: python3 matplotlib not installed — skipping graphs" >&2
-    echo "  Install: sudo apt-get install -y python3-matplotlib  OR  pip3 install matplotlib" >&2
-    echo "  Re-run:  ./generate_failover_graphs.sh ${target}" >&2
-    return 0
+    echo "NOTE: matplotlib not installed — HTML report only (no PNG)." >&2
+    echo "  PNG:  sudo apt-get install -y python3-matplotlib  OR  pip3 install matplotlib" >&2
   fi
 
   python3 "${py_script}" "${target}"
@@ -702,6 +700,7 @@ analyze_failover_metrics() {
     echo "--- Time series ---"
     echo "Full per-second TPS/QPS CSV: ${results_dir}/failover_timeseries.csv"
     echo "Graphs (if generated):       ${results_dir}/graphs/"
+    echo "HTML report:                 ${results_dir}/graphs/failover_report.html"
   } | tee "${analysis_file}"
 
   local header="edition,trigger_method,trigger_utc,baseline_tps,outage_start_sec,outage_duration_sec,rto_sec,peak_err_per_sec,peak_reconn_per_sec,peak_lat_p95_ms"

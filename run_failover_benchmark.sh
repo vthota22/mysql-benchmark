@@ -136,6 +136,7 @@ run_failover_edition() {
   echo "  Metrics CSV:      ${edition_dir}/failover_metrics.csv"
   echo "  Time series:      ${edition_dir}/failover_timeseries.csv"
   echo "  Graphs:           ${edition_dir}/graphs/"
+  echo "  HTML report:      ${edition_dir}/graphs/failover_report.html"
 }
 
 FAILED=0

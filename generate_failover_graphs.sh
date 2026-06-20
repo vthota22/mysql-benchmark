@@ -1,17 +1,30 @@
 #!/usr/bin/env bash
-# Generate TPS/QPS/error graphs from an existing failover benchmark run.
+# Generate TPS/QPS graphs (PNG) and interactive HTML report from an existing failover run.
 #
 # Usage:
 #   ./generate_failover_graphs.sh results/failover_<timestamp>/advanced
 #   ./generate_failover_graphs.sh results/failover_<timestamp>   # all editions + comparison
+#
+# Options (pass through to Python):
+#   ./generate_failover_graphs.sh --html-only results/failover_<timestamp>/advanced
+#   ./generate_failover_graphs.sh --png-only  results/failover_<timestamp>/advanced
+#
+# Output:
+#   <edition>/graphs/failover_report.html   (interactive; no extra deps)
+#   <edition>/graphs/failover_*.png         (requires python3-matplotlib)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TARGET="${1:?Usage: $0 <edition_dir|failover_results_root>}"
 
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 [--html-only|--png-only] <edition_dir|failover_results_root>" >&2
+  exit 1
+fi
+
+TARGET="${@: -1}"
 if [[ ! -d "${TARGET}" ]]; then
   echo "ERROR: not a directory: ${TARGET}" >&2
   exit 1
 fi
 
-python3 "${SCRIPT_DIR}/scripts/generate_failover_graphs.py" "${TARGET}"
+python3 "${SCRIPT_DIR}/scripts/generate_failover_graphs.py" "$@"
