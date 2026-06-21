@@ -90,6 +90,17 @@ tpcc_dir() {
   echo "${TPCC_DIR:-${BENCH_ROOT}/TPCC/sysbench-tpcc}"
 }
 
+ensure_tpcc_failover_patch() {
+  local tpcc patch_script
+  tpcc="$(tpcc_dir)"
+  patch_script="${BENCH_ROOT}/scripts/patch_tpcc_failover.sh"
+  if [[ ! -f "${patch_script}" ]]; then
+    echo "WARNING: missing ${patch_script} — tpcc failover patch skipped" >&2
+    return 0
+  fi
+  bash "${patch_script}" "${tpcc}"
+}
+
 run_tpcc() {
   local subcommand="${1:?prepare|run|cleanup}"
   shift
@@ -101,6 +112,10 @@ run_tpcc() {
   if [[ ! -f "${tpcc}/tpcc.lua" ]]; then
     echo "ERROR: Missing ${tpcc}/tpcc.lua — run ../setup_benchmark.sh first" >&2
     exit 1
+  fi
+
+  if [[ "${subcommand}" == "run" ]]; then
+    ensure_tpcc_failover_patch
   fi
 
   tables="${TPCC_TABLES:-10}"

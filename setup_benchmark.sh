@@ -126,6 +126,10 @@ if [[ ! -f "${TPCC_DIR}/tpcc.lua" ]]; then
 fi
 
 echo ""
+echo "--- Patching sysbench-tpcc for failover (safe ROLLBACK on reconnect) ---"
+"${SCRIPT_DIR}/scripts/patch_tpcc_failover.sh" "${TPCC_DIR}"
+
+echo ""
 install_doctl
 
 echo ""
