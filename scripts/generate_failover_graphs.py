@@ -7,6 +7,7 @@ import argparse
 import csv
 import html
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -34,7 +35,40 @@ KPI_LABELS = {
     "tps_dip_duration_sec": "TPS dip duration (s)",
     "peak_latency_failover_ms": "Peak latency (ms)",
     "transactions_failed_during_failover": "Failed transactions",
+    "writes_failed_during_failover": "Writes failed (write_only)",
+    "peak_write_err_per_sec": "Peak write err/s",
+    "scenario": "Scenario",
+    "trx_profile": "TPC-C profile",
     "data_loss": "Data loss",
+}
+
+METRIC_HELP = {
+    "detect": (
+        "Seconds from failover trigger until sysbench or the DB monitor first sees failure "
+        "(errors/reconnects, TPS/QPS below 5% of baseline, or connect_ok=0)."
+    ),
+    "promote": (
+        "Seconds from trigger until a new primary is confirmed (monitor: hostname change, "
+        "GR PRIMARY role, or write probe OK after a failure). KPI phase duration is "
+        "promotion minus detection."
+    ),
+    "recovery": (
+        "Seconds from primary promotion until TPS stays at or above 90% baseline for 30 consecutive "
+        "seconds (application RTO). KPI app_recovery_sec is the phase after promotion; "
+        "failover_parsed.env RTO_SEC counts from trigger."
+    ),
+    "impact": (
+        "Post-trigger throughput and latency from per-second sysbench data. Charts show the full "
+        "time series; summary values are min/peak over seconds after the trigger."
+    ),
+    "data_loss": (
+        "TPC-C consistency check after failover (warehouse/district/order invariants). "
+        "PASSED means no detected data loss; SKIPPED if FAILOVER_RUN_TPCC_CHECK=0."
+    ),
+    "writes_failed": (
+        "Sum of ignored SQL errors and reconnects during the failover window (failure through recovery). "
+        "In write_only mode every transaction is new_order or payment, so this approximates failed write attempts."
+    ),
 }
 
 
@@ -55,7 +89,7 @@ def load_kpi(path: Path) -> dict[str, str]:
     with path.open(newline="") as fh:
         reader = csv.DictReader(fh)
         for row in reader:
-            return {k: v for k, v in row.items() if k != "edition"}
+            return dict(row)
     return {}
 
 
@@ -223,15 +257,192 @@ def plot_comparison(
     plt.close(fig)
 
 
-def _kpi_table_html(kpi: dict[str, str]) -> str:
-    if not kpi:
-        return "<p class=\"muted\">No failover_kpi.csv found.</p>"
-    rows_html = "".join(
+def _parse_extended_metrics(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8", errors="replace")
+    patterns = {
+        "failure_detect_sec": r"Time to detect failure:\s+([\d.]+)\s+s\b",
+        "promote_sec": r"Time to promote primary:\s+([\d.]+)\s+s\b",
+        "rto_sec": r"Application recovery RTO:\s+([\d.]+)\s+s\b",
+        "primary_before": r"Primary before:\s+(\S+)",
+        "primary_after": r"Primary after:\s+(\S+)",
+        "primary_changed": r"Primary changed:\s+(\S+)",
+        "min_tps_post": r"Min TPS post-trigger:\s+([\d.]+)",
+        "max_tps_drop_pct": r"Max TPS drop:\s+([\d.]+)%",
+        "min_qps_post": r"Min QPS post-trigger:\s+([\d.]+)",
+        "peak_lat_post_ms": r"Peak p95 latency post-trigger:\s+([\d.]+)\s+ms",
+        "tpcc_check": r"TPC-C consistency check:\s+(\S+)",
+    }
+    out: dict[str, str] = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text)
+        if match:
+            out[key] = match.group(1)
+    return out
+
+
+def _format_duration_sec(value: str | float | int | None) -> str:
+    if value is None or value == "" or str(value).upper() in {"N/A", "NOT_DETECTED", "NOT_REACHED"}:
+        return "N/A"
+    try:
+        sec = float(value)
+    except (TypeError, ValueError):
+        return html.escape(str(value))
+    ms = int(round(sec * 1000))
+    if sec >= 60:
+        minutes = sec / 60
+        return f"{sec:.2f} s ({ms:,} ms · {minutes:.2f} min)"
+    if sec < 1:
+        return f"{ms:,} ms ({sec:.3f} s)"
+    if sec == int(sec):
+        return f"{int(sec)} s ({ms:,} ms)"
+    return f"{sec:.2f} s ({ms:,} ms)"
+
+
+def _format_latency_ms(value: str | float | int | None) -> str:
+    if value is None or value == "" or str(value).upper() == "N/A":
+        return "N/A"
+    try:
+        ms = float(value)
+    except (TypeError, ValueError):
+        return html.escape(str(value))
+    sec = ms / 1000
+    if ms >= 1000:
+        return f"{ms:,.2f} ms ({sec:.2f} s · {sec / 60:.3f} min)"
+    return f"{ms:.2f} ms ({sec:.3f} s)"
+
+
+def _metric_row(title: str, value: str, help_text: str, *, sub: str = "", raw_value: bool = False) -> str:
+    sub_html = f'<div class="metric-sub">{html.escape(sub)}</div>' if sub else ""
+    value_html = value if raw_value else html.escape(value)
+    return (
+        f'<tr><td class="metric-cell">'
+        f'<div class="metric-title">{html.escape(title)}</div>'
+        f'<div class="metric-value">{value_html}</div>'
+        f"{sub_html}"
+        f'<div class="metric-help">({html.escape(help_text)})</div>'
+        f"</td></tr>"
+    )
+
+
+def _metrics_summary_html(
+    kpi: dict[str, str],
+    extended: dict[str, str],
+    primary: dict[str, str],
+    parsed: dict[str, str],
+) -> str:
+    if not kpi and not extended:
+        return '<p class="muted">No failover_kpi.csv or failover_extended_metrics.txt found.</p>'
+
+    detect = kpi.get("failure_detection_sec") or extended.get("failure_detect_sec", "N/A")
+    promote_abs = extended.get("promote_sec", "N/A")
+    promote_phase = kpi.get("primary_election_sec", "N/A")
+    recovery_phase = kpi.get("app_recovery_sec", "N/A")
+    rto = parsed.get("RTO_SEC") or extended.get("rto_sec", "N/A")
+    data_loss = kpi.get("data_loss") or extended.get("tpcc_check", "N/A")
+
+    before = primary.get("PRIMARY_BEFORE") or extended.get("primary_before", "N/A")
+    after = primary.get("PRIMARY_AFTER") or extended.get("primary_after", "N/A")
+    changed = primary.get("PRIMARY_CHANGED") or extended.get("primary_changed", "N/A")
+
+    min_tps = extended.get("min_tps_post", "N/A")
+    max_drop = extended.get("max_tps_drop_pct", "N/A")
+    min_qps = extended.get("min_qps_post", "N/A")
+    peak_lat = (
+        extended.get("peak_lat_post_ms")
+        or kpi.get("peak_latency_failover_ms")
+        or "N/A"
+    )
+    tps_dip = kpi.get("tps_dip_duration_sec", "N/A")
+    tx_failed = kpi.get("transactions_failed_during_failover", "N/A")
+    writes_failed = kpi.get("writes_failed_during_failover", "N/A")
+    peak_write_err = kpi.get("peak_write_err_per_sec", "N/A")
+    trx_profile = kpi.get("trx_profile", "mixed")
+
+    impact_parts: list[str] = []
+    if min_tps != "N/A":
+        impact_parts.append(f"Min TPS post-trigger: {min_tps}")
+    if max_drop != "N/A":
+        impact_parts.append(f"Max TPS drop: {max_drop}%")
+    if min_qps != "N/A":
+        impact_parts.append(f"Min QPS post-trigger: {min_qps}")
+    if peak_lat != "N/A":
+        impact_parts.append(f"Peak p95 latency: {_format_latency_ms(peak_lat)}")
+    if tps_dip not in {"", "N/A"}:
+        impact_parts.append(f"Seconds below 90% baseline (KPI): {tps_dip} s")
+    if tx_failed not in {"", "N/A"}:
+        impact_parts.append(f"Error events in failover window (KPI): {tx_failed}")
+    if writes_failed not in {"", "N/A", "-"}:
+        impact_parts.append(f"Writes failed (write_only KPI): {writes_failed}")
+    if peak_write_err not in {"", "N/A", "-", "0", "0.00"}:
+        impact_parts.append(f"Peak write err/s: {peak_write_err}")
+    impact_value = (
+        "".join(f"<div>{html.escape(part)}</div>" for part in impact_parts)
+        if impact_parts
+        else "N/A"
+    )
+
+    rows = [
+        _metric_row(
+            "Time to detect failure",
+            _format_duration_sec(detect),
+            METRIC_HELP["detect"],
+        ),
+        _metric_row(
+            "Time to promote new primary",
+            _format_duration_sec(promote_abs),
+            METRIC_HELP["promote"],
+            sub=(
+                f"KPI phase (election − detection): {_format_duration_sec(promote_phase)} · "
+                f"Primary: {before} → {after} ({changed})"
+            ),
+        ),
+        _metric_row(
+            "Time for application recovery",
+            _format_duration_sec(rto),
+            METRIC_HELP["recovery"],
+            sub=f"KPI phase (recovery − promotion): {_format_duration_sec(recovery_phase)}",
+        ),
+        _metric_row(
+            "Impact on TPS / QPS / latency",
+            impact_value,
+            METRIC_HELP["impact"],
+            sub="See charts on the right for full per-second series.",
+            raw_value=True,
+        ),
+    ]
+    if trx_profile == "write_only" and writes_failed not in {"", "N/A", "-"}:
+        rows.append(
+            _metric_row(
+                "Writes failed during failover",
+                str(writes_failed),
+                METRIC_HELP["writes_failed"],
+                sub=f"Peak write err/s: {peak_write_err} · profile={trx_profile}",
+            )
+        )
+    rows.append(
+        _metric_row(
+            "Data loss (if any)",
+            html.escape(str(data_loss)),
+            METRIC_HELP["data_loss"],
+        )
+    )
+
+    detail_rows = "".join(
         f"<tr><th>{html.escape(KPI_LABELS.get(k, k))}</th>"
         f"<td>{html.escape(str(v))}</td></tr>"
         for k, v in kpi.items()
+        if k != "edition"
     )
-    return f"<table class=\"kpi\"><tbody>{rows_html}</tbody></table>"
+    detail_table = (
+        f'<details class="kpi-detail"><summary>Raw KPI CSV fields</summary>'
+        f'<table class="kpi"><tbody>{detail_rows}</tbody></table></details>'
+        if kpi
+        else ""
+    )
+
+    return f'<table class="metrics"><tbody>{"".join(rows)}</tbody></table>{detail_table}'
 
 
 def generate_html_report(
@@ -242,9 +453,15 @@ def generate_html_report(
     event: dict[str, str],
     kpi: dict[str, str],
     png_files: list[Path],
+    extended: dict[str, str] | None = None,
+    primary: dict[str, str] | None = None,
 ) -> Path:
+    extended = extended or {}
+    primary = primary or {}
     trigger = float(meta.get("FAILOVER_TRIGGER_SECOND", "0"))
-    edition = meta.get("FAILOVER_EDITION", edition_dir.name)
+    scenario = meta.get("FAILOVER_SCENARIO", edition_dir.name if edition_dir.name in {"mixed", "write_only"} else "default")
+    trx_profile = meta.get("TPCC_TRX_PROFILE", kpi.get("trx_profile", "mixed"))
+    edition = meta.get("FAILOVER_EDITION", edition_dir.parent.name if edition_dir.name in {"mixed", "write_only"} else edition_dir.name)
     baseline = float(parsed.get("BASELINE_TPS", "0"))
     recovery = float(parsed.get("RECOVERY_THRESHOLD", str(baseline * 0.9 if baseline else 0)))
     outage_start = float(parsed.get("OUTAGE_START", trigger))
@@ -274,6 +491,8 @@ def generate_html_report(
 
     meta_rows = [
         ("Edition", edition),
+        ("Scenario", scenario),
+        ("TPC-C profile", trx_profile),
         ("Sysbench start (UTC)", meta.get("SYSBENCH_START_UTC", "N/A")),
         ("Failover trigger (UTC)", event.get("FAILOVER_TRIGGER_UTC", "N/A")),
         ("Trigger second", str(int(trigger)) if trigger else "N/A"),
@@ -294,7 +513,7 @@ def generate_html_report(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Failover report — {html.escape(edition)}</title>
+  <title>Failover report — {html.escape(edition)} / {html.escape(scenario)}</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
   <style>
@@ -323,6 +542,15 @@ def generate_html_report(
     th {{ text-align: left; color: var(--muted); font-weight: 500; padding: 0.35rem 0.5rem 0.35rem 0; }}
     td {{ padding: 0.35rem 0; }}
     table.kpi th {{ width: 55%; }}
+    table.metrics {{ font-size: 0.9rem; }}
+    table.metrics td.metric-cell {{ padding: 0.65rem 0; border-bottom: 1px solid var(--border); }}
+    table.metrics tr:last-child td.metric-cell {{ border-bottom: none; }}
+    .metric-title {{ font-weight: 600; color: var(--text); margin-bottom: 0.2rem; }}
+    .metric-value {{ font-size: 1.05rem; color: var(--accent); margin-bottom: 0.15rem; }}
+    .metric-sub {{ color: var(--muted); font-size: 0.82rem; margin-bottom: 0.2rem; }}
+    .metric-help {{ color: var(--muted); font-size: 0.78rem; line-height: 1.35; }}
+    .kpi-detail {{ margin-top: 0.75rem; color: var(--muted); font-size: 0.85rem; }}
+    .kpi-detail summary {{ cursor: pointer; color: var(--accent); }}
     .chart-wrap {{ position: relative; height: 320px; margin-bottom: 1rem; }}
     .muted {{ color: var(--muted); font-size: 0.9rem; }}
     ul {{ margin: 0.25rem 0 0; padding-left: 1.25rem; }}
@@ -331,7 +559,7 @@ def generate_html_report(
 </head>
 <body>
   <h1>Failover benchmark report</h1>
-  <p class="subtitle">{html.escape(edition)} · generated from {html.escape(edition_dir.name)}</p>
+  <p class="subtitle">{html.escape(edition)} · {html.escape(scenario)} ({html.escape(trx_profile)}) · {html.escape(edition_dir.name)}</p>
 
   <div class="grid">
     <div>
@@ -340,8 +568,8 @@ def generate_html_report(
         <table><tbody>{meta_html}</tbody></table>
       </div>
       <div class="card" style="margin-top:1rem">
-        <h2>KPI summary</h2>
-        {_kpi_table_html(kpi)}
+        <h2>Failover metrics</h2>
+        {_metrics_summary_html(kpi, extended, primary, parsed)}
       </div>
       {"<div class=\"card\" style=\"margin-top:1rem\"><h2>PNG exports</h2><ul>" + png_links + "</ul></div>" if png_links else ""}
     </div>
@@ -489,6 +717,8 @@ def generate_for_edition(edition_dir: Path, *, png: bool = True, html: bool = Tr
     parsed = load_metadata(edition_dir / "failover_parsed.env")
     event = load_metadata(edition_dir / "failover_event.txt")
     kpi = load_kpi(edition_dir / "failover_kpi.csv")
+    extended = _parse_extended_metrics(edition_dir / "failover_extended_metrics.txt")
+    primary = load_metadata(edition_dir / "primary_change.env")
 
     outputs: list[Path] = []
     png_files: list[Path] = []
@@ -506,10 +736,32 @@ def generate_for_edition(edition_dir: Path, *, png: bool = True, html: bool = Tr
             outputs.extend(png_files)
 
     if html:
-        html_path = generate_html_report(edition_dir, rows, meta, parsed, event, kpi, png_files)
+        html_path = generate_html_report(
+            edition_dir, rows, meta, parsed, event, kpi, png_files, extended, primary
+        )
         outputs.append(html_path)
 
     return outputs
+
+
+def discover_edition_dirs(path: Path) -> tuple[list[Path], Path]:
+    """Find result dirs containing failover_timeseries.csv (edition or edition/scenario)."""
+    if (path / "failover_timeseries.csv").exists():
+        return [path], path.parent
+
+    dirs: list[Path] = []
+    if path.is_dir():
+        for child in sorted(path.iterdir()):
+            if not child.is_dir():
+                continue
+            if (child / "failover_timeseries.csv").exists():
+                dirs.append(child)
+                continue
+            for scenario_dir in sorted(child.iterdir()):
+                if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
+                    dirs.append(scenario_dir)
+
+    return dirs, path
 
 
 def main() -> int:
@@ -517,7 +769,7 @@ def main() -> int:
     parser.add_argument(
         "path",
         type=Path,
-        help="Edition results dir or failover_<timestamp> root containing standard/ advanced/",
+        help="Scenario dir, edition dir, or failover_<timestamp> root (standard/ advanced/ or nested mixed/ write_only/)",
     )
     parser.add_argument("--png-only", action="store_true", help="Generate PNG files only")
     parser.add_argument("--html-only", action="store_true", help="Generate HTML report only")
@@ -527,14 +779,7 @@ def main() -> int:
     do_png = not args.html_only
     do_html = not args.png_only
 
-    if (path / "failover_timeseries.csv").exists():
-        edition_dirs = [path]
-        results_root = path.parent
-    else:
-        edition_dirs = sorted(
-            d for d in path.iterdir() if d.is_dir() and (d / "failover_timeseries.csv").exists()
-        )
-        results_root = path
+    edition_dirs, results_root = discover_edition_dirs(path)
 
     if not edition_dirs:
         print(f"ERROR: no failover_timeseries.csv found under {path}", file=sys.stderr)

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Failover benchmark: continuous TPC-C load, trigger failover mid-run, capture RTO metrics.
 #
+# Runs each configured scenario sequentially (default: mixed read/write, then write_only).
+#
 # Usage:
 #   cp benchmark.conf.example benchmark.conf   # fill in credentials + failover settings
 #   ./run_failover_benchmark.sh
@@ -8,8 +10,9 @@
 # Optional:
 #   BENCHMARK_CONF=/path/to/benchmark.conf ./run_failover_benchmark.sh
 #   FAILOVER_EDITIONS="advanced" ./run_failover_benchmark.sh   # single edition
+#   FAILOVER_SCENARIOS="mixed" ./run_failover_benchmark.sh    # skip write_only scenario
 #
-# Run inside tmux/nohup on the benchmark droplet — total runtime ~20 min per edition.
+# Run inside tmux/nohup on the benchmark droplet — total runtime ~40 min per edition (2 scenarios).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -28,6 +31,10 @@ failover_defaults
 mkdir -p "${RESULTS_ROOT}"
 exec > >(tee -a "${FULL_LOG}") 2>&1
 
+_per_scenario_runtime_sec() {
+  failover_total_runtime_sec
+}
+
 echo "=== MySQL Failover Benchmark (TPC-C under load) ==="
 echo "Started:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "Results:  ${RESULTS_ROOT}"
@@ -36,7 +43,8 @@ echo "Sysbench: $("${SCRIPT_DIR}/which_sysbench.sh")"
 echo ""
 echo "Load:     threads=${FAILOVER_THREADS} report-interval=${FAILOVER_REPORT_INTERVAL}s"
 echo "Timeline: warmup=${FAILOVER_WARMUP_SEC}s + baseline=${FAILOVER_BASELINE_SEC}s + observe=${FAILOVER_OBSERVE_SEC}s"
-echo "          trigger at second $(failover_trigger_second) | total=$(failover_total_runtime_sec)s"
+echo "          trigger at second $(failover_trigger_second) | total=$(_per_scenario_runtime_sec)s per scenario"
+echo "Scenarios:${FAILOVER_SCENARIOS} (delay between=${FAILOVER_SCENARIO_DELAY_SEC}s)"
 echo "Editions: ${FAILOVER_EDITIONS}"
 echo "Reconnect: mysql-ignore-errors=${FAILOVER_MYSQL_IGNORE_ERRORS}"
 echo "Monitor:   primary=${FAILOVER_MONITOR_PRIMARY:-1} k8s_events=${FAILOVER_COLLECT_K8S_EVENTS:-1}"
@@ -46,6 +54,73 @@ else
   echo "Trigger:  DISABLED — load-only control run (FAILOVER_TRIGGER_ENABLED=0)"
 fi
 echo ""
+
+run_failover_scenario() {
+  local edition="${1:?edition required}"
+  local scenario="${2:?scenario required}"
+  local edition_dir="${3:?edition dir required}"
+  local scenario_dir="${edition_dir}/${scenario}"
+  local trx_profile
+
+  trx_profile="$(failover_scenario_trx_profile "${scenario}")"
+  mkdir -p "${scenario_dir}"
+
+  export FAILOVER_SCENARIO="${scenario}"
+  export TPCC_TRX_PROFILE="${trx_profile}"
+
+  echo ""
+  echo "----------------------------------------"
+  echo " Scenario: ${scenario} (trx_profile=${trx_profile})"
+  echo "----------------------------------------"
+  echo ""
+
+  start_failover_watchers "${scenario_dir}" "${edition}"
+
+  echo "--- Starting continuous TPC-C load (${scenario}) ---"
+  run_tpcc_failover_load "${scenario_dir}"
+
+  if ! wait_for_sysbench_start "${scenario_dir}" 180; then
+    stop_failover_watchers "${scenario_dir}"
+    stop_sysbench_load "${scenario_dir}"
+    return 1
+  fi
+
+  echo "--- Baseline load period, then failover trigger ---"
+  sleep_until_failover_trigger
+
+  if failover_trigger_enabled; then
+    echo "--- Triggering failover (${scenario}) ---"
+  else
+    echo "--- Failover trigger skipped (FAILOVER_TRIGGER_ENABLED=0) — recording trigger time only ---"
+  fi
+  BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${scenario_dir}" \
+    2>&1 | tee "${scenario_dir}/failover_trigger.log"
+
+  echo "--- Observing recovery for ${FAILOVER_OBSERVE_SEC}s ---"
+  sleep "${FAILOVER_OBSERVE_SEC}"
+
+  _failover_snapshot_k8s_events "${scenario_dir}" "post_observe"
+  log_failover_do_events "${scenario_dir}" "${edition}" "post_observe"
+
+  echo "--- Stopping load ---"
+  stop_sysbench_load "${scenario_dir}"
+  stop_failover_watchers "${scenario_dir}"
+
+  run_failover_tpcc_check "${scenario_dir}" || true
+
+  echo "--- Analyzing failover metrics (${scenario}) ---"
+  analyze_failover_metrics "${scenario_dir}"
+
+  echo ""
+  echo "${edition}/${scenario}: failover benchmark complete"
+  echo "  Analysis:         ${scenario_dir}/failover_analysis.txt"
+  echo "  KPI CSV:          ${scenario_dir}/failover_kpi.csv"
+  echo "  Extended metrics: ${scenario_dir}/failover_extended_metrics.txt"
+  echo "  Metrics CSV:      ${scenario_dir}/failover_metrics.csv"
+  echo "  Time series:      ${scenario_dir}/failover_timeseries.csv"
+  echo "  Graphs:           ${scenario_dir}/graphs/"
+  echo "  HTML report:      ${scenario_dir}/graphs/failover_report.html"
+}
 
 run_failover_edition() {
   local edition="${1:?edition required}"
@@ -91,52 +166,17 @@ run_failover_edition() {
     echo ""
   fi
 
-  start_failover_watchers "${edition_dir}" "${edition}"
-
-  echo "--- Starting continuous TPC-C load ---"
-  run_tpcc_failover_load "${edition_dir}"
-
-  if ! wait_for_sysbench_start "${edition_dir}" 180; then
-    stop_failover_watchers "${edition_dir}"
-    stop_sysbench_load "${edition_dir}"
-    return 1
-  fi
-
-  echo "--- Baseline load period, then failover trigger ---"
-  sleep_until_failover_trigger
-
-  if failover_trigger_enabled; then
-    echo "--- Triggering failover ---"
-  else
-    echo "--- Failover trigger skipped (FAILOVER_TRIGGER_ENABLED=0) — recording trigger time only ---"
-  fi
-  BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${edition_dir}" \
-    2>&1 | tee "${edition_dir}/failover_trigger.log"
-
-  echo "--- Observing recovery for ${FAILOVER_OBSERVE_SEC}s ---"
-  sleep "${FAILOVER_OBSERVE_SEC}"
-
-  _failover_snapshot_k8s_events "${edition_dir}" "post_observe"
-  log_failover_do_events "${edition_dir}" "${edition}" "post_observe"
-
-  echo "--- Stopping load ---"
-  stop_sysbench_load "${edition_dir}"
-  stop_failover_watchers "${edition_dir}"
-
-  run_failover_tpcc_check "${edition_dir}" || true
-
-  echo "--- Analyzing failover metrics ---"
-  analyze_failover_metrics "${edition_dir}"
-
-  echo ""
-  echo "${edition}: failover benchmark complete"
-  echo "  Analysis:         ${edition_dir}/failover_analysis.txt"
-  echo "  KPI CSV:          ${edition_dir}/failover_kpi.csv"
-  echo "  Extended metrics: ${edition_dir}/failover_extended_metrics.txt"
-  echo "  Metrics CSV:      ${edition_dir}/failover_metrics.csv"
-  echo "  Time series:      ${edition_dir}/failover_timeseries.csv"
-  echo "  Graphs:           ${edition_dir}/graphs/"
-  echo "  HTML report:      ${edition_dir}/graphs/failover_report.html"
+  local scenario_index=0
+  for scenario in ${FAILOVER_SCENARIOS}; do
+    scenario_index=$((scenario_index + 1))
+    if [[ "${scenario_index}" -gt 1 && "${FAILOVER_SCENARIO_DELAY_SEC:-0}" -gt 0 ]]; then
+      echo "--- Waiting ${FAILOVER_SCENARIO_DELAY_SEC}s for cluster stability before scenario ${scenario} ---"
+      sleep "${FAILOVER_SCENARIO_DELAY_SEC}"
+    fi
+    if ! run_failover_scenario "${edition}" "${scenario}" "${edition_dir}"; then
+      return 1
+    fi
+  done
 }
 
 FAILED=0

@@ -30,6 +30,15 @@ failover_defaults() {
   : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011}"
   : "${FAILOVER_TRIGGER_ENABLED:=1}"
   : "${FAILOVER_POD_DELETE:=${FAILOVER_TRIGGER_ENABLED}}"
+  : "${FAILOVER_SCENARIOS:=mixed write_only}"
+  : "${FAILOVER_SCENARIO_DELAY_SEC:=120}"
+}
+
+failover_scenario_trx_profile() {
+  case "${1:-mixed}" in
+    write_only) echo "write_only" ;;
+    mixed|*) echo "mixed" ;;
+  esac
 }
 
 failover_trigger_enabled() {
@@ -104,7 +113,7 @@ start_primary_monitor() {
   local meta_file="${results_dir}/primary_monitor_meta.txt"
   local interval="${FAILOVER_MONITOR_INTERVAL:-1}"
   local start_epoch
-  start_epoch=$(date -u +%s)
+  start_epoch=$(python3 -c "import time; print('%.3f' % time.time())")
 
   : > "${out_file}"
   echo -e "timestamp_utc\telapsed_sec\tconnect_ok\thostname\tread_only\tsuper_read_only\tgr_member_state\tgr_member_role\twrite_ok\tconnect_error" >> "${out_file}"
@@ -120,7 +129,7 @@ start_primary_monitor() {
   (
     while true; do
       ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-      elapsed=$(( $(date -u +%s) - start_epoch ))
+      elapsed=$(python3 -c "import time; print('%.3f' % (time.time() - float('${start_epoch}')))")
       local write_ok=0
       if _failover_write_probe_ok; then
         write_ok=1
@@ -264,10 +273,12 @@ run_tpcc_failover_load() {
   failover_defaults
   build_mysql_base_opts
 
-  local tpcc total_time ignore_errors
+  local tpcc total_time ignore_errors trx_profile scenario
   tpcc="$(tpcc_dir)"
   total_time=$(failover_total_runtime_sec)
   ignore_errors="${FAILOVER_MYSQL_IGNORE_ERRORS}"
+  scenario="${FAILOVER_SCENARIO:-mixed}"
+  trx_profile="${TPCC_TRX_PROFILE:-$(failover_scenario_trx_profile "${scenario}")}"
 
   export TPCC_THREADS="${FAILOVER_THREADS}"
   export TPCC_TIME="${total_time}"
@@ -275,6 +286,8 @@ run_tpcc_failover_load() {
   export TPCC_REPORT_INTERVAL="${FAILOVER_REPORT_INTERVAL}"
 
   echo "SYSBENCH_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${results_dir}/sysbench_timing.txt"
+  echo "FAILOVER_SCENARIO=${scenario}" >> "${results_dir}/sysbench_timing.txt"
+  echo "TPCC_TRX_PROFILE=${trx_profile}" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_TRIGGER_SECOND=$(failover_trigger_second)" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_TOTAL_SEC=${total_time}" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_MYSQL_IGNORE_ERRORS=${ignore_errors}" >> "${results_dir}/sysbench_timing.txt"
@@ -290,6 +303,7 @@ run_tpcc_failover_load() {
     --scale="${scale}"
     --threads="${FAILOVER_THREADS}"
     --trx_level="${TPCC_TRX_LEVEL:-RR}"
+    --trx_profile="${trx_profile}"
     --force_pk="${TPCC_FORCE_PK:-1}"
     --mysql-ignore-errors="${ignore_errors}"
     --db-ps-mode=disable
@@ -298,7 +312,7 @@ run_tpcc_failover_load() {
     --report-interval="${FAILOVER_REPORT_INTERVAL}"
   )
 
-  echo "Sysbench failover opts: mysql-ignore-errors=${ignore_errors} db-ps-mode=disable"
+  echo "Sysbench failover opts: scenario=${scenario} trx_profile=${trx_profile} mysql-ignore-errors=${ignore_errors} db-ps-mode=disable"
 
   # Foreground load job (not a wrapper subshell) so $! is the sysbench driver process.
   export SYSBENCH_LINE_BUFFER=1
@@ -351,7 +365,7 @@ wait_for_sysbench_start() {
     if [[ -f "${log_file}" ]] && grep -qE 'Threads started!|^\[[[:space:]]*[0-9]+s \]' "${log_file}"; then
       {
         echo "SYSBENCH_READY_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        echo "SYSBENCH_READY_EPOCH=$(date -u +%s)"
+        echo "SYSBENCH_READY_EPOCH=$(python3 -c "import time; print('%.3f' % time.time())")"
       } >> "${results_dir}/sysbench_timing.txt"
       return 0
     fi
@@ -420,23 +434,26 @@ export_failover_timeseries() {
   local csv_file="${results_dir}/failover_timeseries.csv"
   local meta_file="${results_dir}/failover_timeseries_meta.txt"
 
-  local trigger_second start_utc edition
+  local trigger_second start_utc edition scenario trx_profile
   trigger_second=$(failover_trigger_second)
   start_utc=""
   edition="unknown"
+  scenario="mixed"
+  trx_profile="mixed"
 
   if [[ -f "${timing_file}" ]]; then
     # shellcheck disable=SC1090
     source "${timing_file}" 2>/dev/null || true
     trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
     start_utc="${SYSBENCH_START_UTC:-}"
-  fi
-  if [[ -f "${event_file}" ]]; then
-    edition=$(grep -E '^FAILOVER_EDITION=' "${event_file}" | tail -1 | cut -d= -f2- || echo "unknown")
+    scenario="${FAILOVER_SCENARIO:-mixed}"
+    trx_profile="${TPCC_TRX_PROFILE:-mixed}"
   fi
 
   {
     echo "SYSBENCH_START_UTC=${start_utc}"
+    echo "FAILOVER_SCENARIO=${scenario:-mixed}"
+    echo "TPCC_TRX_PROFILE=${trx_profile:-mixed}"
     echo "FAILOVER_TRIGGER_SECOND=${trigger_second}"
     echo "FAILOVER_EDITION=${edition}"
   } > "${meta_file}"
@@ -636,12 +653,16 @@ analyze_failover_metrics() {
 
   failover_defaults
 
-  local trigger_second
+  local trigger_second scenario trx_profile
   trigger_second=$(failover_trigger_second)
+  scenario="mixed"
+  trx_profile="mixed"
   if [[ -f "${timing_file}" ]]; then
     # shellcheck disable=SC1090
     source "${timing_file}" 2>/dev/null || true
     trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
+    scenario="${FAILOVER_SCENARIO:-mixed}"
+    trx_profile="${TPCC_TRX_PROFILE:-mixed}"
   fi
 
   local trigger_utc=""
@@ -670,6 +691,8 @@ analyze_failover_metrics() {
   {
     echo "=== Failover Benchmark Analysis ==="
     echo "Edition:              ${edition}"
+    echo "Scenario:             ${scenario}"
+    echo "TPC-C trx profile:    ${trx_profile}"
     echo "Trigger method:       ${method}"
     echo "Trigger UTC:          ${trigger_utc:-N/A}"
     echo "Trigger second:       ${trigger_second} (from sysbench start)"
@@ -703,9 +726,9 @@ analyze_failover_metrics() {
     echo "HTML report:                 ${results_dir}/graphs/failover_report.html"
   } | tee "${analysis_file}"
 
-  local header="edition,trigger_method,trigger_utc,baseline_tps,outage_start_sec,outage_duration_sec,rto_sec,peak_err_per_sec,peak_reconn_per_sec,peak_lat_p95_ms"
+  local header="edition,scenario,trx_profile,trigger_method,trigger_utc,baseline_tps,outage_start_sec,outage_duration_sec,rto_sec,peak_err_per_sec,peak_reconn_per_sec,peak_lat_p95_ms"
   echo "${header}" > "${csv_file}"
-  echo "${edition},${method},${trigger_utc},${BASELINE_TPS},${OUTAGE_START},${OUTAGE_DURATION},${RTO_SEC},${PEAK_ERR},${PEAK_RECONN},${PEAK_LAT95}" \
+  echo "${edition},${scenario},${trx_profile},${method},${trigger_utc},${BASELINE_TPS},${OUTAGE_START},${OUTAGE_DURATION},${RTO_SEC},${PEAK_ERR},${PEAK_RECONN},${PEAK_LAT95}" \
     >> "${csv_file}"
 
   generate_failover_graphs "${results_dir}"
@@ -732,15 +755,19 @@ write_failover_kpi() {
 
   failover_defaults
 
-  local trigger_second edition trigger_utc
+  local trigger_second edition trigger_utc scenario trx_profile
   trigger_second=$(failover_trigger_second)
   edition="unknown"
   trigger_utc=""
+  scenario="mixed"
+  trx_profile="mixed"
 
   if [[ -f "${timing_file}" ]]; then
     # shellcheck disable=SC1090
     source "${timing_file}" 2>/dev/null || true
     trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
+    scenario="${FAILOVER_SCENARIO:-mixed}"
+    trx_profile="${TPCC_TRX_PROFILE:-mixed}"
   fi
   if [[ -f "${event_file}" ]]; then
     edition=$(grep -E '^FAILOVER_EDITION=' "${event_file}" | tail -1 | cut -d= -f2- || echo "unknown")
@@ -753,7 +780,7 @@ write_failover_kpi() {
     monitor_start=$(grep -E '^MONITOR_START_EPOCH=' "${results_dir}/primary_monitor_meta.txt" | cut -d= -f2- || true)
     sysbench_ready=$(grep -E '^SYSBENCH_READY_EPOCH=' "${timing_file}" | cut -d= -f2- || true)
     if [[ -n "${monitor_start}" && -n "${sysbench_ready}" ]]; then
-      monitor_offset=$((sysbench_ready - monitor_start))
+      monitor_offset=$(python3 -c "print('%.3f' % (float('${sysbench_ready}') - float('${monitor_start}')))")
     fi
   fi
 
@@ -778,6 +805,8 @@ write_failover_kpi() {
 
   awk -v trigger="${trigger_second}" \
       -v edition="${edition}" \
+      -v scenario="${scenario}" \
+      -v trx_profile="${trx_profile}" \
       -v recovery_pct="${FAILOVER_RECOVERY_THRESHOLD}" \
       -v stable="${FAILOVER_RECOVERY_STABLE_SEC}" \
       -v outage_ratio="${FAILOVER_OUTAGE_TPS_RATIO}" \
@@ -963,24 +992,33 @@ function peak_latency(failure_rel, recovery_rel,    sec, start, end, peak) {
   if (sysbench_max_lat != "" && sysbench_max_lat + 0 > 0) return sysbench_max_lat + 0
   return -1
 }
-function errors_in_window(fail_rel, recovery_rel,    sec, start, end, sum) {
+function errors_in_window(fail_rel, recovery_rel,    sec, start, end, sum, peak) {
   sum = 0
+  peak = 0
   start = trigger + (fail_rel >= 0 ? fail_rel : 0)
   end = observe_end
   if (recovery_rel >= 0) end = trigger + recovery_rel
   for (sec = start; sec <= end; sec++) {
-    if (sec in err_arr) sum += err_arr[sec]
+    if (sec in err_arr) {
+      sum += err_arr[sec]
+      if (err_arr[sec] > peak) peak = err_arr[sec]
+    }
     if (sec in reconn_arr) sum += reconn_arr[sec]
   }
+  peak_err_window = peak
   return int(sum + 0.5)
 }
 function fmt_sec(v) {
   if (v < 0) return "NOT_DETECTED"
-  return sprintf("%d", v)
+  if (v < 1) return sprintf("%.3f", v)
+  if (v == int(v)) return sprintf("%d", v)
+  return sprintf("%.2f", v)
 }
 function fmt_phase_duration(v) {
   if (v < 0) return "NOT_REACHED"
-  return sprintf("%d", v)
+  if (v < 1) return sprintf("%.3f", v)
+  if (v == int(v)) return sprintf("%d", v)
+  return sprintf("%.2f", v)
 }
 function phase_duration(end_rel, start_rel) {
   if (end_rel < 0 || start_rel < 0) return -1
@@ -1005,18 +1043,21 @@ END {
     recovery_duration = 0
   dip_sec = dip_duration(failure_sec, recovery_rel)
   peak_lat = peak_latency(failure_sec, recovery_rel)
+  peak_err_window = 0
   tx_failed = errors_in_window(failure_sec, recovery_rel)
 
-  print "edition,failure_detection_sec,primary_election_sec,app_recovery_sec,tps_dip_duration_sec,peak_latency_failover_ms,transactions_failed_during_failover,data_loss"
-  printf "%s,%s,%s,%s,%d,%s,%d,%s\n", \
-    edition, \
-    fmt_sec(failure_sec), \
-    fmt_sec(election_duration), \
-    fmt_phase_duration(recovery_duration), \
-    dip_sec, \
-    fmt_lat(peak_lat), \
-    tx_failed, \
-    tpcc_check
+  print "edition,scenario,trx_profile,failure_detection_sec,primary_election_sec,app_recovery_sec,tps_dip_duration_sec,peak_latency_failover_ms,transactions_failed_during_failover,writes_failed_during_failover,peak_write_err_per_sec,data_loss"
+  if (trx_profile == "write_only") {
+    printf "%s,%s,%s,%s,%s,%s,%d,%s,%d,%d,%.2f,%s\n", \
+      edition, scenario, trx_profile, \
+      fmt_sec(failure_sec), fmt_sec(election_duration), fmt_phase_duration(recovery_duration), \
+      dip_sec, fmt_lat(peak_lat), tx_failed, tx_failed, peak_err_window, tpcc_check
+  } else {
+    printf "%s,%s,%s,%s,%s,%s,%d,%s,%d,-,%.2f,%s\n", \
+      edition, scenario, trx_profile, \
+      fmt_sec(failure_sec), fmt_sec(election_duration), fmt_phase_duration(recovery_duration), \
+      dip_sec, fmt_lat(peak_lat), tx_failed, peak_err_window, tpcc_check
+  }
 }
 AWK
 
@@ -1057,17 +1098,21 @@ write_failover_extended_metrics() {
 
   failover_defaults
 
-  local trigger_second trigger_utc edition method target_pod
+  local trigger_second trigger_utc edition method target_pod scenario trx_profile
   trigger_second=$(failover_trigger_second)
   trigger_utc=""
   edition="unknown"
   method="unknown"
   target_pod=""
+  scenario="mixed"
+  trx_profile="mixed"
 
   if [[ -f "${results_dir}/sysbench_timing.txt" ]]; then
     # shellcheck disable=SC1090
     source "${results_dir}/sysbench_timing.txt" 2>/dev/null || true
     trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
+    scenario="${FAILOVER_SCENARIO:-mixed}"
+    trx_profile="${TPCC_TRX_PROFILE:-mixed}"
   fi
   if [[ -f "${event_file}" ]]; then
     trigger_utc=$(grep -E '^FAILOVER_TRIGGER_UTC=' "${event_file}" | tail -1 | cut -d= -f2- || true)
@@ -1104,13 +1149,15 @@ write_failover_extended_metrics() {
     monitor_start=$(grep -E '^MONITOR_START_EPOCH=' "${results_dir}/primary_monitor_meta.txt" | cut -d= -f2- || true)
     sysbench_ready=$(grep -E '^SYSBENCH_READY_EPOCH=' "${results_dir}/sysbench_timing.txt" | cut -d= -f2- || true)
     if [[ -n "${monitor_start}" && -n "${sysbench_ready}" ]]; then
-      monitor_offset=$((sysbench_ready - monitor_start))
+      monitor_offset=$(python3 -c "print('%.3f' % (float('${sysbench_ready}') - float('${monitor_start}')))")
     fi
   fi
 
   awk -v trigger="${trigger_second}" \
       -v trigger_utc="${trigger_utc}" \
       -v edition="${edition}" \
+      -v scenario="${scenario}" \
+      -v trx_profile="${trx_profile}" \
       -v method="${method}" \
       -v target_pod="${target_pod}" \
       -v tpcc_check="${tpcc_check}" \
@@ -1181,6 +1228,8 @@ function load_timeseries(    f, sec, tps, qps, err, reconn, lat, max_sec) {
     reconn = f[6] + 0
     lat = f[7] + 0
     tps_arr[sec] = tps
+    err_arr[sec] = err
+    reconn_arr[sec] = reconn
     if (sec > max_sec) max_sec = sec
     if (sec < trigger && tps > 0) { pre_sum += tps; pre_cnt++ }
     if (sec >= trigger) {
@@ -1311,6 +1360,8 @@ END {
   print "=== Failover Extended Metrics ==="
   print "Generated:              " generated_utc
   print "Edition:                  " edition
+  print "Scenario:                 " scenario
+  print "TPC-C profile:            " trx_profile
   print "Trigger method:           " method
   print "Trigger UTC:              " (trigger_utc != "" ? trigger_utc : "N/A")
   print "Trigger second:           " trigger " (from sysbench start)"
@@ -1318,15 +1369,15 @@ END {
   print ""
   print "--- Timing (seconds from trigger unless noted) ---"
   if (failure_detect >= 0)
-    printf "Time to detect failure:   %d s (sysbench sec %d)\n", failure_detect, failure_detect_abs
+    printf "Time to detect failure:   %.3f s (%.0f ms · sysbench sec %d)\n", failure_detect, failure_detect * 1000, failure_detect_abs
   else
     print "Time to detect failure:   NOT_DETECTED"
   if (promote_sec >= 0)
-    printf "Time to promote primary:  %d s (write probe / GR role / TPS recovery)\n", promote_sec
+    printf "Time to promote primary:  %.3f s (%.0f ms · write probe / GR role / TPS recovery)\n", promote_sec, promote_sec * 1000
   else
     print "Time to promote primary:  NOT_DETECTED (monitor off or no promotion signal seen)"
   if (rto >= 0)
-    printf "Application recovery RTO: %d s (%.0f%% baseline for %ds)\n", rto, recovery_pct * 100, stable
+    printf "Application recovery RTO: %.3f s (%.0f ms · %.0f%% baseline for %ds)\n", rto, rto * 1000, recovery_pct * 100, stable
   else
     print "Application recovery RTO: NOT_REACHED"
   printf "Outage window:            sysbench sec %d-%d (%d s)\n", outage_start, outage_end, outage_duration
@@ -1350,6 +1401,24 @@ END {
   if (peak_err_post > 0) printf "Peak err/s post-trigger:        %.2f\n", peak_err_post
   if (peak_reconn_post > 0) printf "Peak reconn/s post-trigger:     %.2f\n", peak_reconn_post
   if (below_recovery > 0) printf "Seconds below recovery threshold: %d\n", below_recovery
+  if (trx_profile == "write_only") {
+    writes_failed = 0
+    peak_write_err = 0
+    win_start = trigger + (failure_detect >= 0 ? failure_detect : 0)
+    win_end = (rto >= 0 ? trigger + rto : load_end_sec)
+    for (sec = win_start; sec <= win_end; sec++) {
+      if (sec in tps_arr) {
+        e = (sec in err_arr ? err_arr[sec] : 0)
+        rc = (sec in reconn_arr ? reconn_arr[sec] : 0)
+        writes_failed += e + rc
+        if (e > peak_write_err) peak_write_err = e
+      }
+    }
+    print ""
+    print "--- Write-only failover impact ---"
+    printf "Writes failed (failover window): %d (err/s + reconn/s sum)\n", int(writes_failed + 0.5)
+    if (peak_write_err > 0) printf "Peak write err/s:                %.2f\n", peak_write_err
+  }
   print ""
   print "--- Load continuity ---"
   printf "Sysbench data ends at sec:      %d (expect ~%d)\n", load_end_sec, trigger + stable
@@ -1388,8 +1457,8 @@ write_failover_comparison() {
   local combined_csv="${results_root}/failover_comparison.csv"
   local kpi_csv="${results_root}/failover_kpi.csv"
 
-  echo "edition,trigger_method,trigger_utc,baseline_tps,outage_start_sec,outage_duration_sec,rto_sec,peak_err_per_sec,peak_reconn_per_sec,peak_lat_p95_ms" > "${combined_csv}"
-  echo "edition,failure_detection_sec,primary_election_sec,app_recovery_sec,tps_dip_duration_sec,peak_latency_failover_ms,transactions_failed_during_failover,data_loss" > "${kpi_csv}"
+  echo "edition,scenario,trigger_method,trigger_utc,baseline_tps,outage_start_sec,outage_duration_sec,rto_sec,peak_err_per_sec,peak_reconn_per_sec,peak_lat_p95_ms" > "${combined_csv}"
+  echo "edition,scenario,trx_profile,failure_detection_sec,primary_election_sec,app_recovery_sec,tps_dip_duration_sec,peak_latency_failover_ms,transactions_failed_during_failover,writes_failed_during_failover,peak_write_err_per_sec,data_loss" > "${kpi_csv}"
 
   {
     echo "=== Failover Benchmark — Standard vs Advanced ==="
@@ -1397,16 +1466,16 @@ write_failover_comparison() {
     echo ""
   } > "${summary}"
 
-  for edition_dir in "${results_root}"/*/; do
-    [[ -d "${edition_dir}" ]] || continue
-    local metrics="${edition_dir}/failover_metrics.csv"
-    local kpi="${edition_dir}/failover_kpi.csv"
-    local analysis="${edition_dir}/failover_analysis.txt"
-    local edition
-    edition=$(basename "${edition_dir}")
+  _append_failover_scenario_results() {
+    local edition="$1"
+    local scenario="$2"
+    local scenario_dir="$3"
+    local metrics="${scenario_dir}/failover_metrics.csv"
+    local kpi="${scenario_dir}/failover_kpi.csv"
+    local analysis="${scenario_dir}/failover_analysis.txt"
 
     if [[ -f "${metrics}" ]]; then
-      tail -n +2 "${metrics}" >> "${combined_csv}"
+      tail -n +2 "${metrics}" >> "${combined_csv}" 2>/dev/null || true
     fi
     if [[ -f "${kpi}" ]]; then
       tail -n +2 "${kpi}" >> "${kpi_csv}"
@@ -1414,11 +1483,32 @@ write_failover_comparison() {
     if [[ -f "${analysis}" ]]; then
       {
         echo "========================================"
-        echo " Edition: ${edition}"
+        echo " Edition: ${edition} | Scenario: ${scenario}"
         echo "========================================"
         cat "${analysis}"
         echo ""
       } >> "${summary}"
+    fi
+  }
+
+  for edition_dir in "${results_root}"/*/; do
+    [[ -d "${edition_dir}" ]] || continue
+    local edition
+    edition=$(basename "${edition_dir}")
+    [[ "${edition}" == "graphs" ]] && continue
+
+    local found_scenario=0
+    for scenario_dir in "${edition_dir}"/*/; do
+      [[ -d "${scenario_dir}" ]] || continue
+      local scenario
+      scenario=$(basename "${scenario_dir}")
+      [[ -f "${scenario_dir}/failover_kpi.csv" ]] || continue
+      found_scenario=1
+      _append_failover_scenario_results "${edition}" "${scenario}" "${scenario_dir}"
+    done
+
+    if [[ "${found_scenario}" -eq 0 && -f "${edition_dir}/failover_kpi.csv" ]]; then
+      _append_failover_scenario_results "${edition}" "default" "${edition_dir%/}"
     fi
   done
 

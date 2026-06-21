@@ -2,16 +2,17 @@
 # Generate TPS/QPS graphs (PNG) and interactive HTML report from an existing failover run.
 #
 # Usage:
-#   ./generate_failover_graphs.sh results/failover_<timestamp>/advanced
-#   ./generate_failover_graphs.sh results/failover_<timestamp>   # all editions + comparison
+#   ./generate_failover_graphs.sh results/failover_<timestamp>/advanced/mixed
+#   ./generate_failover_graphs.sh results/failover_<timestamp>/advanced/write_only
+#   ./generate_failover_graphs.sh results/failover_<timestamp>   # all editions/scenarios + comparison
 #
 # Options (pass through to Python):
-#   ./generate_failover_graphs.sh --html-only results/failover_<timestamp>/advanced
-#   ./generate_failover_graphs.sh --png-only  results/failover_<timestamp>/advanced
+#   ./generate_failover_graphs.sh --html-only results/failover_<timestamp>/advanced/mixed
+#   ./generate_failover_graphs.sh --png-only  results/failover_<timestamp>
 #
 # Output:
-#   <edition>/graphs/failover_report.html   (interactive; no extra deps)
-#   <edition>/graphs/failover_*.png         (requires python3-matplotlib)
+#   <edition>/<scenario>/graphs/failover_report.html   (interactive; no extra deps)
+#   <edition>/<scenario>/graphs/failover_*.png         (requires python3-matplotlib)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
