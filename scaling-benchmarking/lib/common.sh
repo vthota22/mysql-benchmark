@@ -125,11 +125,14 @@ run_tpcc() {
       ;;
     run)
       local run_time="${TPCC_MAX_TIME:-${TPCC_TOTAL_TIME:-3600}}"
+      local ignore_errors="${TPCC_IGNORE_ERRORS:-1290,1053,2013,2006,3100}"
+      local reconnect="${TPCC_RECONNECT:-1}"
       run_sysbench_tpcc "${tpcc}" "${opts[@]}" \
         --time="${run_time}" \
         --warmup-time="${TPCC_WARMUP_SEC:-0}" \
         --report-interval="${TPCC_REPORT_INTERVAL:-1}" \
-        --mysql-ignore-errors=1053,2013,2006,3100 \
+        --mysql-ignore-errors="${ignore_errors}" \
+        --reconnect="${reconnect}" \
         --db-ps-mode=disable \
         run
       ;;

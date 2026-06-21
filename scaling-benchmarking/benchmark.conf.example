@@ -22,6 +22,12 @@ TPCC_REPORT_INTERVAL=1
 TPCC_FORCE_PK=1
 TPCC_TRX_LEVEL=RR
 
+# Survive resize/failover without FATAL thread exit (sysbench run phase only).
+# 1290=read-only, 1053=shutdown, 2006/2013=connection loss, 3100=replication hook
+TPCC_IGNORE_ERRORS="1290,1053,2013,2006,3100"
+# Reconnect every N transactions (1 = every txn; helps route to primary after failover)
+TPCC_RECONNECT=1
+
 # 1 = skip prepare when TPC-C tables already exist; 0 = drop DB and reload dataset
 SKIP_PREPARE=0
 
