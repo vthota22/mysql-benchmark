@@ -49,6 +49,8 @@ MYSQL_FAIL_ON_SETTINGS_MISMATCH=0
 MYSQL_VARS="version version_comment innodb_buffer_pool_size innodb_buffer_pool_instances innodb_log_file_size innodb_flush_log_at_trx_commit innodb_io_capacity innodb_io_capacity_max innodb_read_io_threads innodb_write_io_threads max_connections sql_require_primary_key transaction_isolation binlog_format sync_binlog character_set_server collation_server"
 # Optional: document your intended cluster config (informational — set in DO control panel)
 # MYSQL_CLUSTER_PLAN="db-s-4vcpu-8gb"
+# STANDARD_CLUSTER_SIZE_SLUG=db-s-4vcpu-8gb
+# ADVANCED_CLUSTER_SIZE_SLUG=mysql-g-8vcpu-32gb   # shown as "Slug size" in failover HTML report
 # MYSQL_NOTES="Buffer pool and CPU/RAM must match between Standard and Advanced clusters"
 
 # --- Failover benchmark ---
@@ -57,9 +59,12 @@ FAILOVER_EDITIONS="standard advanced"
 
 # TPC-C load during failover test
 # FAILOVER_THREADS=16
-# FAILOVER_WARMUP_SEC=300          # 5 min warmup
-# FAILOVER_BASELINE_SEC=300        # 5 min steady load before trigger
-# FAILOVER_OBSERVE_SEC=600         # 10 min after trigger
+# Timeline (elapsed sec from sysbench start; trigger = warmup + baseline):
+# FAILOVER_WARMUP_SEC=0            # optional warmup before baseline
+# FAILOVER_BASELINE_SEC=300        # steady load before failover trigger
+# FAILOVER_OBSERVE_SEC=300         # keep load running after trigger (harness also sleeps this long)
+# FAILOVER_TRIGGER_SECOND=         # optional override; default warmup + baseline (= 300 with defaults above)
+# Per scenario wall clock: warmup + baseline + observe (600s with defaults above)
 # FAILOVER_REPORT_INTERVAL=1       # 1-second granularity (required for RTO + graphs)
 # FAILOVER_MONITOR_INTERVAL=1      # primary/topology poll interval (seconds)
 # FAILOVER_MONITOR_WRITE_PROBE=1   # separate write INSERT each poll (HAProxy write routing)
