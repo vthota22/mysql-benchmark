@@ -248,7 +248,16 @@ trigger_advanced_failover() {
     return 0
   fi
 
-  echo "FAILOVER_METHOD=kubectl_delete_pod" >> "${RESULTS_DIR}/failover_event.txt"
+  local delete_force="${FAILOVER_POD_DELETE_FORCE:-1}"
+  local delete_grace="${FAILOVER_POD_DELETE_GRACE_SEC:-0}"
+  local delete_method="kubectl_delete_pod"
+  if [[ "${delete_force}" == "1" ]]; then
+    delete_method="kubectl_delete_pod_force"
+  fi
+
+  echo "FAILOVER_METHOD=${delete_method}" >> "${RESULTS_DIR}/failover_event.txt"
+  echo "FAILOVER_POD_DELETE_FORCE=${delete_force}" >> "${RESULTS_DIR}/failover_event.txt"
+  echo "FAILOVER_POD_DELETE_GRACE_SEC=${delete_grace}" >> "${RESULTS_DIR}/failover_event.txt"
   echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${RESULTS_DIR}/failover_event.txt"
   echo "FAILOVER_POD_DELETE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${RESULTS_DIR}/failover_event.txt"
 
@@ -265,17 +274,29 @@ trigger_advanced_failover() {
   pod=$(find_advanced_primary_pod "${kubeconfig}")
 
   echo "FAILOVER_TARGET_POD=${pod}" >> "${RESULTS_DIR}/failover_event.txt"
-  echo "Deleting primary pod ${pod} in namespace ${ns}..." | tee -a "${RESULTS_DIR}/failover_trigger.log"
 
   local kubectl=(kubectl --kubeconfig="${kubeconfig}")
   if [[ -n "${ADVANCED_K8S_CONTEXT:-}" ]]; then
     kubectl+=(--context="${ADVANCED_K8S_CONTEXT}")
   fi
 
+  local delete_args=(delete pod -n "${ns}" "${pod}" --wait=false)
+  if [[ "${delete_force}" == "1" ]]; then
+    delete_args+=(--grace-period="${delete_grace}" --force)
+    echo "Force-deleting primary pod ${pod} in namespace ${ns} (grace-period=${delete_grace})..." \
+      | tee -a "${RESULTS_DIR}/failover_trigger.log"
+    echo "Command: kubectl delete pod ${pod} -n ${ns} --grace-period=${delete_grace} --force --wait=false" \
+      >> "${RESULTS_DIR}/failover_trigger.log"
+  else
+    delete_args+=(--grace-period="${delete_grace}")
+    echo "Deleting primary pod ${pod} in namespace ${ns} (grace-period=${delete_grace})..." \
+      | tee -a "${RESULTS_DIR}/failover_trigger.log"
+  fi
+
   _failover_snapshot_k8s_events "${RESULTS_DIR}" "pre_delete"
   log_failover_do_events "${RESULTS_DIR}" "advanced" "pre_delete"
 
-  "${kubectl[@]}" delete pod -n "${ns}" "${pod}" --wait=false \
+  "${kubectl[@]}" "${delete_args[@]}" \
     2>&1 | tee -a "${RESULTS_DIR}/failover_trigger.log"
 
   echo "Pod delete issued at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${RESULTS_DIR}/failover_trigger.log"

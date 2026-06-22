@@ -55,20 +55,57 @@ MYSQL_VARS="version version_comment innodb_buffer_pool_size innodb_buffer_pool_i
 # Editions to run: "standard advanced" or one edition
 FAILOVER_EDITIONS="standard advanced"
 
-# TPC-C load during failover test (use smaller dataset than full comparison if desired)
+# TPC-C load during failover test
 # FAILOVER_THREADS=16
 # FAILOVER_WARMUP_SEC=300          # 5 min warmup
 # FAILOVER_BASELINE_SEC=300        # 5 min steady load before trigger
 # FAILOVER_OBSERVE_SEC=600         # 10 min after trigger
 # FAILOVER_REPORT_INTERVAL=1       # 1-second granularity (required for RTO + graphs)
-# FAILOVER_MONITOR_INTERVAL=1      # only used if FAILOVER_MONITOR_HOSTNAME=1
-# FAILOVER_GENERATE_GRAPHS=1       # PNG charts from failover_timeseries.csv (needs python3-matplotlib)
-# FAILOVER_MONITOR_HOSTNAME=0      # DO keeps same client hostname on failover; leave off
+# FAILOVER_MONITOR_INTERVAL=1      # primary/topology poll interval (seconds)
+# FAILOVER_MONITOR_WRITE_PROBE=1   # separate write INSERT each poll (HAProxy write routing)
+# FAILOVER_GENERATE_GRAPHS=1       # PNG + interactive HTML (HTML needs no extra deps; PNG needs matplotlib)
+# FAILOVER_MONITOR_PRIMARY=1       # poll @@hostname, read_only, GR state/role, write probe
+# FAILOVER_COLLECT_K8S_EVENTS=1    # kubectl event snapshots (Advanced only)
+# FAILOVER_RUN_TPCC_CHECK=0        # 1 = TPC-C check after failover (sets data_loss in failover_kpi.csv)
+#
+# Dual TPC-C scenarios in one run (mixed read/write, then write-only new_order+payment):
+# FAILOVER_SCENARIOS="mixed write_only"   # default; use "mixed" to skip write_only
+# FAILOVER_SCENARIO_DELAY_SEC=120         # pause between scenarios (cooldown / cluster settle)
+# TPC-C trx_profile is passed to tpcc.lua: mixed = standard TPC-C mix; write_only = 50/50 new_order/payment
+#
+# Output: results/failover_*/<edition>/<scenario>/failover_kpi.csv (KPIs, phase durations in seconds):
+#   mixed/      — standard TPC-C transaction mix (reads + writes)
+#   write_only/ — 100% new_order/payment; writes_failed_during_failover KPI populated
+# Combined rollup: results/failover_*/failover_kpi.csv and failover_comparison.txt
+#   failure_detection_sec   — trigger → first failure signal (err/reconn/outage)
+#   primary_election_sec    — failure detected → promotion (write probe / GR PRIMARY / TPS recovery on Advanced)
+#   app_recovery_sec        — primary elected → TPS/QPS >= 90% baseline
+#   tps_dip_duration_sec    — seconds with TPS < 90% baseline (failure → recovery)
+#   peak_latency_failover_ms, transactions_failed_during_failover, data_loss
+#
+# Sysbench reconnect through GR/failover errors (keep full list):
+# FAILOVER_MYSQL_IGNORE_ERRORS=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011
+#
+# Trigger control (same timeline either way):
+# FAILOVER_TRIGGER_ENABLED=1       # 0 = skip all failover actions
+# FAILOVER_POD_DELETE=1            # Advanced: 0 = no kubectl pod delete (control run)
 
 # RTO analysis thresholds
 # FAILOVER_RECOVERY_THRESHOLD=0.90   # 90% of baseline TPS = recovered
 # FAILOVER_RECOVERY_STABLE_SEC=30    # consecutive seconds at threshold
 # FAILOVER_OUTAGE_TPS_RATIO=0.05     # TPS below this = outage
+
+# --- Short local smoke test (~4 min) — append to benchmark.conf ---
+# FAILOVER_WARMUP_SEC=60
+# FAILOVER_BASELINE_SEC=60
+# FAILOVER_OBSERVE_SEC=120
+# FAILOVER_EDITIONS=advanced
+# SKIP_PREPARE=1
+# TPCC_TABLES=1
+# TPCC_SCALE=10
+# FAILOVER_POD_DELETE=0              # step 1: control run (no pod delete)
+# FAILOVER_POD_DELETE=1              # step 2: real failover test
+# FAILOVER_MYSQL_IGNORE_ERRORS=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011
 
 # --- Standard Edition failover trigger ---
 # Method: power_off | install_update | storage_resize | manual
@@ -91,6 +128,10 @@ STANDARD_CLUSTER_UUID=
 # STANDARD_CLUSTER_NUM_NODES=3
 
 # --- Advanced Edition failover trigger (kubectl delete primary pod) ---
+# Ungraceful kill (default): grace-period=0 --force
+FAILOVER_POD_DELETE_FORCE=1
+FAILOVER_POD_DELETE_GRACE_SEC=0
+# Graceful delete instead: FAILOVER_POD_DELETE_FORCE=0 FAILOVER_POD_DELETE_GRACE_SEC=30
 ADVANCED_CLUSTER_UUID=
 
 # Kubeconfig: use one of these (fill in when API details are available)

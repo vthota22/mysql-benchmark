@@ -30,6 +30,8 @@ failover_defaults() {
   : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011}"
   : "${FAILOVER_TRIGGER_ENABLED:=1}"
   : "${FAILOVER_POD_DELETE:=${FAILOVER_TRIGGER_ENABLED}}"
+  : "${FAILOVER_POD_DELETE_FORCE:=1}"
+  : "${FAILOVER_POD_DELETE_GRACE_SEC:=0}"
   : "${FAILOVER_SCENARIOS:=mixed write_only}"
   : "${FAILOVER_SCENARIO_DELAY_SEC:=120}"
 }
@@ -39,6 +41,34 @@ failover_scenario_trx_profile() {
     write_only) echo "write_only" ;;
     mixed|*) echo "mixed" ;;
   esac
+}
+
+verify_failover_tpcc_profiles() {
+  local tpcc scenario profile
+  tpcc="$(tpcc_dir)"
+
+  if tpcc_supports_trx_profile "${tpcc}"; then
+    echo "TPC-C trx_profile: supported (${tpcc})"
+    return 0
+  fi
+
+  for scenario in ${FAILOVER_SCENARIOS}; do
+    profile="$(failover_scenario_trx_profile "${scenario}")"
+    if [[ "${profile}" != "mixed" ]]; then
+      echo "ERROR: TPC-C at ${tpcc} does not support --trx_profile=${profile}." >&2
+      echo "  The benchmark droplet needs updated Lua files from this repo:" >&2
+      echo "    TPCC/sysbench-tpcc/tpcc_common.lua   (trx_profile option)" >&2
+      echo "    TPCC/sysbench-tpcc/tpcc.lua          (pick_trx function)" >&2
+      echo "  On the droplet: cd /root/mysql-benchmark && git pull" >&2
+      echo "  Or copy those two files, then verify:" >&2
+      echo "    cd TPCC/sysbench-tpcc && sysbench tpcc.lua help | grep trx_profile" >&2
+      return 1
+    fi
+  done
+
+  echo "WARNING: TPC-C lacks --trx_profile; mixed scenario will use default TPC-C mix." >&2
+  echo "  Update TPCC/sysbench-tpcc before running write_only." >&2
+  return 0
 }
 
 failover_trigger_enabled() {
@@ -303,8 +333,19 @@ run_tpcc_failover_load() {
     --scale="${scale}"
     --threads="${FAILOVER_THREADS}"
     --trx_level="${TPCC_TRX_LEVEL:-RR}"
-    --trx_profile="${trx_profile}"
     --force_pk="${TPCC_FORCE_PK:-1}"
+  )
+
+  if tpcc_supports_trx_profile "${tpcc}"; then
+    opts+=(--trx_profile="${trx_profile}")
+  elif [[ "${trx_profile}" != "mixed" ]]; then
+    echo "ERROR: --trx_profile=${trx_profile} not supported by ${tpcc}/tpcc.lua — update TPCC/sysbench-tpcc on this host" >&2
+    return 1
+  else
+    echo "NOTE: omitting --trx_profile (not in tpcc.lua); using default TPC-C mixed workload"
+  fi
+
+  opts+=(
     --mysql-ignore-errors="${ignore_errors}"
     --db-ps-mode=disable
     --time="${total_time}"

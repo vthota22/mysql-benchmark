@@ -45,6 +45,7 @@ echo "Load:     threads=${FAILOVER_THREADS} report-interval=${FAILOVER_REPORT_IN
 echo "Timeline: warmup=${FAILOVER_WARMUP_SEC}s + baseline=${FAILOVER_BASELINE_SEC}s + observe=${FAILOVER_OBSERVE_SEC}s"
 echo "          trigger at second $(failover_trigger_second) | total=$(_per_scenario_runtime_sec)s per scenario"
 echo "Scenarios:${FAILOVER_SCENARIOS} (delay between=${FAILOVER_SCENARIO_DELAY_SEC}s)"
+verify_failover_tpcc_profiles || exit 1
 echo "Editions: ${FAILOVER_EDITIONS}"
 echo "Reconnect: mysql-ignore-errors=${FAILOVER_MYSQL_IGNORE_ERRORS}"
 echo "Monitor:   primary=${FAILOVER_MONITOR_PRIMARY:-1} k8s_events=${FAILOVER_COLLECT_K8S_EVENTS:-1}"
@@ -146,7 +147,11 @@ run_failover_edition() {
     if [[ "${edition}" == "standard" ]]; then
       echo "${FAILOVER_STANDARD_TRIGGER_METHOD:-install_update}"
     else
-      echo "kubectl_delete_pod"
+      if [[ "${FAILOVER_POD_DELETE_FORCE:-1}" == "1" ]]; then
+        echo "kubectl_delete_pod_force (grace-period=${FAILOVER_POD_DELETE_GRACE_SEC:-0})"
+      else
+        echo "kubectl_delete_pod (grace-period=${FAILOVER_POD_DELETE_GRACE_SEC:-30})"
+      fi
     fi
   )"
   echo ""
