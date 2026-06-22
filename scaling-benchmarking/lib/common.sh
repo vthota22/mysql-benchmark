@@ -79,7 +79,6 @@ ensure_database_exists() {
 }
 
 tpcc_tables_ready() {
-  export TPCC_THREADS="${TPCC_PREP_THREADS:-${TPCC_THREADS:-16}}"
   if run_tpcc check >/dev/null 2>&1; then
     return 0
   fi
@@ -120,9 +119,17 @@ run_tpcc() {
 
   tables="${TPCC_TABLES:-10}"
   scale="${TPCC_SCALE:-10}"
-  threads="${TPCC_THREADS:-16}"
   force_pk="${TPCC_FORCE_PK:-1}"
   trx_level="${TPCC_TRX_LEVEL:-RR}"
+
+  case "${subcommand}" in
+    prepare|cleanup|check)
+      threads="${TPCC_PREP_THREADS:-${TPCC_THREADS:-16}}"
+      ;;
+    *)
+      threads="${TPCC_THREADS:-16}"
+      ;;
+  esac
 
   local opts=(
     "${MYSQL_BASE_OPTS[@]}"

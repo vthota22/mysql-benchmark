@@ -16,6 +16,7 @@ MYSQL_DB="sbtest_tpcc"
 TPCC_SCALE=10
 TPCC_TABLES=10
 TPCC_THREADS=16
+# Parallelism for prepare/check/cleanup only; run phase uses TPCC_THREADS above.
 TPCC_PREP_THREADS=16
 TPCC_WARMUP_SEC=30
 TPCC_REPORT_INTERVAL=1

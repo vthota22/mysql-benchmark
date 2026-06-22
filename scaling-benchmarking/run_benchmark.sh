@@ -64,8 +64,6 @@ trap on_exit EXIT
 phase1_init_database() {
   mysql_connectivity_check || return 1
 
-  export TPCC_THREADS="${TPCC_PREP_THREADS}"
-
   if [[ "${SKIP_PREPARE:-0}" == "1" ]]; then
     log_phase "1_INIT" "SKIP_PREPARE=1 — ensuring database exists, checking TPC-C tables"
     ensure_database_exists
