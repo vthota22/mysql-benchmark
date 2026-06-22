@@ -140,7 +140,9 @@ run_tpcc() {
       ;;
     run)
       local run_time="${TPCC_MAX_TIME:-${TPCC_TOTAL_TIME:-3600}}"
-      local ignore_errors="${TPCC_IGNORE_ERRORS:-1290,1053,2013,2006,3100}"
+      # Failover/resize: 1290,1836,1053,2013,2006,2055,2011,3100
+      # TPC-C contention (sysbench defaults): 1205,1213,1020
+      local ignore_errors="${TPCC_IGNORE_ERRORS:-1290,1836,1053,2013,2006,2055,2011,3100,1205,1213,1020}"
       run_sysbench_tpcc "${tpcc}" "${opts[@]}" \
         --time="${run_time}" \
         --warmup-time="${TPCC_WARMUP_SEC:-0}" \

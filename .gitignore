@@ -1,4 +1,5 @@
 scripts/.venv/
+scaling-benchmarking/scripts/.venv/
 benchmark.conf
 scaling-benchmarking/benchmark.conf
 scaling-benchmarking/results/
