@@ -188,6 +188,108 @@ start_primary_monitor() {
   echo $!
 }
 
+_longevity_tee_linebuffer() {
+  if command -v stdbuf >/dev/null 2>&1; then
+    stdbuf -oL -eL tee "$@"
+  else
+    tee "$@"
+  fi
+}
+
+wait_for_longevity_sysbench_start() {
+  local log_file="${1:?log required}"
+  local pid="${2:?pid required}"
+  local timeout="${3:-300}"
+  local i
+
+  for i in $(seq 1 "${timeout}"); do
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      echo "ERROR: sysbench (pid=${pid}) exited before load started — see ${log_file}" >&2
+      if [[ -f "${log_file}" ]]; then
+        tail -20 "${log_file}" >&2 || true
+      fi
+      return 1
+    fi
+    if [[ -f "${log_file}" ]] && grep -qE 'Threads started!|^\[[[:space:]]*[0-9]+s \]' "${log_file}"; then
+      echo "Sysbench load confirmed running (pid=${pid}) at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      return 0
+    fi
+    if (( i % 30 == 0 )); then
+      echo "Waiting for sysbench to start (${i}s / ${timeout}s) — thread init on scale=${TPCC_SCALE:-100} can take 1–3 min..."
+    fi
+    sleep 1
+  done
+  echo "ERROR: sysbench did not reach running state within ${timeout}s — see ${log_file}" >&2
+  return 1
+}
+
+_start_longevity_timeseries_parser() {
+  local log_file="${1:?log required}"
+  local csv="${2:?csv required}"
+  local run_start="${3:?epoch required}"
+  local stop_file="${4:?stop file required}"
+
+  (
+    set +e
+    # Wait for log file (created before this runs)
+    while [[ ! -f "${log_file}" ]] && [[ ! -f "${stop_file}" ]]; do
+      sleep 0.2
+    done
+    tail -n 0 -F "${log_file}" 2>/dev/null | while IFS= read -r line; do
+      [[ -f "${stop_file}" ]] && break
+      parse_sysbench_intermediate_line "${line}" "${csv}" "${run_start}"
+    done
+  ) &
+  echo $!
+}
+
+start_longevity_sysbench_load() {
+  local segment_log="${1:?log required}"
+  local pid_file="${2:?pid file required}"
+
+  build_mysql_base_opts
+
+  local tpcc tables scale threads force_pk trx_level time_sec warmup report_interval
+  tpcc="$(tpcc_dir)"
+  tables="${TPCC_TABLES:-10}"
+  scale="${TPCC_SCALE:-100}"
+  threads="${TPCC_THREADS:-32}"
+  force_pk="${TPCC_FORCE_PK:-1}"
+  trx_level="${TPCC_TRX_LEVEL:-RR}"
+  time_sec="${TPCC_TIME:?TPCC_TIME required}"
+  warmup="${TPCC_WARMUP:-0}"
+  report_interval="${TPCC_REPORT_INTERVAL:-60}"
+
+  local ignore_errors="${LONGEVITY_MYSQL_IGNORE_ERRORS:-${FAILOVER_MYSQL_IGNORE_ERRORS:-1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011}}"
+
+  local opts=(
+    "${MYSQL_BASE_OPTS[@]}"
+    "${MYSQL_SSL_OPTS[@]}"
+    --tables="${tables}"
+    --scale="${scale}"
+    --threads="${threads}"
+    --trx_level="${trx_level}"
+    --force_pk="${force_pk}"
+    --mysql-ignore-errors="${ignore_errors}"
+    --db-ps-mode=disable
+    --time="${time_sec}"
+    --warmup-time="${warmup}"
+    --report-interval="${report_interval}"
+  )
+
+  : > "${segment_log}"
+  {
+    echo "# longevity segment started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "# time=${time_sec}s warmup=${warmup}s threads=${threads} report-interval=${report_interval}s"
+  } >> "${segment_log}"
+
+  (cd "${tpcc}" && "${SYSBENCH_BIN}" tpcc.lua "${opts[@]}" run) \
+    > >(_longevity_tee_linebuffer -a "${segment_log}") 2>&1 &
+  local load_pid=$!
+  echo "${load_pid}" > "${pid_file}"
+  echo "${load_pid}"
+}
+
 run_longevity_tpcc_segment() {
   local edition="${1:?edition required}"
   local results_dir="${2:?results dir required}"
@@ -209,9 +311,13 @@ run_longevity_tpcc_segment() {
   local segment_log="${results_dir}/run_segment_${segment_idx}.log"
   local timeseries_csv="${results_dir}/longevity_timeseries.csv"
   local stop_file="${results_dir}/.monitor_stop"
+  local parser_stop="${results_dir}/.parser_stop"
+  local pid_file="${results_dir}/sysbench_segment_${segment_idx}.pid"
   local monitor_pid=""
+  local parser_pid=""
+  local sysbench_pid=""
 
-  rm -f "${stop_file}"
+  rm -f "${stop_file}" "${parser_stop}" "${pid_file}"
   init_longevity_timeseries "${timeseries_csv}"
 
   local run_start
@@ -219,31 +325,46 @@ run_longevity_tpcc_segment() {
 
   echo "--- Longevity segment ${segment_idx}: time=${segment_time}s warmup=${warmup}s threads=${TPCC_THREADS} ---"
   echo "Segment log: ${segment_log}"
+  if [[ "${warmup}" -gt 0 ]]; then
+    echo "NOTE: ${warmup}s warmup before measured load; first TPS report ~${LONGEVITY_REPORT_INTERVAL:-60}s after warmup ends."
+  fi
+
+  parser_pid=$(_start_longevity_timeseries_parser "${segment_log}" "${timeseries_csv}" "${run_start}" "${parser_stop}")
+
+  echo "Launching sysbench TPC-C (scale=${TPCC_SCALE}, tables=${TPCC_TABLES})..."
+  sysbench_pid=$(start_longevity_sysbench_load "${segment_log}" "${pid_file}")
+  echo "Sysbench pid=${sysbench_pid} (log streams via line-buffered tee)"
+
+  if ! wait_for_longevity_sysbench_start "${segment_log}" "${sysbench_pid}" 300; then
+    touch "${parser_stop}" "${stop_file}"
+    wait "${parser_pid}" 2>/dev/null || true
+    return 1
+  fi
 
   if [[ "${LONGEVITY_MONITOR_PRIMARY:-0}" == "1" ]]; then
     monitor_pid=$(start_primary_monitor "${edition}" "${results_dir}/primary_monitor.csv" \
-      "${LONGEVITY_MONITOR_INTERVAL:-60}" $$ "${stop_file}")
-    echo "Primary monitor PID: ${monitor_pid}"
+      "${LONGEVITY_MONITOR_INTERVAL:-60}" "${sysbench_pid}" "${stop_file}")
+    echo "Primary monitor PID: ${monitor_pid} (watching sysbench pid=${sysbench_pid})"
   fi
 
   local exit_code=0
   set +e
-  run_tpcc_command run 2>&1 | tee "${segment_log}" | while IFS= read -r line; do
-    parse_sysbench_intermediate_line "${line}" "${timeseries_csv}" "${run_start}"
-  done
-  exit_code=${PIPESTATUS[0]}
+  wait "${sysbench_pid}"
+  exit_code=$?
   set -e
 
-  touch "${stop_file}"
+  touch "${parser_stop}" "${stop_file}"
+  wait "${parser_pid}" 2>/dev/null || true
   if [[ -n "${monitor_pid}" ]]; then
     wait "${monitor_pid}" 2>/dev/null || true
   fi
+  rm -f "${pid_file}"
 
   local run_end wall_sec
   run_end=$(date +%s)
   wall_sec=$((run_end - run_start))
 
-  echo "${segment_idx},${run_start},${run_end},${wall_sec},${segment_time},${warmup},${exit_code}" \
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ),${segment_idx},${run_start},${run_end},${wall_sec},${segment_time},${warmup},${exit_code}" \
     >> "${results_dir}/segments.csv"
 
   return "${exit_code}"

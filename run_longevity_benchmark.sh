@@ -107,6 +107,8 @@ run_longevity_edition() {
     export TPCC_THREADS="${PREP_THREADS:-16}"
     run_tpcc_command check 2>&1 | tee "${results_dir}/check_pre.log" \
       || { echo "ERROR: pre-run TPC-C check failed"; return 1; }
+    echo "Pre-run check complete; releasing check connections before load..."
+    sleep 3
     echo ""
   fi
 
