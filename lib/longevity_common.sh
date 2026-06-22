@@ -247,6 +247,15 @@ start_longevity_sysbench_load() {
   local segment_log="${1:?log required}"
   local pid_file="${2:?pid file required}"
 
+  # shellcheck source=/dev/null
+  source "${BENCH_ROOT}/sysbench_mysql_opts.sh"
+  export PATH="${BENCH_ROOT}/sysbench-1.1/bin:${PATH}"
+
+  if [[ ! -x "${SYSBENCH_BIN:-}" ]]; then
+    echo "ERROR: sysbench not found — run ./setup_benchmark.sh (expected ${BENCH_ROOT}/sysbench-1.1/bin/sysbench)" >&2
+    return 1
+  fi
+
   build_mysql_base_opts
 
   local tpcc tables scale threads force_pk trx_level time_sec warmup report_interval
@@ -277,15 +286,18 @@ start_longevity_sysbench_load() {
     --report-interval="${report_interval}"
   )
 
-  : > "${segment_log}"
   {
     echo "# longevity segment started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "# sysbench=${SYSBENCH_BIN} tpcc=${tpcc}"
     echo "# time=${time_sec}s warmup=${warmup}s threads=${threads} report-interval=${report_interval}s"
   } >> "${segment_log}"
 
-  (cd "${tpcc}" && "${SYSBENCH_BIN}" tpcc.lua "${opts[@]}" run) \
-    > >(_longevity_tee_linebuffer -a "${segment_log}") 2>&1 &
+  (cd "${tpcc}" && "${SYSBENCH_BIN}" tpcc.lua "${opts[@]}" run) >> "${segment_log}" 2>&1 &
   local load_pid=$!
+  if ! kill -0 "${load_pid}" 2>/dev/null; then
+    echo "ERROR: failed to start sysbench background process" >&2
+    return 1
+  fi
   echo "${load_pid}" > "${pid_file}"
   echo "${load_pid}"
 }
@@ -317,6 +329,10 @@ run_longevity_tpcc_segment() {
   local parser_pid=""
   local sysbench_pid=""
 
+  # Create log immediately so tail/monitoring always have a path to read
+  : > "${segment_log}"
+  echo "# segment ${segment_idx} setup $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${segment_log}"
+
   rm -f "${stop_file}" "${parser_stop}" "${pid_file}"
   init_longevity_timeseries "${timeseries_csv}"
 
@@ -332,8 +348,14 @@ run_longevity_tpcc_segment() {
   parser_pid=$(_start_longevity_timeseries_parser "${segment_log}" "${timeseries_csv}" "${run_start}" "${parser_stop}")
 
   echo "Launching sysbench TPC-C (scale=${TPCC_SCALE}, tables=${TPCC_TABLES})..."
-  sysbench_pid=$(start_longevity_sysbench_load "${segment_log}" "${pid_file}")
-  echo "Sysbench pid=${sysbench_pid} (log streams via line-buffered tee)"
+  if ! sysbench_pid=$(start_longevity_sysbench_load "${segment_log}" "${pid_file}"); then
+    echo "ERROR: could not launch sysbench — see ${segment_log}" >&2
+    tail -20 "${segment_log}" >&2 || true
+    touch "${parser_stop}" "${stop_file}"
+    wait "${parser_pid}" 2>/dev/null || true
+    return 1
+  fi
+  echo "Sysbench pid=${sysbench_pid} (logging to ${segment_log})"
 
   if ! wait_for_longevity_sysbench_start "${segment_log}" "${sysbench_pid}" 300; then
     touch "${parser_stop}" "${stop_file}"

@@ -1,18 +1,35 @@
 #!/usr/bin/env bash
 # Run Percona sysbench-tpcc against managed MySQL
 # Usage:
-#   export MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DB
-#   ./run_tpcc.sh prepare
-#   ./run_tpcc.sh run
-#   ./run_tpcc.sh check
-#   ./run_tpcc.sh cleanup
+#   ./run_tpcc.sh prepare|run|check|cleanup
+#
+# Connection: export MYSQL_HOST, ... OR set ADVANCED_* / STANDARD_* in benchmark.conf
+#   EDITION=advanced ./run_tpcc.sh run
 #
 # Optional env:
 #   TPCC_TABLES=1 TPCC_SCALE=10 TPCC_THREADS=4 TPCC_TIME=300
 
-set -euo pipefail
+set -uo pipefail
 
-: "${MYSQL_HOST:?Set MYSQL_HOST}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Load benchmark.conf → MYSQL_* when not already exported (e.g. after `source benchmark.conf` alone)
+if [[ -z "${MYSQL_HOST:-}" ]]; then
+  CONFIG="${BENCHMARK_CONF:-${SCRIPT_DIR}/benchmark.conf}"
+  if [[ -f "${CONFIG}" ]]; then
+    # shellcheck source=/dev/null
+    source "${SCRIPT_DIR}/lib/benchmark_common.sh"
+    load_benchmark_config "${CONFIG}"
+    _tpcc_edition="${EDITION:-${LONGEVITY_EDITIONS:-${EDITIONS:-advanced}}}"
+    _tpcc_edition="${_tpcc_edition%% *}"
+    set_mysql_env_for_edition "${_tpcc_edition}"
+    echo "Using ${_tpcc_edition} cluster from ${CONFIG} → ${MYSQL_HOST}:${MYSQL_PORT}/${MYSQL_DB}"
+  fi
+fi
+
+set -eo pipefail
+
+: "${MYSQL_HOST:?Set MYSQL_HOST or ADVANCED_MYSQL_HOST/STANDARD_MYSQL_HOST in benchmark.conf (use EDITION=advanced ./run_tpcc.sh ...)}"
 : "${MYSQL_PORT:?Set MYSQL_PORT}"
 : "${MYSQL_USER:?Set MYSQL_USER}"
 : "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD}"
@@ -20,7 +37,7 @@ set -euo pipefail
 
 COMMAND="${1:?Usage: $0 prepare|run|check|cleanup}"
 
-SCRIPT_DIR="$(dirname "$0")"
+export PATH="${SCRIPT_DIR}/sysbench-1.1/bin:${PATH}"
 TPCC_DIR="${TPCC_DIR:-${SCRIPT_DIR}/TPCC/sysbench-tpcc}"
 source "${SCRIPT_DIR}/sysbench_mysql_opts.sh"
 

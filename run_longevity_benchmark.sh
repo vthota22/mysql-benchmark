@@ -27,6 +27,23 @@ export PATH="${SCRIPT_DIR}/sysbench-1.1/bin:${PATH}"
 source "${SCRIPT_DIR}/lib/longevity_common.sh"
 load_benchmark_config "${CONFIG}"
 
+verify_longevity_prerequisites() {
+  # shellcheck source=/dev/null
+  source "${SCRIPT_DIR}/sysbench_mysql_opts.sh"
+  if [[ ! -x "${SYSBENCH_BIN}" ]]; then
+    echo "ERROR: sysbench not found at ${SYSBENCH_BIN:-sysbench-1.1/bin/sysbench}" >&2
+    echo "Run: ./setup_benchmark.sh" >&2
+    exit 1
+  fi
+  if [[ ! -f "${SCRIPT_DIR}/TPCC/sysbench-tpcc/tpcc.lua" ]]; then
+    echo "ERROR: missing TPCC/sysbench-tpcc/tpcc.lua — run ./setup_benchmark.sh" >&2
+    exit 1
+  fi
+  echo "Prerequisites OK: sysbench=${SYSBENCH_BIN}"
+}
+
+verify_longevity_prerequisites
+
 TARGET_SEC="$(resolve_longevity_duration_sec)"
 EDITIONS="${LONGEVITY_EDITIONS:-advanced}"
 AUTO_RESTART="${LONGEVITY_AUTO_RESTART:-1}"
