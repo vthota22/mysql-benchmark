@@ -196,7 +196,17 @@ phase2_run_with_scaling() {
   local scale_pid=$!
 
   local tpcc_rc=0
-  if ! run_tpcc run 2>&1 | tee -a "${RUN_LOG}"; then
+  local sysbench_offset_recorded=0
+  if ! run_tpcc run 2>&1 | while IFS= read -r line; do
+    if [[ "${sysbench_offset_recorded}" -eq 0 && "${line}" == "[ 1s ]"* ]]; then
+      local first_report_epoch
+      first_report_epoch=$(date +%s)
+      echo "SYSBENCH_OFFSET_SEC=$((first_report_epoch - run_start_epoch - 1))" \
+        >> "${SCALE_TIMING_FILE}"
+      sysbench_offset_recorded=1
+    fi
+    printf '%s\n' "${line}"
+  done | tee -a "${RUN_LOG}"; then
     tpcc_rc=$?
     log_phase "2_RUN" "sysbench exited with status ${tpcc_rc}"
   else
