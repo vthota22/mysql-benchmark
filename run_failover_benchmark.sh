@@ -12,7 +12,7 @@
 #   FAILOVER_EDITIONS="advanced" ./run_failover_benchmark.sh   # single edition
 #   FAILOVER_SCENARIOS="mixed" ./run_failover_benchmark.sh    # skip write_only scenario
 #
-# Run inside tmux/nohup on the benchmark droplet — total runtime ~40 min per edition (2 scenarios).
+# Run inside tmux/nohup on the benchmark droplet — runtime depends on FAILOVER_*_SEC and scenario count.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -159,6 +159,8 @@ run_failover_edition() {
   mysql_connectivity_check "${edition}" "${edition_dir}/mysql_info.txt" \
     || { echo "Aborting ${edition}: cannot connect"; return 1; }
   echo ""
+
+  write_failover_benchmark_config "${edition_dir}" "${edition}"
 
   if [[ "${SKIP_PREPARE:-0}" != "1" ]]; then
     echo "--- Prepare TPC-C data (threads=${PREP_THREADS:-16}) ---"

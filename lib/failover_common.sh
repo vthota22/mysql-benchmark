@@ -43,6 +43,61 @@ failover_scenario_trx_profile() {
   esac
 }
 
+failover_cluster_slug() {
+  local edition="${1:-}"
+  local prefix slug_var
+  prefix="$(echo "${edition}" | tr '[:lower:]' '[:upper:]')"
+  slug_var="${prefix}_CLUSTER_SIZE_SLUG"
+  if [[ -n "${edition}" && -n "${!slug_var:-}" ]]; then
+    echo "${!slug_var}"
+    return 0
+  fi
+  if [[ -n "${MYSQL_CLUSTER_PLAN:-}" ]]; then
+    echo "${MYSQL_CLUSTER_PLAN}"
+    return 0
+  fi
+  if [[ -n "${CLUSTER_SIZE_SLUG:-}" ]]; then
+    echo "${CLUSTER_SIZE_SLUG}"
+    return 0
+  fi
+  echo "N/A"
+}
+
+tpcc_approx_data_size_label() {
+  local tables="${TPCC_TABLES:-10}"
+  local scale="${TPCC_SCALE:-100}"
+  awk -v t="${tables}" -v s="${scale}" 'BEGIN {
+    gb = s * t * 0.1
+    if (gb == int(gb)) printf "~%d GB (tables=%d, scale=%d)", gb, t, s
+    else printf "~%.1f GB (tables=%d, scale=%d)", gb, t, s
+  }'
+}
+
+write_failover_benchmark_config() {
+  local edition_dir="${1:?edition dir required}"
+  local edition="${2:?edition required}"
+  local slug data_size prep_threads load_threads tables scale
+
+  slug="$(failover_cluster_slug "${edition}")"
+  data_size="$(tpcc_approx_data_size_label)"
+  prep_threads="${PREP_THREADS:-16}"
+  load_threads="${FAILOVER_THREADS:-16}"
+  tables="${TPCC_TABLES:-10}"
+  scale="${TPCC_SCALE:-100}"
+
+  {
+    echo "FAILOVER_EDITION=${edition}"
+    echo "CLUSTER_SLUG=${slug}"
+    echo "DATA_SIZE=${data_size}"
+    echo "THREADS=${load_threads}"
+    echo "FAILOVER_THREADS=${load_threads}"
+    echo "TPCC_SCALE=${scale}"
+    echo "TPCC_TABLES=${tables}"
+    echo "TPCC_THREADS=${prep_threads}"
+    echo "PREP_THREADS=${prep_threads}"
+  } > "${edition_dir}/benchmark_config.env"
+}
+
 verify_failover_tpcc_profiles() {
   local tpcc scenario profile
   tpcc="$(tpcc_dir)"
@@ -86,8 +141,18 @@ failover_total_runtime_sec() {
   echo $((FAILOVER_WARMUP_SEC + FAILOVER_BASELINE_SEC + FAILOVER_OBSERVE_SEC))
 }
 
+# Sysbench --time is the measured run duration *after* warmup (not including warmup).
+failover_sysbench_time_sec() {
+  failover_defaults
+  echo $((FAILOVER_BASELINE_SEC + FAILOVER_OBSERVE_SEC))
+}
+
 failover_trigger_second() {
   failover_defaults
+  if [[ -n "${FAILOVER_TRIGGER_SECOND:-}" ]]; then
+    echo "${FAILOVER_TRIGGER_SECOND}"
+    return 0
+  fi
   echo $((FAILOVER_WARMUP_SEC + FAILOVER_BASELINE_SEC))
 }
 
@@ -303,15 +368,16 @@ run_tpcc_failover_load() {
   failover_defaults
   build_mysql_base_opts
 
-  local tpcc total_time ignore_errors trx_profile scenario
+  local tpcc total_time sysbench_time ignore_errors trx_profile scenario
   tpcc="$(tpcc_dir)"
   total_time=$(failover_total_runtime_sec)
+  sysbench_time=$(failover_sysbench_time_sec)
   ignore_errors="${FAILOVER_MYSQL_IGNORE_ERRORS}"
   scenario="${FAILOVER_SCENARIO:-mixed}"
   trx_profile="${TPCC_TRX_PROFILE:-$(failover_scenario_trx_profile "${scenario}")}"
 
   export TPCC_THREADS="${FAILOVER_THREADS}"
-  export TPCC_TIME="${total_time}"
+  export TPCC_TIME="${sysbench_time}"
   export TPCC_WARMUP="${FAILOVER_WARMUP_SEC}"
   export TPCC_REPORT_INTERVAL="${FAILOVER_REPORT_INTERVAL}"
 
@@ -321,6 +387,14 @@ run_tpcc_failover_load() {
   echo "FAILOVER_TRIGGER_SECOND=$(failover_trigger_second)" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_TOTAL_SEC=${total_time}" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_MYSQL_IGNORE_ERRORS=${ignore_errors}" >> "${results_dir}/sysbench_timing.txt"
+  echo "CLUSTER_SLUG=$(failover_cluster_slug "${FAILOVER_EDITION:-unknown}")" >> "${results_dir}/sysbench_timing.txt"
+  echo "DATA_SIZE=$(tpcc_approx_data_size_label)" >> "${results_dir}/sysbench_timing.txt"
+  echo "THREADS=${FAILOVER_THREADS}" >> "${results_dir}/sysbench_timing.txt"
+  echo "FAILOVER_THREADS=${FAILOVER_THREADS}" >> "${results_dir}/sysbench_timing.txt"
+  echo "TPCC_SCALE=${TPCC_SCALE:-100}" >> "${results_dir}/sysbench_timing.txt"
+  echo "TPCC_TABLES=${TPCC_TABLES:-10}" >> "${results_dir}/sysbench_timing.txt"
+  echo "TPCC_THREADS=${PREP_THREADS:-16}" >> "${results_dir}/sysbench_timing.txt"
+  echo "PREP_THREADS=${PREP_THREADS:-16}" >> "${results_dir}/sysbench_timing.txt"
 
   : > "${log_file}"
 
@@ -348,7 +422,7 @@ run_tpcc_failover_load() {
   opts+=(
     --mysql-ignore-errors="${ignore_errors}"
     --db-ps-mode=disable
-    --time="${total_time}"
+    --time="${sysbench_time}"
     --warmup-time="${FAILOVER_WARMUP_SEC}"
     --report-interval="${FAILOVER_REPORT_INTERVAL}"
   )
@@ -362,7 +436,7 @@ run_tpcc_failover_load() {
   unset SYSBENCH_LINE_BUFFER
 
   echo "${load_pid}" > "${pid_file}"
-  echo "Sysbench TPC-C started (pid=${load_pid}, time=${total_time}s, report-interval=${FAILOVER_REPORT_INTERVAL}s)"
+  echo "Sysbench TPC-C started (pid=${load_pid}, warmup=${FAILOVER_WARMUP_SEC}s time=${sysbench_time}s wall=${total_time}s, report-interval=${FAILOVER_REPORT_INTERVAL}s)"
 }
 
 stop_sysbench_load() {
@@ -499,6 +573,14 @@ export_failover_timeseries() {
     echo "FAILOVER_EDITION=${edition}"
   } > "${meta_file}"
 
+  if [[ -f "${results_dir}/sysbench_timing.txt" ]]; then
+    grep -E '^(CLUSTER_SLUG|DATA_SIZE|THREADS|FAILOVER_THREADS|TPCC_SCALE|TPCC_TABLES|TPCC_THREADS|PREP_THREADS)=' \
+      "${results_dir}/sysbench_timing.txt" >> "${meta_file}" 2>/dev/null || true
+  elif [[ -f "${results_dir}/../benchmark_config.env" ]]; then
+    grep -E '^(CLUSTER_SLUG|DATA_SIZE|THREADS|FAILOVER_THREADS|TPCC_SCALE|TPCC_TABLES|TPCC_THREADS|PREP_THREADS)=' \
+      "${results_dir}/../benchmark_config.env" >> "${meta_file}" 2>/dev/null || true
+  fi
+
   awk -v trigger="${trigger_second}" \
       -f - "${sysbench_log}" > "${csv_file}" <<'AWK'
 function parse_line(line,    i, n, f, sec, tps, qps, err, reconn, lat95) {
@@ -571,11 +653,13 @@ _failover_parse_sysbench_intervals() {
   local recovery="${3:-0.90}"
   local stable="${4:-30}"
   local outage_ratio="${5:-0.05}"
+  local observe_sec="${6:-600}"
 
   awk -v trigger="${trigger}" \
       -v recovery="${recovery}" \
       -v stable="${stable}" \
       -v outage_ratio="${outage_ratio}" \
+      -v observe_sec="${observe_sec}" \
       -f - "${sysbench_log}" <<'AWK'
 function parse_interval_line(line,    i, sec, tps, qps, err, reconn, lat95, n) {
   n = split(line, f, " ")
@@ -615,6 +699,7 @@ END {
     exit 1
   }
   baseline_tps = baseline_sum / baseline_count
+  post_trigger_end = trigger + observe_sec
 
   outage_start = -1
   outage_end = -1
@@ -623,7 +708,7 @@ END {
   max_lat = 0
   total_errors = 0
 
-  for (sec = trigger; sec <= trigger + 600; sec++) {
+  for (sec = trigger; sec <= post_trigger_end; sec++) {
     if (!(sec in tps_arr)) continue
     total_errors += err_arr[sec]
     if (err_arr[sec] > max_err) max_err = err_arr[sec]
@@ -635,7 +720,7 @@ END {
   }
 
   if (outage_start < 0) {
-    for (sec = trigger; sec <= trigger + 600; sec++) {
+    for (sec = trigger; sec <= post_trigger_end; sec++) {
       if (!(sec in tps_arr)) continue
       if (err_arr[sec] > 0 || reconn_arr[sec] > 0) {
         outage_start = sec
@@ -655,7 +740,7 @@ END {
   recovery_threshold_tps = baseline_tps * recovery
   rto_sec = -1
   stable_count = 0
-  for (sec = trigger; sec <= trigger + 600; sec++) {
+  for (sec = trigger; sec <= post_trigger_end; sec++) {
     if (!(sec in tps_arr)) continue
     if (tps_arr[sec] >= recovery_threshold_tps) {
       stable_count++
@@ -722,7 +807,7 @@ analyze_failover_metrics() {
 
   _failover_parse_sysbench_intervals "${sysbench_log}" "${trigger_second}" \
     "${FAILOVER_RECOVERY_THRESHOLD}" "${FAILOVER_RECOVERY_STABLE_SEC}" \
-    "${FAILOVER_OUTAGE_TPS_RATIO}" > "${parsed_file}"
+    "${FAILOVER_OUTAGE_TPS_RATIO}" "${FAILOVER_OBSERVE_SEC}" > "${parsed_file}"
 
   # shellcheck disable=SC1090
   source "${parsed_file}"

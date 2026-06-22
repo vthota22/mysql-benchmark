@@ -83,6 +83,41 @@ def load_metadata(path: Path) -> dict[str, str]:
     return meta
 
 
+def load_benchmark_config(edition_dir: Path, meta: dict[str, str]) -> dict[str, str]:
+    """Merge edition + scenario benchmark config for HTML metadata."""
+    cfg: dict[str, str] = {}
+    edition_cfg = edition_dir.parent / "benchmark_config.env"
+    if edition_cfg.exists():
+        cfg.update(load_metadata(edition_cfg))
+    timing = edition_dir / "sysbench_timing.txt"
+    if timing.exists():
+        cfg.update(load_metadata(timing))
+    cfg.update(meta)
+    return cfg
+
+
+def _format_data_size(cfg: dict[str, str]) -> str:
+    if cfg.get("DATA_SIZE"):
+        return cfg["DATA_SIZE"]
+    try:
+        scale = float(cfg["TPCC_SCALE"])
+        tables = float(cfg.get("TPCC_TABLES", "10"))
+        gb = scale * tables * 0.1
+        if gb == int(gb):
+            return f"~{int(gb)} GB (tables={int(tables)}, scale={int(scale)})"
+        return f"~{gb:.1f} GB (tables={int(tables)}, scale={int(scale)})"
+    except (KeyError, TypeError, ValueError):
+        return "N/A"
+
+
+def _cfg_value(cfg: dict[str, str], *keys: str, default: str = "N/A") -> str:
+    for key in keys:
+        val = cfg.get(key, "")
+        if val not in {"", "N/A"}:
+            return str(val)
+    return default
+
+
 def load_kpi(path: Path) -> dict[str, str]:
     if not path.exists():
         return {}
@@ -458,6 +493,7 @@ def generate_html_report(
 ) -> Path:
     extended = extended or {}
     primary = primary or {}
+    bench = load_benchmark_config(edition_dir, meta)
     trigger = float(meta.get("FAILOVER_TRIGGER_SECOND", "0"))
     scenario = meta.get("FAILOVER_SCENARIO", edition_dir.name if edition_dir.name in {"mixed", "write_only"} else "default")
     trx_profile = meta.get("TPCC_TRX_PROFILE", kpi.get("trx_profile", "mixed"))
@@ -493,6 +529,11 @@ def generate_html_report(
         ("Edition", edition),
         ("Scenario", scenario),
         ("TPC-C profile", trx_profile),
+        ("Slug size", _cfg_value(bench, "CLUSTER_SLUG", "MYSQL_CLUSTER_PLAN")),
+        ("Data size", _format_data_size(bench)),
+        ("Threads", _cfg_value(bench, "THREADS", "FAILOVER_THREADS")),
+        ("TPCC_SCALE", _cfg_value(bench, "TPCC_SCALE")),
+        ("TPCC_THREADS", _cfg_value(bench, "TPCC_THREADS", "PREP_THREADS")),
         ("Sysbench start (UTC)", meta.get("SYSBENCH_START_UTC", "N/A")),
         ("Failover trigger (UTC)", event.get("FAILOVER_TRIGGER_UTC", "N/A")),
         ("Trigger second", str(int(trigger)) if trigger else "N/A"),
