@@ -14,6 +14,7 @@ export LONGEVITY_THREADS="${LONGEVITY_THREADS:-8}"
 export LONGEVITY_RUN_TPCC_CHECK=0
 export LONGEVITY_GENERATE_GRAPHS=0
 export LONGEVITY_MONITOR_PRIMARY=0
+export LONGEVITY_AUTO_RESTART=0
 
-echo "=== Longevity smoke: 300s load, ${LONGEVITY_THREADS} threads ==="
+echo "=== Longevity smoke: 300s load, ${LONGEVITY_WARMUP_SEC}s warmup, ${LONGEVITY_THREADS} threads ==="
 exec "${SCRIPT_DIR}/run_longevity_benchmark.sh"

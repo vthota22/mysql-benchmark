@@ -23,9 +23,42 @@ CONFIG="${BENCHMARK_CONF:-${SCRIPT_DIR}/benchmark.conf}"
 
 export PATH="${SCRIPT_DIR}/sysbench-1.1/bin:${PATH}"
 
+# Preserve env overrides set by caller (e.g. scripts/longevity_smoke.sh) before sourcing benchmark.conf
+_longevity_preserve_env() {
+  local _vars=(
+    SKIP_PREPARE LONGEVITY_DURATION_SEC LONGEVITY_DAYS LONGEVITY_WARMUP_SEC
+    LONGEVITY_REPORT_INTERVAL LONGEVITY_THREADS LONGEVITY_RUN_TPCC_CHECK
+    LONGEVITY_GENERATE_GRAPHS LONGEVITY_MONITOR_PRIMARY LONGEVITY_MONITOR_INTERVAL
+    LONGEVITY_AUTO_RESTART LONGEVITY_EDITIONS
+  )
+  local _v
+  for _v in "${_vars[@]}"; do
+    eval "LONGEVITY_SAVED_${_v}=\${${_v}+set}"
+    eval "LONGEVITY_SAVED_${_v}_VAL=\${${_v}:-}"
+  done
+}
+
+_longevity_restore_env() {
+  local _vars=(
+    SKIP_PREPARE LONGEVITY_DURATION_SEC LONGEVITY_DAYS LONGEVITY_WARMUP_SEC
+    LONGEVITY_REPORT_INTERVAL LONGEVITY_THREADS LONGEVITY_RUN_TPCC_CHECK
+    LONGEVITY_GENERATE_GRAPHS LONGEVITY_MONITOR_PRIMARY LONGEVITY_MONITOR_INTERVAL
+    LONGEVITY_AUTO_RESTART LONGEVITY_EDITIONS
+  )
+  local _v _flag
+  for _v in "${_vars[@]}"; do
+    eval "_flag=\${LONGEVITY_SAVED_${_v}:-}"
+    if [[ "${_flag}" == set ]]; then
+      eval "export ${_v}=\${LONGEVITY_SAVED_${_v}_VAL}"
+    fi
+  done
+}
+
 # shellcheck source=lib/longevity_common.sh
 source "${SCRIPT_DIR}/lib/longevity_common.sh"
+_longevity_preserve_env
 load_benchmark_config "${CONFIG}"
+_longevity_restore_env
 
 verify_longevity_prerequisites() {
   # shellcheck source=/dev/null
