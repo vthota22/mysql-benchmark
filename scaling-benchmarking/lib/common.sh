@@ -30,7 +30,8 @@ epoch_to_utc() {
 # Prefix sysbench report-interval lines with wall-clock UTC. Set by run_benchmark.sh:
 #   TPCC_RUN_START_EPOCH, TPCC_SYSBENCH_OFFSET_SEC
 prefix_tpcc_line_timestamp() {
-  local line="${1:?line required}"
+  # Empty lines are valid (sysbench prints blank lines before report-interval output).
+  local line="${1-}"
   if [[ "${line}" =~ ^\[[[:space:]]*([0-9]+)s[[:space:]]*\] ]]; then
     local elapsed="${BASH_REMATCH[1]}"
     local run_start="${TPCC_RUN_START_EPOCH:-0}"
