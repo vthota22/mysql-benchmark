@@ -13,7 +13,8 @@ from pathlib import Path
 
 
 INTERVAL_RE = re.compile(
-    r"^\[\s*(\d+)s\s*\]\s+thds:\s+(\d+)\s+tps:\s+([\d.]+)\s+qps:\s+([\d.]+)\s+"
+    r"^(?:\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\]\s+)?"
+    r"\[\s*(\d+)s\s*\]\s+thds:\s+(\d+)\s+tps:\s+([\d.]+)\s+qps:\s+([\d.]+)\s+"
     r"\(r/w/o:\s+([\d.]+)/([\d.]+)/([\d.]+)\)\s+"
     r"lat \(ms,95%\):\s+([\d.]+)\s+err/s\s+([\d.]+)\s+reconn/s:\s+([\d.]+)"
 )

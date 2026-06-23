@@ -18,6 +18,33 @@ log_phase() {
   echo "[${ts}] PHASE=${phase} ${message}"
 }
 
+epoch_to_utc() {
+  local epoch="${1:?epoch required}"
+  if date -u -r 0 +%Y >/dev/null 2>&1; then
+    date -u -r "${epoch}" +%Y-%m-%dT%H:%M:%SZ
+  else
+    date -u -d "@${epoch}" +%Y-%m-%dT%H:%M:%SZ
+  fi
+}
+
+# Prefix sysbench report-interval lines with wall-clock UTC. Set by run_benchmark.sh:
+#   TPCC_RUN_START_EPOCH, TPCC_SYSBENCH_OFFSET_SEC
+prefix_tpcc_line_timestamp() {
+  local line="${1:?line required}"
+  if [[ "${line}" =~ ^\[[[:space:]]*([0-9]+)s[[:space:]]*\] ]]; then
+    local elapsed="${BASH_REMATCH[1]}"
+    local run_start="${TPCC_RUN_START_EPOCH:-0}"
+    local offset="${TPCC_SYSBENCH_OFFSET_SEC:-0}"
+    if [[ "${run_start}" -gt 0 ]]; then
+      local ts
+      ts="$(epoch_to_utc $((run_start + offset + elapsed)))"
+      printf '[%s] %s\n' "${ts}" "${line}"
+      return 0
+    fi
+  fi
+  printf '%s\n' "${line}"
+}
+
 load_config() {
   local config_file="${1:?config file required}"
   if [[ ! -f "${config_file}" ]]; then

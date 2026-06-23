@@ -183,8 +183,10 @@ phase2_run_with_scaling() {
   : > "${SCALE_TIMING_FILE}"
   : > "${SCALE_LOG}"
 
-  local run_start_epoch
+  local run_start_epoch sysbench_offset_sec=0
   run_start_epoch=$(date +%s)
+  TPCC_RUN_START_EPOCH="${run_start_epoch}"
+  export TPCC_RUN_START_EPOCH
   {
     echo "ENGINE=${ENGINE}"
     echo "RUN_START_EPOCH=${run_start_epoch}"
@@ -195,16 +197,25 @@ phase2_run_with_scaling() {
 
   local tpcc_rc=0
   local sysbench_offset_recorded=0
-  if ! run_tpcc run 2>&1 | while IFS= read -r line; do
+  local tpcc_fifo
+  tpcc_fifo="$(mktemp -u "${RUN_DIR}/.tpcc.XXXXXX")"
+  mkfifo "${tpcc_fifo}"
+  run_tpcc run > "${tpcc_fifo}" 2>&1 &
+  local tpcc_pid=$!
+  while IFS= read -r line; do
     if [[ "${sysbench_offset_recorded}" -eq 0 && "${line}" == "[ 1s ]"* ]]; then
       local first_report_epoch
       first_report_epoch=$(date +%s)
-      echo "SYSBENCH_OFFSET_SEC=$((first_report_epoch - run_start_epoch - 1))" \
-        >> "${SCALE_TIMING_FILE}"
+      sysbench_offset_sec=$((first_report_epoch - run_start_epoch - 1))
+      TPCC_SYSBENCH_OFFSET_SEC="${sysbench_offset_sec}"
+      export TPCC_SYSBENCH_OFFSET_SEC
+      echo "SYSBENCH_OFFSET_SEC=${sysbench_offset_sec}" >> "${SCALE_TIMING_FILE}"
       sysbench_offset_recorded=1
     fi
-    printf '%s\n' "${line}"
-  done | tee -a "${RUN_LOG}"; then
+    prefix_tpcc_line_timestamp "${line}"
+  done < "${tpcc_fifo}" | tee -a "${RUN_LOG}"
+  rm -f "${tpcc_fifo}"
+  if ! wait "${tpcc_pid}"; then
     tpcc_rc=$?
     log_phase "2_RUN" "sysbench exited with status ${tpcc_rc}"
   else

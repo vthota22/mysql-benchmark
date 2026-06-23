@@ -25,7 +25,7 @@ except ImportError as exc:  # pragma: no cover
     print("ERROR: plotly is required. Install with: pip install plotly", file=sys.stderr)
     raise SystemExit(1) from exc
 
-from parse_timeseries import resolve_sysbench_offset
+from parse_timeseries import classify_phase, resolve_sysbench_offset, scale_markers
 
 
 ENV_LINE_RE = re.compile(r"^([A-Z_]+)=(.*)$")
@@ -258,17 +258,27 @@ def add_phase_traces(fig, metrics: list[MetricRow], y_field: str, row: int, col:
         )
 
 
+def timing_for_markers(timing: dict[str, str], run_dir: Path) -> dict[str, str]:
+    offset = resolve_sysbench_offset(timing, run_dir / "tpcc_run.log")
+    if offset:
+        return {**timing, "SYSBENCH_OFFSET_SEC": str(offset)}
+    return timing
+
+
+def apply_metric_phases(
+    metrics: list[MetricRow], timing: dict[str, str], run_dir: Path
+) -> None:
+    """Recompute phase labels so chart colors match scale marker positions."""
+    trigger, complete = scale_markers(timing_for_markers(timing, run_dir))
+    for row in metrics:
+        row.phase = classify_phase(row.elapsed_sec, trigger, complete)
+
+
 def sysbench_scale_markers(
     timing: dict[str, str], run_dir: Path
 ) -> tuple[int | None, int | None]:
     """Map wall-clock scale elapsed times onto the sysbench x-axis."""
-    offset = resolve_sysbench_offset(timing, run_dir / "tpcc_run.log")
-    start = timing.get("SCALE_START_ELAPSED")
-    complete = timing.get("SCALE_COMPLETE_ELAPSED")
-    return (
-        int(start) - offset if start else None,
-        int(complete) - offset if complete else None,
-    )
+    return scale_markers(timing_for_markers(timing, run_dir))
 
 
 def add_scale_markers(
@@ -482,6 +492,7 @@ def generate_report(run_dir: Path, output_path: Path | None = None) -> Path:
     conf = parse_benchmark_conf(run_dir / "benchmark.conf")
     before, after = parse_scale_log(run_dir / "scale.log")
     metrics = load_metrics(run_dir / "metrics_timeseries.csv")
+    apply_metric_phases(metrics, timing, run_dir)
     downtime_episodes = detect_downtime_episodes(metrics)
     downtime_by_phase = downtime_seconds_by_phase(metrics)
 
