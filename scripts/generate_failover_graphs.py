@@ -80,7 +80,10 @@ def load_metadata(path: Path) -> dict[str, str]:
     for line in path.read_text().splitlines():
         if "=" in line:
             key, _, value = line.partition("=")
-            meta[key.strip()] = value.strip()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                value = value[1:-1]
+            meta[key.strip()] = value
     return meta
 
 
@@ -1420,6 +1423,21 @@ def generate_for_edition(edition_dir: Path, *, png: bool = True, html: bool = Tr
     return outputs
 
 
+def _collect_scenario_dirs(parent: Path) -> list[Path]:
+    """Scenario dirs under an edition or thread parent (flat or tN/scenario layout)."""
+    found: list[Path] = []
+    for child in sorted(parent.iterdir()):
+        if not child.is_dir() or child.name == "graphs":
+            continue
+        if (child / "failover_timeseries.csv").exists():
+            found.append(child)
+        elif THREAD_DIR_RE.match(child.name):
+            for scenario_dir in sorted(child.iterdir()):
+                if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
+                    found.append(scenario_dir)
+    return found
+
+
 def discover_edition_dirs(path: Path) -> tuple[list[Path], Path]:
     """Find result dirs containing failover_timeseries.csv (edition/scenario or edition/tN/scenario)."""
     if (path / "failover_timeseries.csv").exists():
@@ -1427,20 +1445,24 @@ def discover_edition_dirs(path: Path) -> tuple[list[Path], Path]:
 
     dirs: list[Path] = []
     if path.is_dir():
-        for child in sorted(path.iterdir()):
-            if not child.is_dir() or child.name == "graphs":
-                continue
-            if (child / "failover_timeseries.csv").exists():
-                dirs.append(child)
-                continue
-            if THREAD_DIR_RE.match(child.name):
+        if path.name in EDITION_NAMES:
+            dirs.extend(_collect_scenario_dirs(path))
+        else:
+            for child in sorted(path.iterdir()):
+                if not child.is_dir() or child.name == "graphs":
+                    continue
+                if (child / "failover_timeseries.csv").exists():
+                    dirs.append(child)
+                    continue
+                if child.name in EDITION_NAMES:
+                    dirs.extend(_collect_scenario_dirs(child))
+                    continue
+                if THREAD_DIR_RE.match(child.name):
+                    dirs.extend(_collect_scenario_dirs(child))
+                    continue
                 for scenario_dir in sorted(child.iterdir()):
                     if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
                         dirs.append(scenario_dir)
-                continue
-            for scenario_dir in sorted(child.iterdir()):
-                if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
-                    dirs.append(scenario_dir)
 
     return dirs, path
 
