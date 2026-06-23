@@ -100,7 +100,8 @@ trigger_standard_failover() {
       local token="${DIGITALOCEAN_TOKEN:-${DO_API_TOKEN:-}}"
       local size_slug="${STANDARD_CLUSTER_SIZE_SLUG:-}"
       local storage_mib="${STANDARD_CLUSTER_STORAGE_MIB:-}"
-      local num_nodes="${STANDARD_CLUSTER_NUM_NODES:-3}"
+      local num_nodes
+      num_nodes="$(failover_cluster_num_nodes standard)"
       : "${token:?Set DIGITALOCEAN_TOKEN for storage_resize}"
       : "${size_slug:?Set STANDARD_CLUSTER_SIZE_SLUG}"
       : "${storage_mib:?Set STANDARD_CLUSTER_STORAGE_MIB (current + increment)}"

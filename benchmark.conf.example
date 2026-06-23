@@ -49,8 +49,14 @@ MYSQL_FAIL_ON_SETTINGS_MISMATCH=0
 MYSQL_VARS="version version_comment innodb_buffer_pool_size innodb_buffer_pool_instances innodb_log_file_size innodb_flush_log_at_trx_commit innodb_io_capacity innodb_io_capacity_max innodb_read_io_threads innodb_write_io_threads max_connections sql_require_primary_key transaction_isolation binlog_format sync_binlog character_set_server collation_server"
 # Optional: document your intended cluster config (informational — set in DO control panel)
 # MYSQL_CLUSTER_PLAN="db-s-4vcpu-8gb"
-# STANDARD_CLUSTER_SIZE_SLUG=db-s-4vcpu-8gb
-# ADVANCED_CLUSTER_SIZE_SLUG=mysql-g-8vcpu-32gb   # shown as "Slug size" in failover HTML report
+
+# Cluster sizing (failover HTML run metadata; edition-specific overrides below)
+SLUG_SIZE=db-s-4vcpu-8gb
+NUM_NODES=3
+STANDARD_CLUSTER_SIZE_SLUG=db-s-4vcpu-8gb
+STANDARD_CLUSTER_NUM_NODES=3
+ADVANCED_CLUSTER_SIZE_SLUG=mysql-g-8vcpu-32gb
+ADVANCED_CLUSTER_NUM_NODES=3
 # MYSQL_NOTES="Buffer pool and CPU/RAM must match between Standard and Advanced clusters"
 
 # --- Failover benchmark ---
@@ -76,9 +82,12 @@ FAILOVER_EDITIONS="standard advanced"
 # Dual TPC-C scenarios in one run (mixed read/write, then write-only new_order+payment):
 # FAILOVER_SCENARIOS="mixed write_only"   # default; use "mixed" to skip write_only
 # FAILOVER_SCENARIO_DELAY_SEC=120         # pause between scenarios (cooldown / cluster settle)
+# FAILOVER_THREAD_MATRIX="4 8 16 32"      # run failover at each thread count (results under edition/t<N>/)
+# FAILOVER_THREAD_DELAY_SEC=120             # pause between thread counts in a matrix run
 # TPC-C trx_profile is passed to tpcc.lua: mixed = standard TPC-C mix; write_only = 50/50 new_order/payment
 #
-# Output: results/failover_*/<edition>/<scenario>/failover_kpi.csv (KPIs, phase durations in seconds):
+# Output: results/failover_*/advanced/t<N>/<scenario>/...  (when FAILOVER_THREAD_MATRIX is set)
+# Combined HTML (thread toggle): results/failover_*/advanced/graphs/failover_report.html
 #   mixed/      — standard TPC-C transaction mix (reads + writes)
 #   write_only/ — 100% new_order/payment; writes_failed_during_failover KPI populated
 # Combined rollup: results/failover_*/failover_kpi.csv and failover_comparison.txt
@@ -130,7 +139,7 @@ STANDARD_CLUSTER_UUID=
 # For storage_resize fallback only:
 # STANDARD_CLUSTER_SIZE_SLUG=db-s-4vcpu-8gb
 # STANDARD_CLUSTER_STORAGE_MIB=204800
-# STANDARD_CLUSTER_NUM_NODES=3
+# STANDARD_CLUSTER_NUM_NODES=3   # see NUM_NODES / STANDARD_CLUSTER_NUM_NODES at top of file
 
 # --- Advanced Edition failover trigger (kubectl delete primary pod) ---
 # Ungraceful kill (default): grace-period=0 --force

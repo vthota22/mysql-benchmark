@@ -34,6 +34,9 @@ failover_defaults() {
   : "${FAILOVER_POD_DELETE_GRACE_SEC:=0}"
   : "${FAILOVER_SCENARIOS:=mixed write_only}"
   : "${FAILOVER_SCENARIO_DELAY_SEC:=120}"
+  # Space-separated load thread counts; when set, runs each under edition/t<N>/<scenario>/
+  : "${FAILOVER_THREAD_MATRIX:=}"
+  : "${FAILOVER_THREAD_DELAY_SEC:=120}"
 }
 
 failover_scenario_trx_profile() {
@@ -52,12 +55,32 @@ failover_cluster_slug() {
     echo "${!slug_var}"
     return 0
   fi
+  if [[ -n "${SLUG_SIZE:-}" ]]; then
+    echo "${SLUG_SIZE}"
+    return 0
+  fi
   if [[ -n "${MYSQL_CLUSTER_PLAN:-}" ]]; then
     echo "${MYSQL_CLUSTER_PLAN}"
     return 0
   fi
   if [[ -n "${CLUSTER_SIZE_SLUG:-}" ]]; then
     echo "${CLUSTER_SIZE_SLUG}"
+    return 0
+  fi
+  echo "N/A"
+}
+
+failover_cluster_num_nodes() {
+  local edition="${1:-}"
+  local prefix nodes_var
+  prefix="$(echo "${edition}" | tr '[:lower:]' '[:upper:]')"
+  nodes_var="${prefix}_CLUSTER_NUM_NODES"
+  if [[ -n "${edition}" && -n "${!nodes_var:-}" ]]; then
+    echo "${!nodes_var}"
+    return 0
+  fi
+  if [[ -n "${NUM_NODES:-}" ]]; then
+    echo "${NUM_NODES}"
     return 0
   fi
   echo "N/A"
@@ -76,9 +99,10 @@ tpcc_approx_data_size_label() {
 write_failover_benchmark_config() {
   local edition_dir="${1:?edition dir required}"
   local edition="${2:?edition required}"
-  local slug data_size prep_threads load_threads tables scale
+  local slug num_nodes data_size prep_threads load_threads tables scale
 
   slug="$(failover_cluster_slug "${edition}")"
+  num_nodes="$(failover_cluster_num_nodes "${edition}")"
   data_size="$(tpcc_approx_data_size_label)"
   prep_threads="${PREP_THREADS:-16}"
   load_threads="${FAILOVER_THREADS:-16}"
@@ -87,7 +111,9 @@ write_failover_benchmark_config() {
 
   {
     echo "FAILOVER_EDITION=${edition}"
+    echo "SLUG_SIZE=${slug}"
     echo "CLUSTER_SLUG=${slug}"
+    echo "NUM_NODES=${num_nodes}"
     echo "DATA_SIZE=${data_size}"
     echo "THREADS=${load_threads}"
     echo "FAILOVER_THREADS=${load_threads}"
@@ -95,6 +121,8 @@ write_failover_benchmark_config() {
     echo "TPCC_TABLES=${tables}"
     echo "TPCC_THREADS=${prep_threads}"
     echo "PREP_THREADS=${prep_threads}"
+    echo "FAILOVER_THREAD_MATRIX=${FAILOVER_THREAD_MATRIX:-}"
+    echo "FAILOVER_SCENARIOS=${FAILOVER_SCENARIOS:-mixed write_only}"
   } > "${edition_dir}/benchmark_config.env"
 }
 
@@ -382,12 +410,15 @@ run_tpcc_failover_load() {
   export TPCC_REPORT_INTERVAL="${FAILOVER_REPORT_INTERVAL}"
 
   echo "SYSBENCH_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${results_dir}/sysbench_timing.txt"
+  echo "FAILOVER_EDITION=${FAILOVER_EDITION:-advanced}" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_SCENARIO=${scenario}" >> "${results_dir}/sysbench_timing.txt"
   echo "TPCC_TRX_PROFILE=${trx_profile}" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_TRIGGER_SECOND=$(failover_trigger_second)" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_TOTAL_SEC=${total_time}" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_MYSQL_IGNORE_ERRORS=${ignore_errors}" >> "${results_dir}/sysbench_timing.txt"
   echo "CLUSTER_SLUG=$(failover_cluster_slug "${FAILOVER_EDITION:-unknown}")" >> "${results_dir}/sysbench_timing.txt"
+  echo "SLUG_SIZE=$(failover_cluster_slug "${FAILOVER_EDITION:-unknown}")" >> "${results_dir}/sysbench_timing.txt"
+  echo "NUM_NODES=$(failover_cluster_num_nodes "${FAILOVER_EDITION:-unknown}")" >> "${results_dir}/sysbench_timing.txt"
   echo "DATA_SIZE=$(tpcc_approx_data_size_label)" >> "${results_dir}/sysbench_timing.txt"
   echo "THREADS=${FAILOVER_THREADS}" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_THREADS=${FAILOVER_THREADS}" >> "${results_dir}/sysbench_timing.txt"
@@ -552,7 +583,7 @@ export_failover_timeseries() {
   local trigger_second start_utc edition scenario trx_profile
   trigger_second=$(failover_trigger_second)
   start_utc=""
-  edition="unknown"
+  edition="${FAILOVER_EDITION:-advanced}"
   scenario="mixed"
   trx_profile="mixed"
 
@@ -561,8 +592,13 @@ export_failover_timeseries() {
     source "${timing_file}" 2>/dev/null || true
     trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
     start_utc="${SYSBENCH_START_UTC:-}"
+    edition="${FAILOVER_EDITION:-${edition}}"
     scenario="${FAILOVER_SCENARIO:-mixed}"
     trx_profile="${TPCC_TRX_PROFILE:-mixed}"
+  fi
+  if [[ -f "${event_file}" ]]; then
+    edition=$(grep -E '^FAILOVER_EDITION=' "${event_file}" | tail -1 | cut -d= -f2- || echo "${edition}")
+    [[ -z "${edition}" || "${edition}" == "unknown" ]] && edition="${FAILOVER_EDITION:-advanced}"
   fi
 
   {
@@ -574,10 +610,10 @@ export_failover_timeseries() {
   } > "${meta_file}"
 
   if [[ -f "${results_dir}/sysbench_timing.txt" ]]; then
-    grep -E '^(CLUSTER_SLUG|DATA_SIZE|THREADS|FAILOVER_THREADS|TPCC_SCALE|TPCC_TABLES|TPCC_THREADS|PREP_THREADS)=' \
+    grep -E '^(SLUG_SIZE|CLUSTER_SLUG|NUM_NODES|DATA_SIZE|THREADS|FAILOVER_THREADS|TPCC_SCALE|TPCC_TABLES|TPCC_THREADS|PREP_THREADS)=' \
       "${results_dir}/sysbench_timing.txt" >> "${meta_file}" 2>/dev/null || true
   elif [[ -f "${results_dir}/../benchmark_config.env" ]]; then
-    grep -E '^(CLUSTER_SLUG|DATA_SIZE|THREADS|FAILOVER_THREADS|TPCC_SCALE|TPCC_TABLES|TPCC_THREADS|PREP_THREADS)=' \
+    grep -E '^(SLUG_SIZE|CLUSTER_SLUG|NUM_NODES|DATA_SIZE|THREADS|FAILOVER_THREADS|TPCC_SCALE|TPCC_TABLES|TPCC_THREADS|PREP_THREADS)=' \
       "${results_dir}/../benchmark_config.env" >> "${meta_file}" 2>/dev/null || true
   fi
 
@@ -681,24 +717,36 @@ function parse_interval_line(line,    i, sec, tps, qps, err, reconn, lat95, n) {
   reconn_arr[sec] = reconn
   lat_arr[sec] = lat95
   if (sec < trigger && err == 0 && tps > 0) {
-    baseline_sum += tps
-    baseline_count++
+    baseline_tps_sum += tps
+    baseline_tps_count++
+    baseline_qps_sum += qps
+    baseline_qps_count++
+    if (lat95 > 0) {
+      baseline_lat_sum += lat95
+      baseline_lat_count++
+    }
   }
   return 1
 }
 BEGIN {
-  baseline_sum = 0
-  baseline_count = 0
+  baseline_tps_sum = 0
+  baseline_tps_count = 0
+  baseline_qps_sum = 0
+  baseline_qps_count = 0
+  baseline_lat_sum = 0
+  baseline_lat_count = 0
 }
 {
   parse_interval_line($0)
 }
 END {
-  if (baseline_count == 0) {
+  if (baseline_tps_count == 0) {
     print "ERROR: no baseline data before trigger second " trigger > "/dev/stderr"
     exit 1
   }
-  baseline_tps = baseline_sum / baseline_count
+  baseline_tps = baseline_tps_sum / baseline_tps_count
+  baseline_qps = (baseline_qps_count > 0) ? baseline_qps_sum / baseline_qps_count : 0
+  baseline_lat_p95 = (baseline_lat_count > 0) ? baseline_lat_sum / baseline_lat_count : 0
   post_trigger_end = trigger + observe_sec
 
   outage_start = -1
@@ -754,6 +802,8 @@ END {
   }
 
   printf "BASELINE_TPS=%.2f\n", baseline_tps
+  printf "BASELINE_QPS=%.2f\n", baseline_qps
+  printf "BASELINE_LAT_P95_MS=%.2f\n", baseline_lat_p95
   printf "OUTAGE_START=%d\n", outage_start
   printf "OUTAGE_END=%d\n", outage_end
   printf "OUTAGE_DURATION=%d\n", outage_duration
@@ -825,6 +875,8 @@ analyze_failover_metrics() {
     echo ""
     echo "--- Throughput ---"
     printf "Baseline TPS (avg):   %.2f\n" "${BASELINE_TPS}"
+    printf "Baseline QPS (avg):   %.2f\n" "${BASELINE_QPS:-0}"
+    printf "Baseline p95 lat (avg): %.2f ms\n" "${BASELINE_LAT_P95_MS:-0}"
     printf "Recovery threshold:   %.2f (%.0f%% of baseline)\n" \
       "${RECOVERY_THRESHOLD}" "$(awk "BEGIN {print ${FAILOVER_RECOVERY_THRESHOLD} * 100}")"
     echo ""
@@ -1624,10 +1676,25 @@ write_failover_comparison() {
     [[ "${edition}" == "graphs" ]] && continue
 
     local found_scenario=0
-    for scenario_dir in "${edition_dir}"/*/; do
-      [[ -d "${scenario_dir}" ]] || continue
-      local scenario
-      scenario=$(basename "${scenario_dir}")
+    for sub_dir in "${edition_dir}"/*/; do
+      [[ -d "${sub_dir}" ]] || continue
+      local sub_name scenario_dir scenario threads_label
+      sub_name=$(basename "${sub_dir}")
+
+      if [[ "${sub_name}" =~ ^t[0-9]+$ ]]; then
+        threads_label="${sub_name}"
+        for scenario_dir in "${sub_dir}"/*/; do
+          [[ -d "${scenario_dir}" ]] || continue
+          scenario=$(basename "${scenario_dir}")
+          [[ -f "${scenario_dir}/failover_kpi.csv" ]] || continue
+          found_scenario=1
+          _append_failover_scenario_results "${edition}" "${threads_label}/${scenario}" "${scenario_dir}"
+        done
+        continue
+      fi
+
+      scenario_dir="${sub_dir}"
+      scenario="${sub_name}"
       [[ -f "${scenario_dir}/failover_kpi.csv" ]] || continue
       found_scenario=1
       _append_failover_scenario_results "${edition}" "${scenario}" "${scenario_dir}"

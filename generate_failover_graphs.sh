@@ -11,8 +11,8 @@
 #   ./generate_failover_graphs.sh --png-only  results/failover_<timestamp>
 #
 # Output:
-#   <edition>/<scenario>/graphs/failover_report.html   (interactive; no extra deps)
-#   <edition>/<scenario>/graphs/failover_*.png         (requires python3-matplotlib)
+#   Per-run:  <edition>/t<N>/<scenario>/graphs/failover_report.html
+#   Combined (thread toggle): <edition>/graphs/failover_report.html
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

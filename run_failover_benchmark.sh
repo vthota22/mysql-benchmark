@@ -11,6 +11,7 @@
 #   BENCHMARK_CONF=/path/to/benchmark.conf ./run_failover_benchmark.sh
 #   FAILOVER_EDITIONS="advanced" ./run_failover_benchmark.sh   # single edition
 #   FAILOVER_SCENARIOS="mixed" ./run_failover_benchmark.sh    # skip write_only scenario
+#   FAILOVER_THREAD_MATRIX="4 8 16 32" ./run_failover_benchmark.sh  # thread sweep
 #
 # Run inside tmux/nohup on the benchmark droplet — runtime depends on FAILOVER_*_SEC and scenario count.
 set -euo pipefail
@@ -42,6 +43,9 @@ echo "Config:   ${CONFIG}"
 echo "Sysbench: $("${SCRIPT_DIR}/which_sysbench.sh")"
 echo ""
 echo "Load:     threads=${FAILOVER_THREADS} report-interval=${FAILOVER_REPORT_INTERVAL}s"
+if [[ -n "${FAILOVER_THREAD_MATRIX:-}" ]]; then
+  echo "Thread matrix:${FAILOVER_THREAD_MATRIX} (delay between=${FAILOVER_THREAD_DELAY_SEC}s)"
+fi
 echo "Timeline: warmup=${FAILOVER_WARMUP_SEC}s + baseline=${FAILOVER_BASELINE_SEC}s + observe=${FAILOVER_OBSERVE_SEC}s"
 echo "          trigger at second $(failover_trigger_second) | total=$(_per_scenario_runtime_sec)s per scenario"
 echo "Scenarios:${FAILOVER_SCENARIOS} (delay between=${FAILOVER_SCENARIO_DELAY_SEC}s)"
@@ -174,16 +178,45 @@ run_failover_edition() {
   fi
 
   local scenario_index=0
-  for scenario in ${FAILOVER_SCENARIOS}; do
-    scenario_index=$((scenario_index + 1))
-    if [[ "${scenario_index}" -gt 1 && "${FAILOVER_SCENARIO_DELAY_SEC:-0}" -gt 0 ]]; then
-      echo "--- Waiting ${FAILOVER_SCENARIO_DELAY_SEC}s for cluster stability before scenario ${scenario} ---"
-      sleep "${FAILOVER_SCENARIO_DELAY_SEC}"
-    fi
-    if ! run_failover_scenario "${edition}" "${scenario}" "${edition_dir}"; then
+  local thread_index=0
+
+  _run_scenarios_for_base_dir() {
+    local base_dir="${1:?base dir required}"
+    scenario_index=0
+    for scenario in ${FAILOVER_SCENARIOS}; do
+      scenario_index=$((scenario_index + 1))
+      if [[ "${scenario_index}" -gt 1 && "${FAILOVER_SCENARIO_DELAY_SEC:-0}" -gt 0 ]]; then
+        echo "--- Waiting ${FAILOVER_SCENARIO_DELAY_SEC}s for cluster stability before scenario ${scenario} ---"
+        sleep "${FAILOVER_SCENARIO_DELAY_SEC}"
+      fi
+      if ! run_failover_scenario "${edition}" "${scenario}" "${base_dir}"; then
+        return 1
+      fi
+    done
+    return 0
+  }
+
+  if [[ -n "${FAILOVER_THREAD_MATRIX:-}" ]]; then
+    for threads in ${FAILOVER_THREAD_MATRIX}; do
+      thread_index=$((thread_index + 1))
+      if [[ "${thread_index}" -gt 1 && "${FAILOVER_THREAD_DELAY_SEC:-0}" -gt 0 ]]; then
+        echo "--- Waiting ${FAILOVER_THREAD_DELAY_SEC}s before thread count ${threads} ---"
+        sleep "${FAILOVER_THREAD_DELAY_SEC}"
+      fi
+      export FAILOVER_THREADS="${threads}"
+      local thread_dir="${edition_dir}/t${threads}"
+      mkdir -p "${thread_dir}"
+      echo ""
+      echo "======== Thread count: ${threads} (results under ${thread_dir}/) ========"
+      if ! _run_scenarios_for_base_dir "${thread_dir}"; then
+        return 1
+      fi
+    done
+  else
+    if ! _run_scenarios_for_base_dir "${edition_dir}"; then
       return 1
     fi
-  done
+  fi
 }
 
 FAILED=0
@@ -205,6 +238,7 @@ echo "=== Failover benchmark complete ==="
 echo "Results:   ${RESULTS_ROOT}"
 echo "Summary:   ${RESULTS_ROOT}/failover_comparison.txt"
 echo "KPI CSV:   ${RESULTS_ROOT}/failover_kpi.csv"
+echo "HTML report (thread toggle): ${RESULTS_ROOT}/advanced/graphs/failover_report.html"
 echo "Full log:  ${FULL_LOG}"
 
 if [[ "${FAILED}" -gt 0 ]]; then

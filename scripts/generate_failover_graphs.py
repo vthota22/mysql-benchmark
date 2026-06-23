@@ -7,6 +7,7 @@ import argparse
 import csv
 import html
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -116,6 +117,311 @@ def _cfg_value(cfg: dict[str, str], *keys: str, default: str = "N/A") -> str:
         if val not in {"", "N/A"}:
             return str(val)
     return default
+
+
+def find_benchmark_conf() -> Path | None:
+    env = os.environ.get("BENCHMARK_CONF", "").strip()
+    if env:
+        path = Path(env)
+        if path.is_file():
+            return path
+    repo_conf = Path(__file__).resolve().parent.parent / "benchmark.conf"
+    if repo_conf.is_file():
+        return repo_conf
+    return None
+
+
+def _resolve_from_file_cfg(file_cfg: dict[str, str], *keys: str) -> str:
+    for key in keys:
+        val = file_cfg.get(key, "")
+        if val not in {"", "N/A"}:
+            return str(val)
+    return "N/A"
+
+
+def enrich_cluster_metadata(cfg: dict[str, str], edition: str) -> None:
+    """Fill slug/node metadata from benchmark.conf when absent in saved run files."""
+    slug = _cfg_value(cfg, "SLUG_SIZE", "CLUSTER_SLUG")
+    nodes = _cfg_value(cfg, "NUM_NODES", "CLUSTER_NUM_NODES")
+    if slug != "N/A" and nodes != "N/A":
+        return
+
+    conf_path = find_benchmark_conf()
+    if not conf_path:
+        return
+
+    file_cfg = load_metadata(conf_path)
+    prefix = edition.upper()
+    if slug == "N/A":
+        resolved = _resolve_from_file_cfg(
+            file_cfg,
+            f"{prefix}_CLUSTER_SIZE_SLUG",
+            "SLUG_SIZE",
+            "MYSQL_CLUSTER_PLAN",
+            "CLUSTER_SIZE_SLUG",
+        )
+        if resolved != "N/A":
+            cfg["SLUG_SIZE"] = resolved
+            cfg["CLUSTER_SLUG"] = resolved
+    if nodes == "N/A":
+        resolved = _resolve_from_file_cfg(
+            file_cfg,
+            f"{prefix}_CLUSTER_NUM_NODES",
+            "NUM_NODES",
+        )
+        if resolved != "N/A":
+            cfg["NUM_NODES"] = resolved
+
+
+THREAD_DIR_RE = re.compile(r"^t(\d+)$")
+EDITION_NAMES = {"advanced", "standard"}
+DEFAULT_THREAD_MATRIX = (4, 8, 16, 32)
+DEFAULT_SCENARIOS = ("mixed", "write_only")
+
+
+def resolve_edition_name(
+    scenario_dir: Path,
+    meta: dict[str, str],
+    event: dict[str, str],
+    kpi: dict[str, str],
+    bench: dict[str, str],
+) -> str:
+    for src in (
+        meta.get("FAILOVER_EDITION"),
+        event.get("FAILOVER_EDITION"),
+        kpi.get("edition"),
+        bench.get("FAILOVER_EDITION"),
+    ):
+        if src and str(src).lower() not in {"", "unknown"}:
+            return str(src)
+    for parent in scenario_dir.parents:
+        if parent.name in EDITION_NAMES:
+            return parent.name
+    return "advanced"
+
+
+def infer_thread_count(scenario_dir: Path, meta: dict[str, str], bench: dict[str, str]) -> int:
+    parent = scenario_dir.parent.name
+    match = THREAD_DIR_RE.match(parent)
+    if match:
+        return int(match.group(1))
+    for key in ("THREADS", "FAILOVER_THREADS"):
+        if meta.get(key, "").isdigit():
+            return int(meta[key])
+        if bench.get(key, "").isdigit():
+            return int(bench[key])
+    return 0
+
+
+def load_scenario_bundle(scenario_dir: Path) -> dict:
+    rows = load_timeseries(scenario_dir / "failover_timeseries.csv")
+    meta = load_metadata(scenario_dir / "failover_timeseries_meta.txt")
+    parsed = load_metadata(scenario_dir / "failover_parsed.env")
+    event = load_metadata(scenario_dir / "failover_event.txt")
+    kpi = load_kpi(scenario_dir / "failover_kpi.csv")
+    extended = _parse_extended_metrics(scenario_dir / "failover_extended_metrics.txt")
+    primary = load_metadata(scenario_dir / "primary_change.env")
+    bench = load_benchmark_config(scenario_dir, meta)
+    edition = resolve_edition_name(scenario_dir, meta, event, kpi, bench)
+    enrich_cluster_metadata(bench, edition)
+    scenario = meta.get(
+        "FAILOVER_SCENARIO",
+        scenario_dir.name if scenario_dir.name in {"mixed", "write_only"} else "default",
+    )
+    trx_profile = meta.get("TPCC_TRX_PROFILE", kpi.get("trx_profile", "mixed"))
+    threads = infer_thread_count(scenario_dir, meta, bench)
+    trigger = float(meta.get("FAILOVER_TRIGGER_SECOND", "0"))
+    baseline = float(parsed.get("BASELINE_TPS", "0"))
+    recovery = float(parsed.get("RECOVERY_THRESHOLD", str(baseline * 0.9 if baseline else 0)))
+    outage_start = float(parsed.get("OUTAGE_START", trigger))
+    outage_end = float(parsed.get("OUTAGE_END", trigger))
+    return {
+        "dir": str(scenario_dir),
+        "edition": edition,
+        "scenario": scenario,
+        "trx_profile": trx_profile,
+        "threads": threads,
+        "rows": rows,
+        "meta": meta,
+        "parsed": parsed,
+        "event": event,
+        "kpi": kpi,
+        "extended": extended,
+        "primary": primary,
+        "bench": bench,
+        "trigger": trigger,
+        "baseline": baseline,
+        "recovery": recovery,
+        "outage_start": outage_start,
+        "outage_end": outage_end,
+        "chart_data": {
+            "elapsed": [r["elapsed_sec"] for r in rows],
+            "tps": [r["tps"] for r in rows],
+            "qps": [r["qps"] for r in rows],
+            "err": [r["err_per_sec"] for r in rows],
+            "reconn": [r["reconn_per_sec"] for r in rows],
+            "lat_p95": [r["lat_p95_ms"] for r in rows],
+            "trigger_sec": trigger,
+            "baseline_tps": baseline,
+            "recovery_threshold": recovery,
+            "outage_start": outage_start,
+            "outage_end": outage_end,
+        },
+    }
+
+
+def load_edition_benchmark_config(edition_dir: Path) -> dict[str, str]:
+    return load_metadata(edition_dir / "benchmark_config.env")
+
+
+def _parse_space_list(value: str) -> list[str]:
+    return [part for part in value.split() if part]
+
+
+def parent_edition_dir(scenario_dir: Path) -> Path | None:
+    if scenario_dir.name in {"mixed", "write_only"}:
+        parent = scenario_dir.parent
+        if parent.name in EDITION_NAMES:
+            return parent
+    for parent in scenario_dir.parents:
+        if parent.name in EDITION_NAMES:
+            return parent
+    return None
+
+
+def resolve_thread_matrix(
+    edition_dir: Path, thread_runs: dict[int, dict[str, Path]]
+) -> list[int]:
+    bench = load_edition_benchmark_config(edition_dir)
+    discovered = {t for t in thread_runs if t > 0}
+    if bench.get("FAILOVER_THREAD_MATRIX", "").strip():
+        planned = {
+            int(part)
+            for part in _parse_space_list(bench["FAILOVER_THREAD_MATRIX"])
+            if part.isdigit()
+        }
+    else:
+        planned = set(DEFAULT_THREAD_MATRIX)
+    return sorted(planned | discovered)
+
+
+def resolve_scenario_list(
+    edition_dir: Path, thread_runs: dict[int, dict[str, Path]]
+) -> list[str]:
+    bench = load_edition_benchmark_config(edition_dir)
+    discovered: set[str] = set()
+    for scenarios in thread_runs.values():
+        discovered.update(scenarios.keys())
+    if bench.get("FAILOVER_SCENARIOS", "").strip():
+        planned = set(_parse_space_list(bench["FAILOVER_SCENARIOS"]))
+    else:
+        planned = set(DEFAULT_SCENARIOS)
+    return sorted(planned | discovered)
+
+
+def discover_thread_runs(edition_dir: Path) -> dict[int, dict[str, Path]]:
+    """Map thread count -> scenario name -> results dir."""
+    runs: dict[int, dict[str, Path]] = {}
+    if not edition_dir.is_dir():
+        return runs
+
+    for child in sorted(edition_dir.iterdir()):
+        if not child.is_dir() or child.name == "graphs":
+            continue
+        match = THREAD_DIR_RE.match(child.name)
+        if match:
+            threads = int(match.group(1))
+            for scenario_dir in sorted(child.iterdir()):
+                if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
+                    runs.setdefault(threads, {})[scenario_dir.name] = scenario_dir
+            continue
+        if child.name in {"mixed", "write_only"} and (child / "failover_timeseries.csv").exists():
+            bundle = load_scenario_bundle(child)
+            threads = bundle["threads"] or 0
+            runs.setdefault(threads, {})[child.name] = child
+
+    return runs
+
+
+def _baseline_averages_before_trigger(
+    rows: list[dict[str, float]], trigger_sec: float
+) -> tuple[float, float, float]:
+    """Average per-second metrics before trigger (seconds with err=0 and tps>0)."""
+    tps_vals: list[float] = []
+    qps_vals: list[float] = []
+    lat_vals: list[float] = []
+    for row in rows:
+        if row["elapsed_sec"] >= trigger_sec:
+            continue
+        if row["err_per_sec"] > 0 or row["tps"] <= 0:
+            continue
+        tps_vals.append(row["tps"])
+        qps_vals.append(row["qps"])
+        if row["lat_p95_ms"] > 0:
+            lat_vals.append(row["lat_p95_ms"])
+    tps = sum(tps_vals) / len(tps_vals) if tps_vals else 0.0
+    qps = sum(qps_vals) / len(qps_vals) if qps_vals else 0.0
+    lat = sum(lat_vals) / len(lat_vals) if lat_vals else 0.0
+    return tps, qps, lat
+
+
+def _resolve_baseline_metrics(
+    parsed: dict[str, str],
+    rows: list[dict[str, float]],
+    trigger_sec: float,
+) -> tuple[float, float, float]:
+    tps = float(parsed.get("BASELINE_TPS", "0") or 0)
+    qps = float(parsed.get("BASELINE_QPS", "0") or 0)
+    lat = float(parsed.get("BASELINE_LAT_P95_MS", "0") or 0)
+    if rows and trigger_sec > 0:
+        calc_tps, calc_qps, calc_lat = _baseline_averages_before_trigger(rows, trigger_sec)
+        if tps <= 0:
+            tps = calc_tps
+        if qps <= 0:
+            qps = calc_qps
+        if lat <= 0:
+            lat = calc_lat
+    return tps, qps, lat
+
+
+def _meta_rows_for_bundle(bundle: dict) -> list[tuple[str, str]]:
+    bench = bundle["bench"]
+    meta = bundle["meta"]
+    event = bundle["event"]
+    parsed = bundle["parsed"]
+    trigger = bundle["trigger"]
+    threads = bundle["threads"]
+    baseline_tps, baseline_qps, baseline_lat = _resolve_baseline_metrics(
+        parsed, bundle.get("rows", []), trigger
+    )
+    return [
+        ("Edition", bundle["edition"]),
+        ("Scenario", bundle["scenario"]),
+        ("TPC-C profile", bundle["trx_profile"]),
+        ("Load threads", str(threads) if threads else _cfg_value(bench, "THREADS", "FAILOVER_THREADS")),
+        ("Slug size", _cfg_value(bench, "SLUG_SIZE", "CLUSTER_SLUG", "MYSQL_CLUSTER_PLAN")),
+        ("Num nodes", _cfg_value(bench, "NUM_NODES", "CLUSTER_NUM_NODES")),
+        ("Data size", _format_data_size(bench)),
+        ("TPCC_SCALE", _cfg_value(bench, "TPCC_SCALE")),
+        ("TPCC_THREADS", _cfg_value(bench, "TPCC_THREADS", "PREP_THREADS")),
+        ("Sysbench start (UTC)", meta.get("SYSBENCH_START_UTC", "N/A")),
+        ("Failover trigger (UTC)", event.get("FAILOVER_TRIGGER_UTC", "N/A")),
+        ("Trigger second", str(int(trigger)) if trigger else "N/A"),
+        ("Trigger method", event.get("FAILOVER_METHOD", "N/A")),
+        ("Target pod", event.get("FAILOVER_TARGET_POD", "N/A")),
+        ("Baseline TPS", f"{baseline_tps:.2f}" if baseline_tps else "N/A"),
+        ("Baseline QPS", f"{baseline_qps:.2f}" if baseline_qps else "N/A"),
+        (
+            "Baseline latency p95",
+            _format_latency_ms(baseline_lat) if baseline_lat else "N/A",
+        ),
+    ]
+
+
+def _meta_table_html(meta_rows: list[tuple[str, str]]) -> str:
+    return "".join(
+        f"<tr><th>{html.escape(k)}</th><td>{html.escape(v)}</td></tr>" for k, v in meta_rows
+    )
 
 
 def load_kpi(path: Path) -> dict[str, str]:
@@ -497,9 +803,10 @@ def generate_html_report(
     trigger = float(meta.get("FAILOVER_TRIGGER_SECOND", "0"))
     scenario = meta.get("FAILOVER_SCENARIO", edition_dir.name if edition_dir.name in {"mixed", "write_only"} else "default")
     trx_profile = meta.get("TPCC_TRX_PROFILE", kpi.get("trx_profile", "mixed"))
-    edition = meta.get("FAILOVER_EDITION", edition_dir.parent.name if edition_dir.name in {"mixed", "write_only"} else edition_dir.name)
-    baseline = float(parsed.get("BASELINE_TPS", "0"))
-    recovery = float(parsed.get("RECOVERY_THRESHOLD", str(baseline * 0.9 if baseline else 0)))
+    edition = resolve_edition_name(edition_dir, meta, event, kpi, bench)
+    enrich_cluster_metadata(bench, edition)
+    baseline_tps, baseline_qps, baseline_lat = _resolve_baseline_metrics(parsed, rows, trigger)
+    recovery = float(parsed.get("RECOVERY_THRESHOLD", str(baseline_tps * 0.9 if baseline_tps else 0)))
     outage_start = float(parsed.get("OUTAGE_START", trigger))
     outage_end = float(parsed.get("OUTAGE_END", trigger))
 
@@ -512,7 +819,7 @@ def generate_html_report(
         "reconn": [r["reconn_per_sec"] for r in rows],
         "lat_p95": [r["lat_p95_ms"] for r in rows],
         "trigger_sec": trigger,
-        "baseline_tps": baseline,
+        "baseline_tps": baseline_tps,
         "recovery_threshold": recovery,
         "outage_start": outage_start,
         "outage_end": outage_end,
@@ -529,9 +836,10 @@ def generate_html_report(
         ("Edition", edition),
         ("Scenario", scenario),
         ("TPC-C profile", trx_profile),
-        ("Slug size", _cfg_value(bench, "CLUSTER_SLUG", "MYSQL_CLUSTER_PLAN")),
+        ("Load threads", str(infer_thread_count(edition_dir, meta, bench)) or _cfg_value(bench, "THREADS", "FAILOVER_THREADS")),
+        ("Slug size", _cfg_value(bench, "SLUG_SIZE", "CLUSTER_SLUG", "MYSQL_CLUSTER_PLAN")),
+        ("Num nodes", _cfg_value(bench, "NUM_NODES", "CLUSTER_NUM_NODES")),
         ("Data size", _format_data_size(bench)),
-        ("Threads", _cfg_value(bench, "THREADS", "FAILOVER_THREADS")),
         ("TPCC_SCALE", _cfg_value(bench, "TPCC_SCALE")),
         ("TPCC_THREADS", _cfg_value(bench, "TPCC_THREADS", "PREP_THREADS")),
         ("Sysbench start (UTC)", meta.get("SYSBENCH_START_UTC", "N/A")),
@@ -539,12 +847,14 @@ def generate_html_report(
         ("Trigger second", str(int(trigger)) if trigger else "N/A"),
         ("Trigger method", event.get("FAILOVER_METHOD", "N/A")),
         ("Target pod", event.get("FAILOVER_TARGET_POD", "N/A")),
-        ("Baseline TPS", f"{baseline:.2f}" if baseline else "N/A"),
+        ("Baseline TPS", f"{baseline_tps:.2f}" if baseline_tps else "N/A"),
+        ("Baseline QPS", f"{baseline_qps:.2f}" if baseline_qps else "N/A"),
+        (
+            "Baseline latency p95",
+            _format_latency_ms(baseline_lat) if baseline_lat else "N/A",
+        ),
     ]
-    meta_html = "".join(
-        f"<tr><th>{html.escape(k)}</th><td>{html.escape(v)}</td></tr>"
-        for k, v in meta_rows
-    )
+    meta_html = _meta_table_html(meta_rows)
 
     out_path = edition_dir / "graphs" / "failover_report.html"
     out_path.parent.mkdir(exist_ok=True)
@@ -716,6 +1026,288 @@ def generate_html_report(
     return out_path
 
 
+def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[int, dict[str, Path]]) -> Path:
+    """Single HTML with thread + scenario toggle buttons."""
+    bundles: dict[str, dict] = {}
+    thread_counts = resolve_thread_matrix(edition_dir, thread_runs)
+    scenario_list = resolve_scenario_list(edition_dir, thread_runs)
+    edition = "advanced"
+
+    for threads, scenarios in thread_runs.items():
+        for scenario, scenario_dir in sorted(scenarios.items()):
+            key = f"{threads}:{scenario}"
+            bundle = load_scenario_bundle(scenario_dir)
+            bundles[key] = bundle
+            edition = bundle["edition"]
+
+    default_threads = next((t for t in thread_counts if any(f"{t}:{s}" in bundles for s in scenario_list)), thread_counts[0])
+    default_scenario = next(
+        (s for s in scenario_list if f"{default_threads}:{s}" in bundles),
+        scenario_list[0],
+    )
+
+    panels: list[str] = []
+    chart_payload: dict[str, dict] = {}
+    for threads in thread_counts:
+        for scenario in scenario_list:
+            key = f"{threads}:{scenario}"
+            panel_id = f"panel_t{threads}_{scenario}"
+            hidden = "" if (threads == default_threads and scenario == default_scenario) else ' style="display:none"'
+            bundle = bundles.get(key)
+            if bundle:
+                meta_html = _meta_table_html(_meta_rows_for_bundle(bundle))
+                metrics_html = _metrics_summary_html(
+                    bundle["kpi"], bundle["extended"], bundle["primary"], bundle["parsed"]
+                )
+                chart_payload[key] = bundle["chart_data"]
+                panels.append(
+                    f'<div class="run-panel" id="{panel_id}" data-threads="{threads}" '
+                    f'data-scenario="{html.escape(scenario)}"{hidden}>'
+                    f'<div class="grid"><div>'
+                    f'<div class="card"><h2>Run metadata</h2><table><tbody>{meta_html}</tbody></table></div>'
+                    f'<div class="card" style="margin-top:1rem"><h2>Failover metrics</h2>{metrics_html}</div>'
+                    f"</div><div>"
+                    f'<div class="card"><h2>TPS &amp; QPS</h2><div class="chart-wrap">'
+                    f'<canvas id="tpsQps_{panel_id}"></canvas></div></div>'
+                    f'<div class="card"><h2>Errors &amp; reconnects</h2><div class="chart-wrap">'
+                    f'<canvas id="errors_{panel_id}"></canvas></div></div>'
+                    f'<div class="card"><h2>Latency p95 (ms)</h2><div class="chart-wrap">'
+                    f'<canvas id="latency_{panel_id}"></canvas></div></div>'
+                    f"</div></div></div>"
+                )
+            else:
+                panels.append(
+                    f'<div class="run-panel run-panel-empty" id="{panel_id}" data-threads="{threads}" '
+                    f'data-scenario="{html.escape(scenario)}"{hidden}>'
+                    f'<div class="card empty-state">'
+                    f"<h2>No data</h2>"
+                    f"<p>No failover results for <strong>{threads} threads</strong> · "
+                    f"<strong>{html.escape(scenario)}</strong> in this run.</p>"
+                    f"</div></div>"
+                )
+
+    thread_buttons = "".join(
+        f'<button type="button" class="toggle-btn{" active" if t == default_threads else ""}" '
+        f'data-threads="{t}">{t} threads</button>'
+        for t in thread_counts
+    )
+    scenario_buttons = "".join(
+        f'<button type="button" class="toggle-btn scenario-btn{" active" if s == default_scenario else ""}" '
+        f'data-scenario="{html.escape(s)}">{html.escape(s)}</button>'
+        for s in scenario_list
+    )
+
+    out_path = edition_dir / "graphs" / "failover_report.html"
+    out_path.parent.mkdir(exist_ok=True)
+
+    page = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Failover report — {html.escape(edition)} (thread comparison)</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+  <style>
+    :root {{
+      --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --muted: #94a3b8;
+      --accent: #38bdf8; --border: #334155;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg); color: var(--text); margin: 0; padding: 1.5rem;
+      line-height: 1.5;
+    }}
+    h1 {{ font-size: 1.5rem; margin: 0 0 0.25rem; }}
+    .subtitle {{ color: var(--muted); margin-bottom: 1rem; }}
+    .toolbar {{ display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; align-items: center; }}
+    .toolbar-label {{ color: var(--muted); font-size: 0.85rem; margin-right: 0.25rem; }}
+    .toggle-btn {{
+      background: var(--card); color: var(--text); border: 1px solid var(--border);
+      border-radius: 6px; padding: 0.45rem 0.85rem; cursor: pointer; font-size: 0.9rem;
+    }}
+    .toggle-btn:hover {{ border-color: var(--accent); }}
+    .toggle-btn.active {{ background: var(--accent); color: #0f172a; border-color: var(--accent); font-weight: 600; }}
+    .grid {{ display: grid; gap: 1rem; grid-template-columns: 1fr; }}
+    @media (min-width: 960px) {{ .grid {{ grid-template-columns: 320px 1fr; }} }}
+    .card {{
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 8px; padding: 1rem 1.25rem;
+    }}
+    .card h2 {{ font-size: 1rem; margin: 0 0 0.75rem; color: var(--accent); }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 0.9rem; }}
+    th {{ text-align: left; color: var(--muted); font-weight: 500; padding: 0.35rem 0.5rem 0.35rem 0; }}
+    td {{ padding: 0.35rem 0; }}
+    table.metrics td.metric-cell {{ padding: 0.65rem 0; border-bottom: 1px solid var(--border); }}
+    .metric-title {{ font-weight: 600; color: var(--text); margin-bottom: 0.2rem; }}
+    .metric-value {{ font-size: 1.05rem; color: var(--accent); margin-bottom: 0.15rem; }}
+    .metric-sub {{ color: var(--muted); font-size: 0.82rem; margin-bottom: 0.2rem; }}
+    .metric-help {{ color: var(--muted); font-size: 0.78rem; line-height: 1.35; }}
+    .chart-wrap {{ position: relative; height: 320px; margin-bottom: 1rem; }}
+    .empty-state {{ text-align: center; padding: 2.5rem 1.5rem; color: var(--muted); }}
+    .empty-state h2 {{ color: var(--text); margin: 0 0 0.5rem; font-size: 1.1rem; }}
+    .empty-state p {{ margin: 0; }}
+  </style>
+</head>
+<body>
+  <h1>Failover benchmark report</h1>
+  <p class="subtitle">{html.escape(edition)} · thread sweep · select load threads and scenario below</p>
+
+  <div class="toolbar">
+    <span class="toolbar-label">Threads:</span>
+    {thread_buttons}
+  </div>
+  <div class="toolbar">
+    <span class="toolbar-label">Scenario:</span>
+    {scenario_buttons}
+  </div>
+
+  {''.join(panels)}
+
+  <script>
+    const RUNS = {json.dumps(chart_payload)};
+    let activeThreads = {default_threads};
+    let activeScenario = {json.dumps(default_scenario)};
+    let charts = {{}};
+
+    Chart.defaults.color = "#94a3b8";
+    Chart.defaults.borderColor = "#334155";
+
+    function runKey(threads, scenario) {{
+      return threads + ":" + scenario;
+    }}
+
+    function destroyCharts() {{
+      Object.values(charts).forEach(c => c.destroy());
+      charts = {{}};
+    }}
+
+    function triggerAnnotations(DATA) {{
+      return {{
+        annotation: {{
+          annotations: {{
+            trigger: {{
+              type: "line", xMin: DATA.trigger_sec, xMax: DATA.trigger_sec,
+              borderColor: "#f87171", borderWidth: 2, borderDash: [6, 4],
+              label: {{ display: true, content: "failover trigger", color: "#fca5a5", backgroundColor: "rgba(30,41,59,0.8)" }}
+            }},
+            outage: {{
+              type: "box", xMin: DATA.outage_start, xMax: DATA.outage_end,
+              backgroundColor: "rgba(248,113,113,0.08)", borderWidth: 0,
+            }}
+          }}
+        }}
+      }};
+    }}
+
+    function baseScales(yTitle) {{
+      return {{
+        x: {{ title: {{ display: true, text: "Elapsed time (s from sysbench start)" }} }},
+        y: {{ title: {{ display: true, text: yTitle }}, beginAtZero: true }}
+      }};
+    }}
+
+    function renderCharts(threads, scenario) {{
+      const key = runKey(threads, scenario);
+      const DATA = RUNS[key];
+      if (!DATA) return;
+      destroyCharts();
+      const panelId = "panel_t" + threads + "_" + scenario;
+      charts.tps = new Chart(document.getElementById("tpsQps_" + panelId), {{
+        type: "line",
+        data: {{
+          labels: DATA.elapsed,
+          datasets: [
+            {{ label: "TPS", data: DATA.tps, borderColor: "#60a5fa", borderWidth: 1.5, pointRadius: 0, yAxisID: "y" }},
+            {{ label: "QPS", data: DATA.qps, borderColor: "#34d399", borderWidth: 1.2, pointRadius: 0, yAxisID: "y1" }},
+          ]
+        }},
+        options: {{
+          responsive: true, maintainAspectRatio: false, interaction: {{ mode: "index", intersect: false }},
+          plugins: triggerAnnotations(DATA),
+          scales: {{
+            x: {{ title: {{ display: true, text: "Elapsed time (s)" }} }},
+            y: {{ type: "linear", position: "left", title: {{ display: true, text: "TPS" }}, beginAtZero: true }},
+            y1: {{ type: "linear", position: "right", title: {{ display: true, text: "QPS" }}, beginAtZero: true, grid: {{ drawOnChartArea: false }} }}
+          }}
+        }}
+      }});
+      charts.err = new Chart(document.getElementById("errors_" + panelId), {{
+        type: "line",
+        data: {{
+          labels: DATA.elapsed,
+          datasets: [
+            {{ label: "errors/s", data: DATA.err, borderColor: "#f87171", borderWidth: 1.5, pointRadius: 0 }},
+            {{ label: "reconnects/s", data: DATA.reconn, borderColor: "#c084fc", borderWidth: 1.2, pointRadius: 0 }},
+          ]
+        }},
+        options: {{
+          responsive: true, maintainAspectRatio: false, interaction: {{ mode: "index", intersect: false }},
+          plugins: triggerAnnotations(DATA), scales: baseScales("Rate (/s)")
+        }}
+      }});
+      charts.lat = new Chart(document.getElementById("latency_" + panelId), {{
+        type: "line",
+        data: {{
+          labels: DATA.elapsed,
+          datasets: [
+            {{ label: "p95 latency (ms)", data: DATA.lat_p95, borderColor: "#2dd4bf", borderWidth: 1.5, pointRadius: 0 }},
+          ]
+        }},
+        options: {{
+          responsive: true, maintainAspectRatio: false, interaction: {{ mode: "index", intersect: false }},
+          plugins: triggerAnnotations(DATA), scales: baseScales("Latency p95 (ms)")
+        }}
+      }});
+    }}
+
+    function showPanel(threads, scenario) {{
+      document.querySelectorAll(".run-panel").forEach(el => {{
+        const match = String(el.dataset.threads) === String(threads) && el.dataset.scenario === scenario;
+        el.style.display = match ? "" : "none";
+      }});
+      destroyCharts();
+      if (RUNS[runKey(threads, scenario)]) {{
+        renderCharts(threads, scenario);
+      }}
+    }}
+
+    function setActiveButtons(threads, scenario) {{
+      document.querySelectorAll(".toggle-btn[data-threads]").forEach(btn => {{
+        btn.classList.toggle("active", String(btn.dataset.threads) === String(threads));
+      }});
+      document.querySelectorAll(".toggle-btn[data-scenario]").forEach(btn => {{
+        btn.classList.toggle("active", btn.dataset.scenario === scenario);
+      }});
+    }}
+
+    document.querySelectorAll(".toggle-btn[data-threads]").forEach(btn => {{
+      btn.addEventListener("click", () => {{
+        activeThreads = btn.dataset.threads;
+        setActiveButtons(activeThreads, activeScenario);
+        showPanel(activeThreads, activeScenario);
+      }});
+    }});
+
+    document.querySelectorAll(".toggle-btn[data-scenario]").forEach(btn => {{
+      btn.addEventListener("click", () => {{
+        activeScenario = btn.dataset.scenario;
+        setActiveButtons(activeThreads, activeScenario);
+        showPanel(activeThreads, activeScenario);
+      }});
+    }});
+
+    setActiveButtons(activeThreads, activeScenario);
+    showPanel(activeThreads, activeScenario);
+  </script>
+</body>
+</html>
+"""
+    out_path.write_text(page, encoding="utf-8")
+    return out_path
+
+
 def generate_png_for_edition(
     edition_dir: Path,
     rows: list[dict[str, float]],
@@ -777,32 +1369,68 @@ def generate_for_edition(edition_dir: Path, *, png: bool = True, html: bool = Tr
             outputs.extend(png_files)
 
     if html:
-        html_path = generate_html_report(
-            edition_dir, rows, meta, parsed, event, kpi, png_files, extended, primary
-        )
-        outputs.append(html_path)
+        parent_ed = parent_edition_dir(edition_dir)
+        if not (parent_ed and discover_thread_runs(parent_ed)):
+            html_path = generate_html_report(
+                edition_dir, rows, meta, parsed, event, kpi, png_files, extended, primary
+            )
+            outputs.append(html_path)
 
     return outputs
 
 
 def discover_edition_dirs(path: Path) -> tuple[list[Path], Path]:
-    """Find result dirs containing failover_timeseries.csv (edition or edition/scenario)."""
+    """Find result dirs containing failover_timeseries.csv (edition/scenario or edition/tN/scenario)."""
     if (path / "failover_timeseries.csv").exists():
         return [path], path.parent
 
     dirs: list[Path] = []
     if path.is_dir():
         for child in sorted(path.iterdir()):
-            if not child.is_dir():
+            if not child.is_dir() or child.name == "graphs":
                 continue
             if (child / "failover_timeseries.csv").exists():
                 dirs.append(child)
+                continue
+            if THREAD_DIR_RE.match(child.name):
+                for scenario_dir in sorted(child.iterdir()):
+                    if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
+                        dirs.append(scenario_dir)
                 continue
             for scenario_dir in sorted(child.iterdir()):
                 if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
                     dirs.append(scenario_dir)
 
     return dirs, path
+
+
+def maybe_generate_combined_reports(results_root: Path, *, do_html: bool) -> None:
+    if not do_html:
+        return
+    edition_dirs: list[Path]
+    if results_root.name in EDITION_NAMES:
+        edition_dirs = [results_root]
+    else:
+        edition_dirs = sorted(
+            d for d in results_root.iterdir() if d.is_dir() and d.name in EDITION_NAMES
+        )
+    for edition_dir in edition_dirs:
+        thread_runs = discover_thread_runs(edition_dir)
+        if not thread_runs:
+            continue
+        out = generate_combined_thread_html_report(edition_dir, thread_runs)
+        print(f"Wrote {out}")
+        html_content = out.read_text(encoding="utf-8")
+        mirrored: set[Path] = set()
+        for scenarios in thread_runs.values():
+            for scenario_dir in scenarios.values():
+                if scenario_dir in mirrored:
+                    continue
+                mirrored.add(scenario_dir)
+                mirror_out = scenario_dir / "graphs" / "failover_report.html"
+                mirror_out.parent.mkdir(exist_ok=True)
+                mirror_out.write_text(html_content, encoding="utf-8")
+                print(f"Wrote {mirror_out}")
 
 
 def main() -> int:
@@ -829,6 +1457,8 @@ def main() -> int:
     for edition_dir in edition_dirs:
         for out in generate_for_edition(edition_dir, png=do_png, html=do_html):
             print(f"Wrote {out}")
+
+    maybe_generate_combined_reports(results_root, do_html=do_html)
 
     if do_png and len(edition_dirs) >= 2 and _ensure_mpl():
         comp_path = results_root / "graphs" / "failover_tps_comparison.png"
