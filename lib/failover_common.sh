@@ -920,7 +920,7 @@ analyze_failover_metrics() {
   echo "Extended metrics: ${results_dir}/failover_extended_metrics.txt"
 }
 
-# Seven core failover KPIs — phase durations (see benchmark.conf.example).
+# Seven core failover KPIs — absolute seconds from trigger (see benchmark.conf.example).
 write_failover_kpi() {
   local results_dir="${1:?results dir required}"
   local kpi_csv="${results_dir}/failover_kpi.csv"
@@ -1015,6 +1015,11 @@ function load_timeseries(    line, f, sec) {
       pre_qps_sum += qps_arr[sec]
       pre_qps_cnt++
     }
+    if (sec < trigger) {
+      pre_err_sum += err_arr[sec]
+      pre_reconn_sum += reconn_arr[sec]
+      pre_err_cnt++
+    }
   }
   close(tsfile)
   if (pre_tps_cnt > 0) baseline_tps = pre_tps_sum / pre_tps_cnt
@@ -1026,31 +1031,39 @@ function load_timeseries(    line, f, sec) {
   observe_end = trigger + observe_sec
   if (load_end > observe_end) observe_end = load_end
 }
-function detect_failure(    sec, app, db, sysbench_sec) {
-  app = -1
-  db = -1
-  for (sec = trigger; sec <= observe_end; sec++) {
-    if (!(sec in tps_arr)) continue
-    if (app < 0 && (err_arr[sec] > 0 || reconn_arr[sec] > 0 \
-        || (baseline_tps > 0 && tps_arr[sec] < outage_tps) \
-        || (baseline_qps > 0 && qps_arr[sec] < outage_qps)))
-      app = sec - trigger
+function detect_write_probe_ttd(    sysbench_sec, wo) {
+  if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
+  close(monitor)
+  while ((getline line < monitor) > 0) {
+    split(line, f, "\t")
+    if (f[1] == "timestamp_utc") continue
+    sysbench_sec = (f[2] + 0) - monitor_offset
+    if (sysbench_sec < trigger) continue
+    wo = monitor_write_ok(f)
+    if (wo == 0) return sysbench_sec - trigger
   }
-  if (monitor != "" && ( (getline _ < monitor) > 0 )) {
-    close(monitor)
-    while ((getline line < monitor) > 0) {
-      split(line, f, "\t")
-      if (f[1] == "timestamp_utc") continue
-      sysbench_sec = (f[2] + 0) - monitor_offset
-      if (sysbench_sec >= trigger && f[3] != "1" && db < 0)
-        db = sysbench_sec - trigger
-    }
-    close(monitor)
-  }
-  if (app >= 0 && db >= 0) return (app < db ? app : db)
-  if (app >= 0) return app
-  if (db >= 0) return db
+  close(monitor)
   return -1
+}
+function count_write_probe_failures(recovery_rel, election_rel,    sysbench_sec, wo, end_abs, count) {
+  count = 0
+  end_abs = observe_end
+  if (recovery_rel >= 0) end_abs = trigger + recovery_rel
+  if (election_rel >= 0 && trigger + election_rel > end_abs)
+    end_abs = trigger + election_rel
+  if (monitor == "" || ( (getline _ < monitor) <= 0 )) return 0
+  close(monitor)
+  while ((getline line < monitor) > 0) {
+    split(line, f, "\t")
+    if (f[1] == "timestamp_utc") continue
+    sysbench_sec = (f[2] + 0) - monitor_offset
+    if (sysbench_sec < trigger || sysbench_sec > end_abs) continue
+    if (f[3] != "1") continue
+    wo = monitor_write_ok(f)
+    if (wo == 0) count++
+  }
+  close(monitor)
+  return count
 }
 function monitor_gr_state(f) { return f[7] }
 function monitor_gr_role(f) {
@@ -1065,83 +1078,50 @@ function monitor_is_new_format(f) {
   role = monitor_gr_role(f)
   return (role == "PRIMARY" || role == "SECONDARY" || role == "ONLINE" || role == "OFFLINE")
 }
-function is_primary_elected(f, saw_fail, saw_write_fail,    wo, role, ro, gr, host) {
+function is_primary_elected(f,    wo, role, gr, host, changed_host) {
   if (f[3] != "1") return 0
   wo = monitor_write_ok(f)
+  if (wo != 1) return 0
   role = monitor_gr_role(f)
-  ro = f[5] + 0
   gr = monitor_gr_state(f)
   host = f[4]
   changed_host = (primary_before != "N/A" && host != primary_before && host != "ERROR")
-  if (role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY") && changed_host) return 1
-  if (wo == 1 && (saw_write_fail || saw_fail) && (changed_host || edition != "advanced")) return 1
+  if (!changed_host) return 0
   if (edition == "advanced") {
-    if (wo == 1 && saw_write_fail) return 1
-    if (changed_host) return 1
-    return 0
+    return (role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY"))
   }
-  if (wo == 1 && (changed_host || saw_fail)) return 1
-  if (ro == 0 && (gr == "ONLINE" || gr == "PRIMARY") && (changed_host || saw_fail)) return 1
-  return 0
+  return 1
 }
-function detect_primary_election_from_monitor(    saw_fail, saw_write_fail, prev_write_ok, sysbench_sec) {
+function detect_primary_election_from_monitor(    sysbench_sec) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
   close(monitor)
   while ((getline line < monitor) > 0) {
     split(line, f, "\t")
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
-    if (sysbench_sec < trigger) {
-      wo = monitor_write_ok(f)
-      if (wo >= 0) prev_write_ok = wo
-      continue
-    }
-    if (f[3] != "1") {
-      saw_fail = 1
-      continue
-    }
-    wo = monitor_write_ok(f)
-    if (wo == 0) saw_write_fail = 1
-    if (is_primary_elected(f, saw_fail, saw_write_fail))
+    if (sysbench_sec < trigger) continue
+    if (is_primary_elected(f))
       return sysbench_sec - trigger
-    if (wo >= 0) prev_write_ok = wo
   }
   close(monitor)
   return -1
 }
-function detect_primary_election_from_tps(failure_rel,    sec, start) {
-  if (edition != "advanced") return -1
-  start = trigger + (failure_rel >= 0 ? failure_rel : 0)
-  for (sec = start; sec <= observe_end; sec++) {
+function detect_app_recovery_rto(    sec, stable_count, rto) {
+  stable_count = 0
+  rto = -1
+  for (sec = trigger; sec <= observe_end; sec++) {
     if (!(sec in tps_arr)) continue
-    if (baseline_tps > 0 && tps_arr[sec] >= tps_thresh)
-      return sec - trigger
+    if (baseline_tps > 0 && tps_arr[sec] >= tps_thresh) {
+      stable_count++
+      if (stable_count >= stable && rto < 0) {
+        rto = sec - trigger - stable + 2
+        if (rto < 0) rto = 0
+      }
+    } else {
+      stable_count = 0
+    }
   }
-  return -1
-}
-function detect_primary_election(failure_rel,    mon, tps) {
-  mon = detect_primary_election_from_monitor()
-  if (edition != "advanced") return mon
-  tps = detect_primary_election_from_tps(failure_rel)
-  if (mon < 0) return tps
-  if (tps < 0) return mon
-  return (mon < tps ? mon : tps)
-}
-function detect_tps_recovery(start_sec,    sec) {
-  for (sec = start_sec; sec <= observe_end; sec++) {
-    if (!(sec in tps_arr)) continue
-    if (baseline_tps > 0 && tps_arr[sec] >= tps_thresh)
-      return sec - trigger
-  }
-  return -1
-}
-function detect_qps_recovery(start_sec,    sec) {
-  for (sec = start_sec; sec <= observe_end; sec++) {
-    if (!(sec in qps_arr)) continue
-    if (baseline_qps > 0 && qps_arr[sec] >= qps_thresh)
-      return sec - trigger
-  }
-  return -1
+  return rto
 }
 function dip_duration(failure_rel, recovery_rel,    sec, start, end, count) {
   count = 0
@@ -1170,18 +1150,32 @@ function peak_latency(failure_rel, recovery_rel,    sec, start, end, peak) {
   if (sysbench_max_lat != "" && sysbench_max_lat + 0 > 0) return sysbench_max_lat + 0
   return -1
 }
-function errors_in_window(fail_rel, recovery_rel,    sec, start, end, sum, peak) {
+function failover_errors_in_window(fail_rel, recovery_rel,    sec, start, end, sum, peak, excess_err, excess_reconn, baseline_err, baseline_reconn) {
+  baseline_err = 0
+  baseline_reconn = 0
+  if (pre_err_cnt > 0) {
+    baseline_err = pre_err_sum / pre_err_cnt
+    baseline_reconn = pre_reconn_sum / pre_err_cnt
+  }
   sum = 0
   peak = 0
   start = trigger + (fail_rel >= 0 ? fail_rel : 0)
   end = observe_end
   if (recovery_rel >= 0) end = trigger + recovery_rel
   for (sec = start; sec <= end; sec++) {
+    excess_err = 0
+    excess_reconn = 0
     if (sec in err_arr) {
-      sum += err_arr[sec]
-      if (err_arr[sec] > peak) peak = err_arr[sec]
+      excess_err = err_arr[sec] - baseline_err
+      if (excess_err < 0) excess_err = 0
+      sum += excess_err
+      if (excess_err > peak) peak = excess_err
     }
-    if (sec in reconn_arr) sum += reconn_arr[sec]
+    if (sec in reconn_arr) {
+      excess_reconn = reconn_arr[sec] - baseline_reconn
+      if (excess_reconn < 0) excess_reconn = 0
+      sum += excess_reconn
+    }
   }
   peak_err_window = peak
   return int(sum + 0.5)
@@ -1200,6 +1194,7 @@ function fmt_phase_duration(v) {
 }
 function phase_duration(end_rel, start_rel) {
   if (end_rel < 0 || start_rel < 0) return -1
+  if (end_rel < start_rel) return -1
   return end_rel - start_rel
 }
 function fmt_lat(v) {
@@ -1208,34 +1203,20 @@ function fmt_lat(v) {
 }
 END {
   load_timeseries()
-  failure_sec = detect_failure()
-  election_sec = detect_primary_election(failure_sec)
-  recovery_start_sec = trigger
-  if (failure_sec >= 0) recovery_start_sec = trigger + failure_sec
-  if (election_sec >= 0) recovery_start_sec = trigger + election_sec
-  recovery_rel = detect_tps_recovery(recovery_start_sec)
-  if (recovery_rel < 0) recovery_rel = detect_qps_recovery(recovery_start_sec)
-  election_duration = phase_duration(election_sec, failure_sec)
-  recovery_duration = phase_duration(recovery_rel, election_sec)
-  if (recovery_rel >= 0 && election_sec >= 0 && recovery_rel < election_sec)
-    recovery_duration = 0
-  dip_sec = dip_duration(failure_sec, recovery_rel)
-  peak_lat = peak_latency(failure_sec, recovery_rel)
+  failure_sec = detect_write_probe_ttd()
+  election_sec = detect_primary_election_from_monitor()
+  recovery_sec = detect_app_recovery_rto()
+  dip_sec = dip_duration(failure_sec, recovery_sec)
+  peak_lat = peak_latency(failure_sec, recovery_sec)
   peak_err_window = 0
-  tx_failed = errors_in_window(failure_sec, recovery_rel)
+  tx_failed = failover_errors_in_window(failure_sec, recovery_sec)
+  writes_failed = count_write_probe_failures(recovery_sec, election_sec)
 
   print "edition,scenario,trx_profile,failure_detection_sec,primary_election_sec,app_recovery_sec,tps_dip_duration_sec,peak_latency_failover_ms,transactions_failed_during_failover,writes_failed_during_failover,peak_write_err_per_sec,data_loss"
-  if (trx_profile == "write_only") {
-    printf "%s,%s,%s,%s,%s,%s,%d,%s,%d,%d,%.2f,%s\n", \
-      edition, scenario, trx_profile, \
-      fmt_sec(failure_sec), fmt_sec(election_duration), fmt_phase_duration(recovery_duration), \
-      dip_sec, fmt_lat(peak_lat), tx_failed, tx_failed, peak_err_window, tpcc_check
-  } else {
-    printf "%s,%s,%s,%s,%s,%s,%d,%s,%d,-,%.2f,%s\n", \
-      edition, scenario, trx_profile, \
-      fmt_sec(failure_sec), fmt_sec(election_duration), fmt_phase_duration(recovery_duration), \
-      dip_sec, fmt_lat(peak_lat), tx_failed, peak_err_window, tpcc_check
-  }
+  printf "%s,%s,%s,%s,%s,%s,%d,%s,%d,%d,%.2f,%s\n", \
+    edition, scenario, trx_profile, \
+    fmt_sec(failure_sec), fmt_sec(election_sec), fmt_sec(recovery_sec), \
+    dip_sec, fmt_lat(peak_lat), tx_failed, writes_failed, peak_err_window, tpcc_check
 }
 AWK
 
@@ -1359,10 +1340,10 @@ BEGIN {
   failure_detect = -1
   failure_detect_abs = -1
   promote_sec = -1
-  connect_fail = -1
   rto = -1
   load_end_sec = 0
   baseline = 0
+  baseline_qps = 0
   recovery_threshold = 0
   outage_start = 0
   outage_end = 0
@@ -1373,6 +1354,13 @@ BEGIN {
   peak_err_post = 0
   peak_reconn_post = 0
   below_recovery = 0
+  pre_sum = 0
+  pre_cnt = 0
+  pre_qps_sum = 0
+  pre_qps_cnt = 0
+  pre_err_sum = 0
+  pre_reconn_sum = 0
+  pre_err_cnt = 0
   monitor_offset = monitor_offset + 0
   if (parsed_env != "") {
     while ((getline line < parsed_env) > 0) {
@@ -1406,15 +1394,18 @@ function load_timeseries(    f, sec, tps, qps, err, reconn, lat, max_sec) {
     reconn = f[6] + 0
     lat = f[7] + 0
     tps_arr[sec] = tps
+    qps_arr[sec] = qps
     err_arr[sec] = err
     reconn_arr[sec] = reconn
     if (sec > max_sec) max_sec = sec
     if (sec < trigger && tps > 0) { pre_sum += tps; pre_cnt++ }
+    if (sec < trigger && qps > 0) { pre_qps_sum += qps; pre_qps_cnt++ }
+    if (sec < trigger) {
+      pre_err_sum += err
+      pre_reconn_sum += reconn
+      pre_err_cnt++
+    }
     if (sec >= trigger) {
-      if (failure_detect < 0 && (err > 0 || reconn > 0 || (baseline > 0 && tps < baseline * outage_ratio))) {
-        failure_detect = sec - trigger
-        failure_detect_abs = sec
-      }
       if (min_tps_post == 0 || tps < min_tps_post) min_tps_post = tps
       if (min_qps_post == 0 || qps < min_qps_post) min_qps_post = qps
       if (lat > max_lat_post) max_lat_post = lat
@@ -1435,36 +1426,95 @@ function monitor_write_ok(f) {
   if (length(f) >= 10 && f[9] != "" && f[9] != "ERROR") return f[9] + 0
   return -1
 }
-function is_primary_elected(f, saw_fail, saw_write_fail,    wo, role, ro, gr, host) {
+function is_primary_elected(f,    wo, role, gr, host, changed_host) {
   if (f[3] != "1") return 0
   wo = monitor_write_ok(f)
+  if (wo != 1) return 0
   role = monitor_gr_role(f)
-  ro = f[5] + 0
   gr = monitor_gr_state(f)
   host = f[4]
   changed_host = (primary_before != "N/A" && host != primary_before && host != "ERROR")
-  if (role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY") && changed_host) return 1
-  if (wo == 1 && (saw_write_fail || saw_fail) && (changed_host || edition != "advanced")) return 1
+  if (!changed_host) return 0
   if (edition == "advanced") {
-    if (wo == 1 && saw_write_fail) return 1
-    if (changed_host) return 1
-    return 0
+    return (role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY"))
   }
-  if (wo == 1 && (changed_host || saw_fail)) return 1
-  if (ro == 0 && (gr == "ONLINE" || gr == "PRIMARY") && (changed_host || saw_fail)) return 1
-  return 0
+  return 1
 }
-function detect_promote_from_tps(failure_rel,    sec, start) {
-  if (edition != "advanced") return -1
-  start = trigger + (failure_rel >= 0 ? failure_rel : 0)
-  for (sec = start; sec <= load_end_sec; sec++) {
+function compute_rto(    sec, stable_count, computed) {
+  computed = -1
+  stable_count = 0
+  for (sec = trigger; sec <= load_end_sec; sec++) {
     if (!(sec in tps_arr)) continue
-    if (baseline > 0 && tps_arr[sec] >= recovery_threshold)
-      return sec - trigger
+    if (baseline > 0 && tps_arr[sec] >= recovery_threshold) {
+      stable_count++
+      if (stable_count >= stable && computed < 0) {
+        computed = sec - trigger - stable + 2
+        if (computed < 0) computed = 0
+      }
+    } else {
+      stable_count = 0
+    }
   }
+  return computed
+}
+function detect_write_probe_ttd(    sysbench_sec, wo) {
+  if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
+  close(monitor)
+  while ((getline line < monitor) > 0) {
+    split(line, f, "\t")
+    if (f[1] == "timestamp_utc") continue
+    sysbench_sec = (f[2] + 0) - monitor_offset
+    if (sysbench_sec < trigger) continue
+    wo = monitor_write_ok(f)
+    if (wo == 0) return sysbench_sec - trigger
+  }
+  close(monitor)
   return -1
 }
-function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec, saw_fail, saw_write_fail, wo) {
+function count_write_probe_failures(rto_rel, promote_rel,    sysbench_sec, wo, end_abs, count) {
+  count = 0
+  end_abs = load_end_sec
+  if (rto_rel >= 0) end_abs = trigger + rto_rel
+  if (promote_rel >= 0 && trigger + promote_rel > end_abs)
+    end_abs = trigger + promote_rel
+  if (monitor == "" || ( (getline _ < monitor) <= 0 )) return 0
+  close(monitor)
+  while ((getline line < monitor) > 0) {
+    split(line, f, "\t")
+    if (f[1] == "timestamp_utc") continue
+    sysbench_sec = (f[2] + 0) - monitor_offset
+    if (sysbench_sec < trigger || sysbench_sec > end_abs) continue
+    if (f[3] != "1") continue
+    wo = monitor_write_ok(f)
+    if (wo == 0) count++
+  }
+  close(monitor)
+  return count
+}
+function failover_tx_failures(fail_rel, rto_rel,    sec, start, end, sum, baseline_err, baseline_reconn, excess_err, excess_reconn) {
+  baseline_err = 0
+  baseline_reconn = 0
+  if (pre_err_cnt > 0) {
+    baseline_err = pre_err_sum / pre_err_cnt
+    baseline_reconn = pre_reconn_sum / pre_err_cnt
+  }
+  sum = 0
+  start = trigger + (fail_rel >= 0 ? fail_rel : 0)
+  end = load_end_sec
+  if (rto_rel >= 0) end = trigger + rto_rel
+  for (sec = start; sec <= end; sec++) {
+    if (sec in err_arr) {
+      excess_err = err_arr[sec] - baseline_err
+      if (excess_err > 0) sum += excess_err
+    }
+    if (sec in reconn_arr) {
+      excess_reconn = reconn_arr[sec] - baseline_reconn
+      if (excess_reconn > 0) sum += excess_reconn
+    }
+  }
+  return int(sum + 0.5)
+}
+function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return
   close(monitor)
   while ((getline line < monitor) > 0) {
@@ -1475,7 +1525,6 @@ function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec, saw_fail, saw_
     if (f[3] != "1") {
       if (sysbench_sec >= trigger && connect_fail < 0)
         connect_fail = sysbench_sec - trigger
-      if (sysbench_sec >= trigger) saw_fail = 1
       continue
     }
     host = f[4]
@@ -1483,9 +1532,7 @@ function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec, saw_fail, saw_
     gr = monitor_gr_state(f)
     if (primary_before == "N/A" && sysbench_sec < trigger) primary_before = host
     if (sysbench_sec >= trigger) {
-      wo = monitor_write_ok(f)
-      if (wo == 0) saw_write_fail = 1
-      if (promote_sec < 0 && is_primary_elected(f, saw_fail, saw_write_fail))
+      if (promote_sec < 0 && is_primary_elected(f))
         promote_sec = sysbench_sec - trigger
       if (primary_after == "N/A" && host != "ERROR") primary_after = host
     }
@@ -1519,21 +1566,21 @@ function summarize_k8s(    block, in_block) {
 END {
   load_timeseries()
   load_monitor()
-  if (edition == "advanced") {
-    tps_promote = detect_promote_from_tps(failure_detect)
-    if (tps_promote >= 0 && (promote_sec < 0 || tps_promote < promote_sec))
-      promote_sec = tps_promote
-  }
   fatal_count = count_fatal()
-  if (baseline == 0 && pre_cnt > 0) baseline = pre_sum / pre_cnt
-  if (failure_detect < 0 && connect_fail >= 0) {
-    failure_detect = connect_fail
-    failure_detect_abs = trigger + connect_fail
+  if (pre_cnt > 0) {
+    baseline = pre_sum / pre_cnt
+    recovery_threshold = baseline * recovery_pct
   }
-  if (failure_detect < 0 && outage_start >= trigger) {
-    failure_detect = outage_start - trigger
-    failure_detect_abs = outage_start
-  }
+  if (pre_qps_cnt > 0) baseline_qps = pre_qps_sum / pre_qps_cnt
+
+  failure_detect = detect_write_probe_ttd()
+  if (failure_detect >= 0) failure_detect_abs = trigger + failure_detect
+
+  computed_rto = compute_rto()
+  if (computed_rto >= 0) rto = computed_rto
+
+  writes_failed = count_write_probe_failures(rto, promote_sec)
+  tx_failed = failover_tx_failures(failure_detect, rto)
 
   print "=== Failover Extended Metrics ==="
   print "Generated:              " generated_utc
@@ -1547,11 +1594,11 @@ END {
   print ""
   print "--- Timing (seconds from trigger unless noted) ---"
   if (failure_detect >= 0)
-    printf "Time to detect failure:   %.3f s (%.0f ms · sysbench sec %d)\n", failure_detect, failure_detect * 1000, failure_detect_abs
+    printf "Time to detect failure:   %.3f s (%.0f ms · first write_ok=0 on monitor)\n", failure_detect, failure_detect * 1000
   else
     print "Time to detect failure:   NOT_DETECTED"
   if (promote_sec >= 0)
-    printf "Time to promote primary:  %.3f s (%.0f ms · write probe / GR role / TPS recovery)\n", promote_sec, promote_sec * 1000
+    printf "Time to promote primary:  %.3f s (%.0f ms · GR PRIMARY + hostname change + write probe OK)\n", promote_sec, promote_sec * 1000
   else
     print "Time to promote primary:  NOT_DETECTED (monitor off or no promotion signal seen)"
   if (rto >= 0)
@@ -1579,24 +1626,10 @@ END {
   if (peak_err_post > 0) printf "Peak err/s post-trigger:        %.2f\n", peak_err_post
   if (peak_reconn_post > 0) printf "Peak reconn/s post-trigger:     %.2f\n", peak_reconn_post
   if (below_recovery > 0) printf "Seconds below recovery threshold: %d\n", below_recovery
-  if (trx_profile == "write_only") {
-    writes_failed = 0
-    peak_write_err = 0
-    win_start = trigger + (failure_detect >= 0 ? failure_detect : 0)
-    win_end = (rto >= 0 ? trigger + rto : load_end_sec)
-    for (sec = win_start; sec <= win_end; sec++) {
-      if (sec in tps_arr) {
-        e = (sec in err_arr ? err_arr[sec] : 0)
-        rc = (sec in reconn_arr ? reconn_arr[sec] : 0)
-        writes_failed += e + rc
-        if (e > peak_write_err) peak_write_err = e
-      }
-    }
-    print ""
-    print "--- Write-only failover impact ---"
-    printf "Writes failed (failover window): %d (err/s + reconn/s sum)\n", int(writes_failed + 0.5)
-    if (peak_write_err > 0) printf "Peak write err/s:                %.2f\n", peak_write_err
-  }
+  print ""
+  print "--- Failover impact (TTD → RTO) ---"
+  printf "Transactions failed (excess err/reconn over pre-trigger baseline): %d\n", tx_failed
+  printf "Write probe failures (polls with connect_ok=1, write_ok=0):       %d\n", writes_failed
   print ""
   print "--- Load continuity ---"
   printf "Sysbench data ends at sec:      %d (expect ~%d)\n", load_end_sec, trigger + stable
@@ -1708,4 +1741,72 @@ write_failover_comparison() {
   echo "Comparison summary: ${summary}"
   echo "Comparison CSV:     ${combined_csv}"
   echo "KPI CSV:            ${kpi_csv}"
+}
+
+# Recompute KPI / extended metrics from saved timeseries + monitor (no sysbench re-run).
+reanalyze_failover_scenario() {
+  local scenario_dir="${1:?scenario dir required}"
+  local sysbench_log="${scenario_dir}/sysbench_run.log"
+  local timing_file="${scenario_dir}/sysbench_timing.txt"
+  local parsed_file="${scenario_dir}/failover_parsed.env"
+  local timeseries="${scenario_dir}/failover_timeseries.csv"
+
+  if [[ ! -f "${timeseries}" ]]; then
+    echo "SKIP: missing ${timeseries}" >&2
+    return 1
+  fi
+
+  failover_defaults
+
+  if [[ -f "${sysbench_log}" ]]; then
+    local trigger_second
+    trigger_second=$(failover_trigger_second)
+    if [[ -f "${timing_file}" ]]; then
+      # shellcheck disable=SC1090
+      source "${timing_file}" 2>/dev/null || true
+      trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
+    fi
+    _failover_parse_sysbench_intervals "${sysbench_log}" "${trigger_second}" \
+      "${FAILOVER_RECOVERY_THRESHOLD}" "${FAILOVER_RECOVERY_STABLE_SEC}" \
+      "${FAILOVER_OUTAGE_TPS_RATIO}" "${FAILOVER_OBSERVE_SEC}" > "${parsed_file}"
+  fi
+
+  write_failover_kpi "${scenario_dir}"
+  write_failover_extended_metrics "${scenario_dir}"
+  return 0
+}
+
+reanalyze_failover_results() {
+  local results_root="${1:?results root required}"
+  local scenario_dir count=0
+
+  if [[ ! -d "${results_root}" ]]; then
+    echo "ERROR: not a directory: ${results_root}" >&2
+    return 1
+  fi
+
+  failover_defaults
+
+  while IFS= read -r scenario_dir; do
+    echo ""
+    echo "--- Reanalyzing ${scenario_dir} ---"
+    if reanalyze_failover_scenario "${scenario_dir}"; then
+      count=$((count + 1))
+    fi
+  done < <(find "${results_root}" -name failover_timeseries.csv -print | sort | while read -r ts; do dirname "${ts}"; done)
+
+  if [[ "${count}" -eq 0 ]]; then
+    echo "WARNING: no scenario dirs with failover_timeseries.csv under ${results_root}" >&2
+    return 1
+  fi
+
+  echo ""
+  echo "--- Rollup comparison + graphs ---"
+  write_failover_comparison "${results_root}"
+  if [[ -f "${BENCH_ROOT}/scripts/generate_failover_graphs.py" ]]; then
+    python3 "${BENCH_ROOT}/scripts/generate_failover_graphs.py" --html-only "${results_root}"
+  fi
+
+  echo ""
+  echo "Reanalyzed ${count} scenario(s) under ${results_root}"
 }

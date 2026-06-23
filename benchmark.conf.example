@@ -91,9 +91,11 @@ FAILOVER_EDITIONS="standard advanced"
 #   mixed/      — standard TPC-C transaction mix (reads + writes)
 #   write_only/ — 100% new_order/payment; writes_failed_during_failover KPI populated
 # Combined rollup: results/failover_*/failover_kpi.csv and failover_comparison.txt
-#   failure_detection_sec   — trigger → first failure signal (err/reconn/outage)
-#   primary_election_sec    — failure detected → promotion (write probe / GR PRIMARY / TPS recovery on Advanced)
-#   app_recovery_sec        — primary elected → TPS/QPS >= 90% baseline
+#   failure_detection_sec   — trigger → first monitor write_ok=0 (seconds from trigger)
+#   primary_election_sec    — trigger → promotion (GR PRIMARY + hostname change + write_ok=1)
+#   app_recovery_sec        — trigger → RTO (TPS ≥ 90% baseline for 30s stable)
+#   transactions_failed_during_failover — excess err/s + reconn/s over pre-trigger baseline (TTD → RTO)
+#   writes_failed_during_failover — monitor polls with connect_ok=1 and write_ok=0 (trigger → max(RTO, promote))
 #   tps_dip_duration_sec    — seconds with TPS < 90% baseline (failure → recovery)
 #   peak_latency_failover_ms, transactions_failed_during_failover, data_loss
 #

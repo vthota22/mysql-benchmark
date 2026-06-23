@@ -30,13 +30,13 @@ def _ensure_mpl() -> bool:
         return False
 
 KPI_LABELS = {
-    "failure_detection_sec": "Failure detection (s)",
-    "primary_election_sec": "Primary election (s)",
-    "app_recovery_sec": "App recovery (s)",
+    "failure_detection_sec": "Failure detection (s from trigger)",
+    "primary_election_sec": "Primary promotion (s from trigger)",
+    "app_recovery_sec": "Application recovery / RTO (s from trigger)",
     "tps_dip_duration_sec": "TPS dip duration (s)",
     "peak_latency_failover_ms": "Peak latency (ms)",
     "transactions_failed_during_failover": "Failed transactions",
-    "writes_failed_during_failover": "Writes failed (write_only)",
+    "writes_failed_during_failover": "Write probe failures (poll count)",
     "peak_write_err_per_sec": "Peak write err/s",
     "scenario": "Scenario",
     "trx_profile": "TPC-C profile",
@@ -45,30 +45,30 @@ KPI_LABELS = {
 
 METRIC_HELP = {
     "detect": (
-        "Seconds from failover trigger until sysbench or the DB monitor first sees failure "
-        "(errors/reconnects, TPS/QPS below 5% of baseline, or connect_ok=0)."
+        "Seconds from failover trigger until the primary monitor reports write_ok=0 "
+        "(write probe INSERT failed)."
     ),
     "promote": (
-        "Seconds from trigger until a new primary is confirmed (monitor: hostname change, "
-        "GR PRIMARY role, or write probe OK after a failure). KPI phase duration is "
-        "promotion minus detection."
+        "Seconds from trigger until the monitor confirms promotion: new hostname, "
+        "GR PRIMARY role (Advanced), and write_ok=1."
     ),
     "recovery": (
-        "Seconds from primary promotion until TPS stays at or above 90% baseline for 30 consecutive "
-        "seconds (application RTO). KPI app_recovery_sec is the phase after promotion; "
-        "failover_parsed.env RTO_SEC counts from trigger."
+        "Seconds from trigger until TPS stays at or above 90% baseline for 30 consecutive seconds (RTO)."
     ),
     "impact": (
         "Post-trigger throughput and latency from per-second sysbench data. Charts show the full "
         "time series; summary values are min/peak over seconds after the trigger."
     ),
+    "transactions_failed": (
+        "Sum of err/s and reconn/s above the pre-trigger baseline during TTD → RTO — "
+        "isolates failover-related transaction failures from steady-state background errors."
+    ),
+    "writes_failed": (
+        "Count of monitor polls from trigger through max(RTO, promote) where connect_ok=1 and write_ok=0."
+    ),
     "data_loss": (
         "TPC-C consistency check after failover (warehouse/district/order invariants). "
         "PASSED means no detected data loss; SKIPPED if FAILOVER_RUN_TPCC_CHECK=0."
-    ),
-    "writes_failed": (
-        "Sum of ignored SQL errors and reconnects during the failover window (failure through recovery). "
-        "In write_only mode every transaction is new_order or payment, so this approximates failed write attempts."
     ),
 }
 
@@ -289,33 +289,52 @@ def parent_edition_dir(scenario_dir: Path) -> Path | None:
     return None
 
 
+def _planned_from_conf_keys(edition_dir: Path, key: str, default: tuple) -> set:
+    planned: set = set()
+    bench = load_edition_benchmark_config(edition_dir)
+    if bench.get(key, "").strip():
+        if key == "FAILOVER_THREAD_MATRIX":
+            planned.update(
+                int(part)
+                for part in _parse_space_list(bench[key])
+                if part.isdigit()
+            )
+        else:
+            planned.update(_parse_space_list(bench[key]))
+    conf_path = find_benchmark_conf()
+    if conf_path:
+        conf = load_metadata(conf_path)
+        if conf.get(key, "").strip():
+            if key == "FAILOVER_THREAD_MATRIX":
+                planned.update(
+                    int(part)
+                    for part in _parse_space_list(conf[key])
+                    if part.isdigit()
+                )
+            else:
+                planned.update(_parse_space_list(conf[key]))
+    if not planned:
+        planned = set(default)
+    return planned
+
+
 def resolve_thread_matrix(
     edition_dir: Path, thread_runs: dict[int, dict[str, Path]]
 ) -> list[int]:
-    bench = load_edition_benchmark_config(edition_dir)
     discovered = {t for t in thread_runs if t > 0}
-    if bench.get("FAILOVER_THREAD_MATRIX", "").strip():
-        planned = {
-            int(part)
-            for part in _parse_space_list(bench["FAILOVER_THREAD_MATRIX"])
-            if part.isdigit()
-        }
-    else:
-        planned = set(DEFAULT_THREAD_MATRIX)
+    planned = _planned_from_conf_keys(
+        edition_dir, "FAILOVER_THREAD_MATRIX", DEFAULT_THREAD_MATRIX
+    )
     return sorted(planned | discovered)
 
 
 def resolve_scenario_list(
     edition_dir: Path, thread_runs: dict[int, dict[str, Path]]
 ) -> list[str]:
-    bench = load_edition_benchmark_config(edition_dir)
     discovered: set[str] = set()
     for scenarios in thread_runs.values():
         discovered.update(scenarios.keys())
-    if bench.get("FAILOVER_SCENARIOS", "").strip():
-        planned = set(_parse_space_list(bench["FAILOVER_SCENARIOS"]))
-    else:
-        planned = set(DEFAULT_SCENARIOS)
+    planned = _planned_from_conf_keys(edition_dir, "FAILOVER_SCENARIOS", DEFAULT_SCENARIOS)
     return sorted(planned | discovered)
 
 
@@ -641,6 +660,23 @@ def _format_duration_sec(value: str | float | int | None) -> str:
     return f"{sec:.2f} s ({ms:,} ms)"
 
 
+def _parse_metric_sec(value: str | float | int | None) -> float | None:
+    if value is None or value == "" or str(value).upper() in {"N/A", "NOT_DETECTED", "NOT_REACHED"}:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _phase_gap_sec(end: str | float | int | None, start: str | float | int | None) -> str:
+    end_sec = _parse_metric_sec(end)
+    start_sec = _parse_metric_sec(start)
+    if end_sec is None or start_sec is None or end_sec < start_sec:
+        return "N/A"
+    return _format_duration_sec(end_sec - start_sec)
+
+
 def _format_latency_ms(value: str | float | int | None) -> str:
     if value is None or value == "" or str(value).upper() == "N/A":
         return "N/A"
@@ -677,10 +713,8 @@ def _metrics_summary_html(
         return '<p class="muted">No failover_kpi.csv or failover_extended_metrics.txt found.</p>'
 
     detect = kpi.get("failure_detection_sec") or extended.get("failure_detect_sec", "N/A")
-    promote_abs = extended.get("promote_sec", "N/A")
-    promote_phase = kpi.get("primary_election_sec", "N/A")
-    recovery_phase = kpi.get("app_recovery_sec", "N/A")
-    rto = parsed.get("RTO_SEC") or extended.get("rto_sec", "N/A")
+    promote = kpi.get("primary_election_sec") or extended.get("promote_sec", "N/A")
+    recovery = kpi.get("app_recovery_sec") or parsed.get("RTO_SEC") or extended.get("rto_sec", "N/A")
     data_loss = kpi.get("data_loss") or extended.get("tpcc_check", "N/A")
 
     before = primary.get("PRIMARY_BEFORE") or extended.get("primary_before", "N/A")
@@ -713,9 +747,9 @@ def _metrics_summary_html(
     if tps_dip not in {"", "N/A"}:
         impact_parts.append(f"Seconds below 90% baseline (KPI): {tps_dip} s")
     if tx_failed not in {"", "N/A"}:
-        impact_parts.append(f"Error events in failover window (KPI): {tx_failed}")
+        impact_parts.append(f"Transactions failed (excess over baseline, KPI): {tx_failed}")
     if writes_failed not in {"", "N/A", "-"}:
-        impact_parts.append(f"Writes failed (write_only KPI): {writes_failed}")
+        impact_parts.append(f"Write probe failures (poll count, KPI): {writes_failed}")
     if peak_write_err not in {"", "N/A", "-", "0", "0.00"}:
         impact_parts.append(f"Peak write err/s: {peak_write_err}")
     impact_value = (
@@ -732,18 +766,18 @@ def _metrics_summary_html(
         ),
         _metric_row(
             "Time to promote new primary",
-            _format_duration_sec(promote_abs),
+            _format_duration_sec(promote),
             METRIC_HELP["promote"],
             sub=(
-                f"KPI phase (election − detection): {_format_duration_sec(promote_phase)} · "
+                f"Interval after detection: {_phase_gap_sec(promote, detect)} · "
                 f"Primary: {before} → {after} ({changed})"
             ),
         ),
         _metric_row(
             "Time for application recovery",
-            _format_duration_sec(rto),
+            _format_duration_sec(recovery),
             METRIC_HELP["recovery"],
-            sub=f"KPI phase (recovery − promotion): {_format_duration_sec(recovery_phase)}",
+            sub=f"Interval after promotion: {_phase_gap_sec(recovery, promote)}",
         ),
         _metric_row(
             "Impact on TPS / QPS / latency",
@@ -753,13 +787,20 @@ def _metrics_summary_html(
             raw_value=True,
         ),
     ]
-    if trx_profile == "write_only" and writes_failed not in {"", "N/A", "-"}:
+    if tx_failed not in {"", "N/A"}:
         rows.append(
             _metric_row(
-                "Writes failed during failover",
+                "Transactions failed during failover",
+                str(tx_failed),
+                METRIC_HELP["transactions_failed"],
+            )
+        )
+    if writes_failed not in {"", "N/A", "-"}:
+        rows.append(
+            _metric_row(
+                "Write probe failures during failover",
                 str(writes_failed),
                 METRIC_HELP["writes_failed"],
-                sub=f"Peak write err/s: {peak_write_err} · profile={trx_profile}",
             )
         )
     rows.append(
