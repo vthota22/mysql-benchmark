@@ -56,12 +56,62 @@ def load_scale_timing(path: Path) -> dict[str, str]:
     return values
 
 
+def sysbench_offset_sec(timing: dict[str, str]) -> int:
+    """Seconds between RUN_START_EPOCH and sysbench's t=0 (first report is t=1)."""
+    raw = timing.get("SYSBENCH_OFFSET_SEC")
+    return int(raw) if raw else 0
+
+
+def infer_offset_from_benchmark_log(
+    benchmark_log: Path, scale_start_elapsed: int
+) -> int | None:
+    """Derive sysbench offset from interleaved benchmark.log (legacy runs)."""
+    if not benchmark_log.is_file():
+        return None
+
+    last_sysbench_elapsed: int | None = None
+    scale_before_sysbench = False
+    scale_line_re = re.compile(r"^\[.*\] PHASE=SCALE_START elapsed=(\d+)s")
+    for line in benchmark_log.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = INTERVAL_RE.match(line)
+        if match:
+            elapsed = int(match.group(1))
+            if scale_before_sysbench:
+                return scale_start_elapsed - elapsed
+            last_sysbench_elapsed = elapsed
+            continue
+        scale_match = scale_line_re.match(line)
+        if scale_match and int(scale_match.group(1)) == scale_start_elapsed:
+            if last_sysbench_elapsed is not None:
+                return scale_start_elapsed - last_sysbench_elapsed
+            scale_before_sysbench = True
+    return None
+
+
+def resolve_sysbench_offset(
+    timing: dict[str, str], run_log: Path
+) -> int:
+    offset = sysbench_offset_sec(timing)
+    if offset:
+        return offset
+
+    scale_start = timing.get("SCALE_START_ELAPSED")
+    if not scale_start:
+        return 0
+
+    inferred = infer_offset_from_benchmark_log(
+        run_log.parent / "benchmark.log", int(scale_start)
+    )
+    return inferred if inferred is not None else 0
+
+
 def scale_markers(timing: dict[str, str]) -> tuple[int | None, int | None]:
+    offset = sysbench_offset_sec(timing)
     trigger = timing.get("SCALE_START_ELAPSED")
     complete = timing.get("SCALE_COMPLETE_ELAPSED")
     return (
-        int(trigger) if trigger else None,
-        int(complete) if complete else None,
+        int(trigger) - offset if trigger else None,
+        int(complete) - offset if complete else None,
     )
 
 
@@ -111,12 +161,14 @@ def classify_phase(elapsed: int, trigger: int | None, complete: int | None) -> s
     return "post_scaling"
 
 
-def wall_clock_from_elapsed(run_start_epoch: int | None, elapsed_sec: int) -> str:
+def wall_clock_from_elapsed(
+    run_start_epoch: int | None, elapsed_sec: int, sysbench_offset: int = 0
+) -> str:
     if run_start_epoch is None:
         return ""
-    return datetime.fromtimestamp(run_start_epoch + elapsed_sec, tz=UTC).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
+    return datetime.fromtimestamp(
+        run_start_epoch + sysbench_offset + elapsed_sec, tz=UTC
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def parse_intervals(path: Path) -> list[Interval]:
@@ -200,16 +252,26 @@ def main() -> int:
 
     timing = load_scale_timing(args.scale_timing_file)
     run_start = args.run_start_epoch or int(timing["RUN_START_EPOCH"]) if timing.get("RUN_START_EPOCH") else None
-    trigger, complete = scale_markers(timing)
+    offset = resolve_sysbench_offset(timing, args.run_log)
+    timing_for_markers = (
+        {**timing, "SYSBENCH_OFFSET_SEC": str(offset)} if offset else timing
+    )
+    trigger, complete = scale_markers(timing_for_markers)
     intervals = parse_intervals(args.run_log)
     events = build_scale_events(timing)
 
     if not intervals:
         print(f"WARNING: no sysbench interval lines found in {args.run_log}", file=sys.stderr)
+    elif offset == 0 and timing.get("SCALE_START_ELAPSED"):
+        print(
+            "WARNING: SYSBENCH_OFFSET_SEC missing — wall_clock_utc and phase may be "
+            f"~{int(timing['SCALE_START_ELAPSED']) // 10}s early vs scale events",
+            file=sys.stderr,
+        )
 
     for row in intervals:
         row.phase = classify_phase(row.elapsed_sec, trigger, complete)
-        row.wall_clock_utc = wall_clock_from_elapsed(run_start, row.elapsed_sec)
+        row.wall_clock_utc = wall_clock_from_elapsed(run_start, row.elapsed_sec, offset)
 
     write_timeseries_csv(intervals, args.timeseries_csv)
     write_scale_events_csv(events, args.scale_events_csv)
