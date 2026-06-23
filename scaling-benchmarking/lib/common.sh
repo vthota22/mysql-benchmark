@@ -150,8 +150,11 @@ run_tpcc() {
   trx_level="${TPCC_TRX_LEVEL:-RR}"
 
   case "${subcommand}" in
-    prepare|cleanup|check)
-      threads="${TPCC_PREP_THREADS:-${TPCC_THREADS:-16}}"
+    check)
+      threads="${TPCC_CHECK_THREADS:-${TPCC_PREP_THREADS:-16}}"
+      ;;
+    prepare|cleanup)
+      threads="${TPCC_PREP_THREADS:-16}"
       ;;
     *)
       threads="${TPCC_THREADS:-16}"

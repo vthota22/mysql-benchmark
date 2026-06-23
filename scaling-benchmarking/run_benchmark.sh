@@ -38,7 +38,8 @@ export ENGINE MYSQL_HOST MYSQL_PORT MYSQL_USER MYSQL_PASSWORD MYSQL_DB
 export TPCC_TABLES="${TPCC_TABLES:-10}"
 export TPCC_SCALE="${TPCC_SCALE:-10}"
 export TPCC_THREADS="${TPCC_THREADS:-16}"
-export TPCC_PREP_THREADS="${TPCC_PREP_THREADS:-${TPCC_THREADS}}"
+export TPCC_PREP_THREADS="${TPCC_PREP_THREADS:-16}"
+export TPCC_CHECK_THREADS="${TPCC_CHECK_THREADS:-${TPCC_PREP_THREADS}}"
 export TPCC_WARMUP_SEC="${TPCC_WARMUP_SEC:-0}"
 export TPCC_REPORT_INTERVAL="${TPCC_REPORT_INTERVAL:-1}"
 export TPCC_FORCE_PK="${TPCC_FORCE_PK:-1}"
@@ -68,14 +69,14 @@ phase1_init_database() {
     log_phase "1_INIT" "SKIP_PREPARE=1 — ensuring database exists, checking TPC-C tables"
     ensure_database_exists
 
-    if tpcc_tables_ready; then
-      log_phase "1_INIT" "TPC-C tables present — skipping prepare"
-      return 0
+    log_phase "1_INIT" "running sysbench tpcc check (threads=${TPCC_CHECK_THREADS})"
+    if ! run_tpcc check | tee -a "${RUN_LOG}"; then
+      log_phase "1_INIT" "ERROR: TPC-C check failed"
+      return 1
     fi
 
-    log_phase "1_INIT" "ERROR: SKIP_PREPARE=1 but TPC-C tables are missing or invalid"
-    log_phase "1_INIT" "Run once with SKIP_PREPARE=0 to load data, or run: sysbench tpcc prepare"
-    return 1
+    log_phase "1_INIT" "TPC-C tables present — skipping prepare"
+    return 0
   fi
 
   log_phase "1_INIT" "dropping and recreating database '${MYSQL_DB}'"

@@ -16,8 +16,10 @@ MYSQL_DB="sbtest_tpcc"
 TPCC_SCALE=10
 TPCC_TABLES=10
 TPCC_THREADS=16
-# Parallelism for prepare/check/cleanup only; run phase uses TPCC_THREADS above.
+# Parallelism for prepare/cleanup (default 16, independent of TPCC_THREADS).
 TPCC_PREP_THREADS=16
+# Parallelism for tpcc check when SKIP_PREPARE=1 (defaults to TPCC_PREP_THREADS).
+TPCC_CHECK_THREADS=
 TPCC_WARMUP_SEC=30
 TPCC_REPORT_INTERVAL=1
 TPCC_FORCE_PK=1
@@ -29,6 +31,8 @@ TPCC_TRX_LEVEL=RR
 TPCC_IGNORE_ERRORS="1290,1836,1053,2013,2006,2055,2011,3100,1205,1213,1020"
 
 # 1 = skip prepare when TPC-C tables already exist; 0 = drop DB and reload dataset
+# When SKIP_PREPARE=1, phase 1 runs tpcc check with TPCC_CHECK_THREADS (or TPCC_PREP_THREADS);
+# the run phase still uses TPCC_THREADS below.
 SKIP_PREPARE=0
 
 # Total TPC-C run duration (seconds, including warmup). Workload is independent of scaling.
