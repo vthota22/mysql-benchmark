@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Poll @@hostname and @@read_only every second during a failover benchmark.
+# Poll @@hostname on a fixed 1s grid (with connect/op timeouts) during a failover benchmark.
 #
 # Usage:
 #   monitor_mysql_primary.sh <results_dir>

@@ -25,6 +25,9 @@ failover_defaults() {
   : "${FAILOVER_MONITOR_HOSTNAME:=0}"
   : "${FAILOVER_MONITOR_PRIMARY:=1}"
   : "${FAILOVER_MONITOR_WRITE_PROBE:=1}"
+  : "${FAILOVER_MONITOR_INTERVAL:=1}"
+  : "${FAILOVER_MONITOR_CONNECT_TIMEOUT:=1}"
+  : "${FAILOVER_MONITOR_OP_TIMEOUT:=1}"
   : "${FAILOVER_COLLECT_K8S_EVENTS:=1}"
   : "${FAILOVER_RUN_TPCC_CHECK:=0}"
   : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011}"
@@ -208,6 +211,23 @@ mysql_cli() {
     --ssl-mode=REQUIRED "${MYSQL_DB}" 2>/dev/null "$@"
 }
 
+_failover_run_timeout() {
+  local secs="${1:?seconds required}"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${secs}" "$@"
+  else
+    "$@"
+  fi
+}
+
+mysql_cli_timed() {
+  _failover_run_timeout "${FAILOVER_MONITOR_OP_TIMEOUT}" \
+    mysql -h "${MYSQL_HOST}" -P "${MYSQL_PORT}" -u "${MYSQL_USER}" -p"${MYSQL_PASSWORD}" \
+    --ssl-mode=REQUIRED --connect-timeout="${FAILOVER_MONITOR_CONNECT_TIMEOUT}" \
+    "${MYSQL_DB}" 2>/dev/null "$@"
+}
+
 failover_monitor_enabled() {
   [[ "${FAILOVER_MONITOR_PRIMARY:-1}" == "1" || "${FAILOVER_MONITOR_HOSTNAME:-0}" == "1" ]]
 }
@@ -228,13 +248,137 @@ _failover_write_probe_ok() {
     ON DUPLICATE KEY UPDATE heartbeat = NOW(6);" 2>/dev/null
 }
 
+# One mysql session per grid tick: write INSERT (optional) + topology SELECT.
+# Sets monitor_connect_ok, monitor_write_ok, monitor_row, monitor_err.
+_failover_monitor_poll_once() {
+  local tmp_out line
+  lines=()
+
+  monitor_connect_ok=0
+  monitor_write_ok=0
+  monitor_row=""
+  monitor_err="timeout_or_connect_failed"
+
+  tmp_out=$(mktemp "${TMPDIR:-/tmp}/failover_monitor.XXXXXX")
+  if [[ "${FAILOVER_MONITOR_WRITE_PROBE:-1}" == "1" ]]; then
+    mysql_cli_timed -f -N -B > "${tmp_out}" 2>/dev/null <<'SQL' || true
+INSERT INTO failover_write_probe (id, heartbeat) VALUES (1, NOW(6))
+ON DUPLICATE KEY UPDATE heartbeat = NOW(6);
+SELECT ROW_COUNT();
+SELECT @@hostname,
+       @@global.read_only,
+       @@global.super_read_only,
+       IFNULL((
+         SELECT MEMBER_STATE
+           FROM performance_schema.replication_group_members
+          WHERE MEMBER_ID = @@server_uuid
+          LIMIT 1
+       ), 'N/A'),
+       IFNULL((
+         SELECT MEMBER_ROLE
+           FROM performance_schema.replication_group_members
+          WHERE MEMBER_ID = @@server_uuid
+          LIMIT 1
+       ), 'N/A');
+SQL
+  else
+    mysql_cli_timed -N -B > "${tmp_out}" 2>/dev/null <<'SQL' || true
+SELECT @@hostname,
+       @@global.read_only,
+       @@global.super_read_only,
+       IFNULL((
+         SELECT MEMBER_STATE
+           FROM performance_schema.replication_group_members
+          WHERE MEMBER_ID = @@server_uuid
+          LIMIT 1
+       ), 'N/A'),
+       IFNULL((
+         SELECT MEMBER_ROLE
+           FROM performance_schema.replication_group_members
+          WHERE MEMBER_ID = @@server_uuid
+          LIMIT 1
+       ), 'N/A');
+SQL
+  fi
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    lines+=("${line}")
+  done < "${tmp_out}"
+  rm -f "${tmp_out}"
+
+  if [[ "${FAILOVER_MONITOR_WRITE_PROBE:-1}" == "1" ]]; then
+    if ((${#lines[@]} >= 2)) && [[ "${lines[1]}" == *$'\t'* ]]; then
+      monitor_row="${lines[1]}"
+      monitor_connect_ok=1
+      monitor_err=""
+      if [[ "${lines[0]}" =~ ^-?[0-9]+$ ]] && ((lines[0] >= 0)); then
+        monitor_write_ok=1
+      fi
+    elif ((${#lines[@]} >= 1)) && [[ "${lines[0]}" == *$'\t'* ]]; then
+      monitor_row="${lines[0]}"
+      monitor_connect_ok=1
+      monitor_write_ok=0
+      monitor_err=""
+    fi
+  elif ((${#lines[@]} >= 1)) && [[ "${lines[0]}" == *$'\t'* ]]; then
+    monitor_row="${lines[0]}"
+    monitor_connect_ok=1
+    monitor_write_ok=0
+    monitor_err=""
+  fi
+}
+
+_failover_monitor_sleep_until() {
+  local target_epoch="${1:?target epoch required}"
+  python3 -c "
+import time
+target = float('${target_epoch}')
+delay = target - time.time()
+if delay > 0:
+    time.sleep(delay)
+"
+}
+
+_failover_monitor_append_row() {
+  local out_file="${1:?out file required}"
+  local ts="${2:?timestamp required}"
+  local elapsed="${3:?elapsed required}"
+  local connect_ok="${4:?connect ok required}"
+  local row="${5:-}"
+  local write_ok="${6:-0}"
+  local err="${7:-}"
+
+  if [[ "${connect_ok}" == "1" && "${row}" == *$'\t'* && "${row}" != *"ERROR"* ]]; then
+    echo -e "${ts}\t${elapsed}\t1\t${row}\t${write_ok}\t${err}" >> "${out_file}"
+  else
+    err=${err:-${row//$'\t'/ }}
+    err=${err//$'\n'/ }
+    echo -e "${ts}\t${elapsed}\t0\tERROR\tERROR\tERROR\tERROR\tERROR\t${write_ok}\t${err}" >> "${out_file}"
+  fi
+}
+
+_failover_monitor_emit_missed_tick() {
+  local out_file="${1:?out file required}"
+  local start_epoch="${2:?start epoch required}"
+  local tick="${3:?tick required}"
+  local interval="${4:?interval required}"
+  local target_epoch elapsed ts
+
+  target_epoch=$(python3 -c "print(float('${start_epoch}') + int('${tick}') * float('${interval}'))")
+  elapsed=$(python3 -c "print('%.3f' % (float('${target_epoch}') - float('${start_epoch}')))")
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  _failover_monitor_append_row "${out_file}" "${ts}" "${elapsed}" 0 "" 0 "missed_tick"
+}
+
 start_primary_monitor() {
   local results_dir="${1:?results dir required}"
   local edition="${2:-unknown}"
   local pid_file="${results_dir}/primary_monitor.pid"
   local out_file="${results_dir}/primary_monitor.tsv"
   local meta_file="${results_dir}/primary_monitor_meta.txt"
-  local interval="${FAILOVER_MONITOR_INTERVAL:-1}"
+  local interval="${FAILOVER_MONITOR_INTERVAL}"
+  local connect_timeout="${FAILOVER_MONITOR_CONNECT_TIMEOUT}"
+  local op_timeout="${FAILOVER_MONITOR_OP_TIMEOUT}"
   local start_epoch
   start_epoch=$(python3 -c "import time; print('%.3f' % time.time())")
 
@@ -244,48 +388,45 @@ start_primary_monitor() {
     echo "MONITOR_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "MONITOR_START_EPOCH=${start_epoch}"
     echo "MONITOR_INTERVAL_SEC=${interval}"
+    echo "MONITOR_SCHEDULE=fixed_interval"
+    echo "MONITOR_SESSION=single_connection"
+    echo "MONITOR_CONNECT_TIMEOUT_SEC=${connect_timeout}"
+    echo "MONITOR_OP_TIMEOUT_SEC=${op_timeout}"
     echo "MONITOR_EDITION=${edition}"
   } > "${meta_file}"
 
   _failover_ensure_write_probe_table
 
   (
+    local tick=0 target_epoch elapsed ts due_tick
     while true; do
+      due_tick=$(python3 -c "
+import math, time
+start = float('${start_epoch}')
+interval = float('${interval}')
+print(int(math.floor((time.time() - start) / interval)))
+")
+      while (( tick < due_tick )); do
+        _failover_monitor_emit_missed_tick "${out_file}" "${start_epoch}" "${tick}" "${interval}"
+        tick=$((tick + 1))
+      done
+
+      target_epoch=$(python3 -c "print(float('${start_epoch}') + ${tick} * float('${interval}'))")
+      _failover_monitor_sleep_until "${target_epoch}"
+
+      elapsed=$(python3 -c "print('%.3f' % (float('${target_epoch}') - float('${start_epoch}')))")
       ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-      elapsed=$(python3 -c "import time; print('%.3f' % (time.time() - float('${start_epoch}')))")
-      local write_ok=0
-      if _failover_write_probe_ok; then
-        write_ok=1
-      fi
-      row=$(mysql_cli -N -B -e "
-        SELECT @@hostname,
-               @@global.read_only,
-               @@global.super_read_only,
-               IFNULL((
-                 SELECT MEMBER_STATE
-                   FROM performance_schema.replication_group_members
-                  WHERE MEMBER_ID = @@server_uuid
-                  LIMIT 1
-               ), 'N/A'),
-               IFNULL((
-                 SELECT MEMBER_ROLE
-                   FROM performance_schema.replication_group_members
-                  WHERE MEMBER_ID = @@server_uuid
-                  LIMIT 1
-               ), 'N/A');" 2>/dev/null) || row=""
-      if [[ "${row}" == *$'\t'* && "${row}" != *"ERROR"* ]]; then
-        echo -e "${ts}\t${elapsed}\t1\t${row}\t${write_ok}\t" >> "${out_file}"
-      else
-        err=${row//$'\t'/ }
-        err=${err//$'\n'/ }
-        echo -e "${ts}\t${elapsed}\t0\tERROR\tERROR\tERROR\tERROR\tERROR\t${write_ok}\t${err}" >> "${out_file}"
-      fi
-      sleep "${interval}"
+
+      _failover_monitor_poll_once
+      _failover_monitor_append_row "${out_file}" "${ts}" "${elapsed}" \
+        "${monitor_connect_ok}" "${monitor_row}" "${monitor_write_ok}" "${monitor_err}"
+
+      tick=$((tick + 1))
     done
   ) &
 
   echo $! > "${pid_file}"
-  echo "Primary monitor started (pid=$(cat "${pid_file}"), interval=${interval}s)"
+  echo "Primary monitor started (pid=$(cat "${pid_file}"), fixed ${interval}s grid, single mysql session/tick, connect_timeout=${connect_timeout}s, op_timeout=${op_timeout}s)"
 }
 
 stop_primary_monitor() {
@@ -1031,7 +1172,7 @@ function load_timeseries(    line, f, sec) {
   observe_end = trigger + observe_sec
   if (load_end > observe_end) observe_end = load_end
 }
-function detect_write_probe_ttd(    sysbench_sec, wo) {
+function detect_hostname_flip_ttd(    sysbench_sec, host) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
   close(monitor)
   while ((getline line < monitor) > 0) {
@@ -1039,8 +1180,10 @@ function detect_write_probe_ttd(    sysbench_sec, wo) {
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
     if (sysbench_sec < trigger) continue
-    wo = monitor_write_ok(f)
-    if (wo == 0) return sysbench_sec - trigger
+    if (f[3] != "1") continue
+    host = f[4]
+    if (primary_before != "N/A" && host != primary_before && host != "ERROR")
+      return sysbench_sec - trigger
   }
   close(monitor)
   return -1
@@ -1203,7 +1346,7 @@ function fmt_lat(v) {
 }
 END {
   load_timeseries()
-  failure_sec = detect_write_probe_ttd()
+  failure_sec = detect_hostname_flip_ttd()
   election_sec = detect_primary_election_from_monitor()
   recovery_sec = detect_app_recovery_rto()
   dip_sec = dip_duration(failure_sec, recovery_sec)
@@ -1457,7 +1600,7 @@ function compute_rto(    sec, stable_count, computed) {
   }
   return computed
 }
-function detect_write_probe_ttd(    sysbench_sec, wo) {
+function detect_hostname_flip_ttd(    sysbench_sec, host) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
   close(monitor)
   while ((getline line < monitor) > 0) {
@@ -1465,8 +1608,10 @@ function detect_write_probe_ttd(    sysbench_sec, wo) {
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
     if (sysbench_sec < trigger) continue
-    wo = monitor_write_ok(f)
-    if (wo == 0) return sysbench_sec - trigger
+    if (f[3] != "1") continue
+    host = f[4]
+    if (primary_before != "N/A" && host != primary_before && host != "ERROR")
+      return sysbench_sec - trigger
   }
   close(monitor)
   return -1
@@ -1573,7 +1718,7 @@ END {
   }
   if (pre_qps_cnt > 0) baseline_qps = pre_qps_sum / pre_qps_cnt
 
-  failure_detect = detect_write_probe_ttd()
+  failure_detect = detect_hostname_flip_ttd()
   if (failure_detect >= 0) failure_detect_abs = trigger + failure_detect
 
   computed_rto = compute_rto()
@@ -1594,7 +1739,7 @@ END {
   print ""
   print "--- Timing (seconds from trigger unless noted) ---"
   if (failure_detect >= 0)
-    printf "Time to detect failure:   %.3f s (%.0f ms · first write_ok=0 on monitor)\n", failure_detect, failure_detect * 1000
+    printf "Time to detect failure:   %.3f s (%.0f ms · first @@hostname change on monitor)\n", failure_detect, failure_detect * 1000
   else
     print "Time to detect failure:   NOT_DETECTED"
   if (promote_sec >= 0)
@@ -1629,7 +1774,7 @@ END {
   print ""
   print "--- Failover impact (TTD → RTO) ---"
   printf "Transactions failed (excess err/reconn over pre-trigger baseline): %d\n", tx_failed
-  printf "Write probe failures (polls with connect_ok=1, write_ok=0):       %d\n", writes_failed
+  printf "Write probe failures (poll count, connect_ok=1 & write_ok=0; not seconds — see note): %d\n", writes_failed
   print ""
   print "--- Load continuity ---"
   printf "Sysbench data ends at sec:      %d (expect ~%d)\n", load_end_sec, trigger + stable

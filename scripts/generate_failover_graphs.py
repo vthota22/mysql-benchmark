@@ -29,42 +29,19 @@ def _ensure_mpl() -> bool:
     except ImportError:
         return False
 
-KPI_LABELS = {
-    "failure_detection_sec": "Failure detection (s from trigger)",
-    "primary_election_sec": "Primary promotion (s from trigger)",
-    "app_recovery_sec": "Application recovery / RTO (s from trigger)",
-    "tps_dip_duration_sec": "TPS dip duration (s)",
-    "peak_latency_failover_ms": "Peak latency (ms)",
-    "transactions_failed_during_failover": "Failed transactions",
-    "writes_failed_during_failover": "Write probe failures (poll count)",
-    "peak_write_err_per_sec": "Peak write err/s",
-    "scenario": "Scenario",
-    "trx_profile": "TPC-C profile",
-    "data_loss": "Data loss",
-}
 
 METRIC_HELP = {
     "detect": (
-        "Seconds from failover trigger until the primary monitor reports write_ok=0 "
-        "(write probe INSERT failed)."
+        "Seconds from failover trigger until the primary monitor reports a hostname change "
+        "(HAProxy routing to a different pod). Does not require write_ok=0; use "
+        "Time to promote new primary for when the new primary accepts writes."
     ),
     "promote": (
-        "Seconds from trigger until the monitor confirms promotion: new hostname, "
-        "GR PRIMARY role (Advanced), and write_ok=1."
+        "Seconds from trigger until the new primary is fully promoted and accepting writes: "
+        "hostname changed, GR PRIMARY role (Advanced), and write probe INSERT succeeds (write_ok=1)."
     ),
     "recovery": (
         "Seconds from trigger until TPS stays at or above 90% baseline for 30 consecutive seconds (RTO)."
-    ),
-    "impact": (
-        "Post-trigger throughput and latency from per-second sysbench data. Charts show the full "
-        "time series; summary values are min/peak over seconds after the trigger."
-    ),
-    "transactions_failed": (
-        "Sum of err/s and reconn/s above the pre-trigger baseline during TTD → RTO — "
-        "isolates failover-related transaction failures from steady-state background errors."
-    ),
-    "writes_failed": (
-        "Count of monitor polls from trigger through max(RTO, promote) where connect_ok=1 and write_ok=0."
     ),
     "data_loss": (
         "TPC-C consistency check after failover (warehouse/district/order invariants). "
@@ -406,6 +383,100 @@ def _resolve_baseline_metrics(
     return tps, qps, lat
 
 
+def _parse_kpi_sec(value: str | None) -> float | None:
+    if not value or str(value).upper() in {"N/A", "NOT_DETECTED", "NOT_REACHED"}:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _averages_after_failover(
+    rows: list[dict[str, float]],
+    trigger_sec: float,
+    promote_sec: float | None,
+) -> tuple[float, float, float, str]:
+    """Average healthy per-second metrics after promotion (or post-trigger fallback)."""
+    if promote_sec is not None and promote_sec >= 0:
+        start = trigger_sec + promote_sec
+        window_note = f"from promotion ({promote_sec:.2f}s after trigger) through end of run"
+    else:
+        start = trigger_sec + 5.0
+        window_note = "from 5s after trigger through end of run (promote not detected)"
+
+    tps_vals: list[float] = []
+    qps_vals: list[float] = []
+    lat_vals: list[float] = []
+    for row in rows:
+        if row["elapsed_sec"] < start:
+            continue
+        if row["err_per_sec"] > 0 or row["tps"] <= 0:
+            continue
+        tps_vals.append(row["tps"])
+        qps_vals.append(row["qps"])
+        if row["lat_p95_ms"] > 0:
+            lat_vals.append(row["lat_p95_ms"])
+
+    tps = sum(tps_vals) / len(tps_vals) if tps_vals else 0.0
+    qps = sum(qps_vals) / len(qps_vals) if qps_vals else 0.0
+    lat = sum(lat_vals) / len(lat_vals) if lat_vals else 0.0
+    return tps, qps, lat, window_note
+
+
+def _fmt_compare_num(value: float, decimals: int = 2) -> str:
+    if value <= 0:
+        return "N/A"
+    if value == int(value):
+        return str(int(value))
+    return f"{value:.{decimals}f}"
+
+
+def _before_after_throughput_table_html(bundle: dict) -> str:
+    rows = bundle.get("rows", [])
+    trigger = float(bundle.get("trigger", 0))
+    parsed = bundle.get("parsed", {})
+    kpi = bundle.get("kpi", {})
+
+    before_tps, before_qps, before_lat = _resolve_baseline_metrics(parsed, rows, trigger)
+    promote_sec = _parse_kpi_sec(kpi.get("primary_election_sec"))
+    after_tps, after_qps, after_lat, window_note = _averages_after_failover(
+        rows, trigger, promote_sec
+    )
+
+    def row(label: str, before: float, after: float, *, latency: bool = False) -> str:
+        if latency:
+            b = _format_latency_ms(before) if before > 0 else "N/A"
+            a = _format_latency_ms(after) if after > 0 else "N/A"
+        else:
+            b = _fmt_compare_num(before)
+            a = _fmt_compare_num(after)
+        return (
+            f"<tr><th>{html.escape(label)}</th>"
+            f"<td>{html.escape(b)}</td><td>{html.escape(a)}</td></tr>"
+        )
+
+    return f"""
+    <p class="monitor-subhead">After failover: average of healthy seconds {html.escape(window_note)}.</p>
+    <div class="table-scroll">
+      <table class="throughput-compare">
+        <thead>
+          <tr>
+            <th></th>
+            <th>Baseline (before failover)</th>
+            <th>After failover</th>
+          </tr>
+        </thead>
+        <tbody>
+          {row("TPS", before_tps, after_tps)}
+          {row("QPS", before_qps, after_qps)}
+          {row("Latency p95", before_lat, after_lat, latency=True)}
+        </tbody>
+      </table>
+    </div>
+    """
+
+
 def _meta_rows_for_bundle(bundle: dict) -> list[tuple[str, str]]:
     bench = bundle["bench"]
     meta = bundle["meta"]
@@ -444,6 +515,213 @@ def _meta_table_html(meta_rows: list[tuple[str, str]]) -> str:
     return "".join(
         f"<tr><th>{html.escape(k)}</th><td>{html.escape(v)}</td></tr>" for k, v in meta_rows
     )
+
+
+def _monitor_sysbench_offset(scenario_dir: Path) -> float:
+    meta_path = scenario_dir / "primary_monitor_meta.txt"
+    timing_path = scenario_dir / "sysbench_timing.txt"
+    if not meta_path.exists() or not timing_path.exists():
+        return 0.0
+    meta = load_metadata(meta_path)
+    timing = load_metadata(timing_path)
+    try:
+        monitor_start = float(meta.get("MONITOR_START_EPOCH", 0))
+        sysbench_ready = float(timing.get("SYSBENCH_READY_EPOCH", 0))
+        if monitor_start and sysbench_ready:
+            return sysbench_ready - monitor_start
+    except ValueError:
+        pass
+    return 0.0
+
+
+def load_primary_monitor(scenario_dir: Path) -> list[dict[str, str | float]]:
+    path = scenario_dir / "primary_monitor.tsv"
+    if not path.exists():
+        return []
+    offset = _monitor_sysbench_offset(scenario_dir)
+    rows: list[dict[str, str | float]] = []
+    for line in path.read_text().splitlines()[1:]:
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 8:
+            continue
+        elapsed = float(parts[1])
+        rows.append(
+            {
+                "wall": parts[0],
+                "elapsed": elapsed,
+                "sysbench_sec": elapsed - offset,
+                "connect_ok": parts[2],
+                "hostname": parts[3],
+                "gr_state": parts[6] if len(parts) > 6 else "",
+                "gr_role": parts[7] if len(parts) > 7 else "",
+                "write_ok": parts[8] if len(parts) > 8 else "",
+            }
+        )
+    return rows
+
+
+def _short_pod_name(name: str) -> str:
+    for prefix in ("benchmark-failover2-", "benchmark-"):
+        if name.startswith(prefix):
+            return name[len(prefix) :]
+    return name
+
+
+def _wall_hms(wall: str) -> str:
+    if "T" in wall:
+        return wall.split("T", 1)[1].rstrip("Z")
+    return wall
+
+
+def _select_monitor_transition_rows(
+    monitor_rows: list[dict[str, str | float]],
+    trigger: float,
+    primary_before: str,
+    event: dict[str, str],
+) -> list[tuple[dict[str, str | float], str]]:
+    """Curated polls: last pre-trigger, first post-trigger (delete), gap on old primary, promotion."""
+    ordered: list[tuple[dict[str, str | float], str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(row: dict[str, str | float], note: str = "") -> None:
+        key = (str(row["wall"]), str(row["hostname"]))
+        if key in seen:
+            return
+        seen.add(key)
+        ordered.append((row, note))
+
+    pre = [r for r in monitor_rows if float(r["sysbench_sec"]) < trigger]
+    post = [r for r in monitor_rows if float(r["sysbench_sec"]) >= trigger]
+
+    if pre:
+        add(pre[-1])
+
+    delete_row = post[0] if post else None
+    if delete_row:
+        add(delete_row, "← pod deleted")
+
+    promote_row: dict[str, str | float] | None = None
+    for row in post:
+        host = str(row["hostname"])
+        if primary_before and host not in ("ERROR", primary_before, ""):
+            promote_row = row
+            break
+
+    if delete_row and promote_row and primary_before:
+        delete_sb = float(delete_row["sysbench_sec"])
+        promote_sb = float(promote_row["sysbench_sec"])
+        for row in post:
+            sb = float(row["sysbench_sec"])
+            if sb <= delete_sb + 0.05 or sb >= promote_sb - 0.05:
+                continue
+            if str(row["hostname"]) == primary_before:
+                add(row)
+
+    if promote_row:
+        add(promote_row, "← hostname change")
+
+    return ordered
+
+
+def _monitor_trigger_table_html(scenario_dir: Path, bundle: dict) -> str:
+    """HTML table: primary before / at delete / through promotion (per scenario panel)."""
+    monitor_rows = load_primary_monitor(scenario_dir)
+    trigger = float(bundle.get("trigger", 0))
+    primary_before = bundle.get("primary", {}).get("PRIMARY_BEFORE", "")
+    primary_after = bundle.get("primary", {}).get("PRIMARY_AFTER", "")
+    scenario = bundle.get("scenario", "")
+    event = bundle.get("event", {})
+    trigger_utc = event.get("FAILOVER_TRIGGER_UTC") or event.get("FAILOVER_POD_DELETE_UTC", "")
+    target_pod = event.get("FAILOVER_TARGET_POD", primary_before)
+
+    if not monitor_rows:
+        return '<p class="muted">No primary_monitor.tsv for this scenario.</p>'
+
+    if trigger <= 0:
+        return '<p class="muted">Trigger second unknown — cannot align monitor polls.</p>'
+
+    post = [r for r in monitor_rows if float(r["sysbench_sec"]) >= trigger]
+    connect0 = sum(1 for r in post if r["connect_ok"] == "0")
+    write0 = sum(1 for r in post if r["write_ok"] == "0")
+
+    transition = _select_monitor_transition_rows(monitor_rows, trigger, primary_before, event)
+    if not transition:
+        return '<p class="muted">No monitor polls around trigger.</p>'
+
+    trigger_hms = _wall_hms(trigger_utc) if trigger_utc else "N/A"
+    headline = (
+        f'<p class="monitor-headline"><strong>{html.escape(scenario)}</strong> — pod '
+        f"<code>{html.escape(_short_pod_name(target_pod))}</code> deleted at "
+        f'<code>{html.escape(trigger_hms)}</code></p>'
+    )
+    if primary_before:
+        headline += (
+            f'<p class="monitor-subhead">Primary before trigger: '
+            f"<code>{html.escape(_short_pod_name(primary_before))}</code>"
+        )
+        if primary_after and primary_after != primary_before:
+            headline += (
+                f" · after promotion: <code>{html.escape(_short_pod_name(primary_after))}</code>"
+            )
+        headline += (
+            f' · post-trigger <span class="{"cell-bad" if connect0 else ""}">connect_ok=0: {connect0}</span>'
+            f' · <span class="{"cell-bad" if write0 else ""}">write_ok=0: {write0}</span></p>'
+        )
+
+    body_rows: list[str] = []
+    for row, note in transition:
+        sb = float(row["sysbench_sec"])
+        row_classes: list[str] = []
+        if note == "← pod deleted":
+            row_classes.append("row-at-trigger")
+        elif note == "← hostname change":
+            row_classes.append("row-host-change")
+        if row["connect_ok"] == "0" or row["write_ok"] == "0":
+            row_classes.append("row-fail")
+        cls = f' class="{" ".join(row_classes)}"' if row_classes else ""
+
+        connect_cell = html.escape(str(row["connect_ok"]))
+        write_cell = html.escape(str(row["write_ok"]))
+        if row["connect_ok"] == "0":
+            connect_cell = f'<span class="cell-bad">{connect_cell}</span>'
+        if row["write_ok"] == "0":
+            write_cell = f'<span class="cell-bad">{write_cell}</span>'
+
+        role = html.escape(str(row["gr_role"]))
+        if note:
+            role += f' <span class="monitor-note">{html.escape(note)}</span>'
+
+        body_rows.append(
+            f"<tr{cls}>"
+            f"<td>{sb:.1f}</td>"
+            f"<td>{html.escape(_wall_hms(str(row['wall'])))}</td>"
+            f"<td>{connect_cell}</td>"
+            f"<td>{write_cell}</td>"
+            f"<td>{html.escape(_short_pod_name(str(row['hostname'])))}</td>"
+            f"<td>{role}</td>"
+            f"</tr>"
+        )
+
+    return f"""
+    {headline}
+    <div class="table-scroll">
+      <table class="monitor-trigger">
+        <thead>
+          <tr>
+            <th>Sysbench sec</th>
+            <th>Wall time</th>
+            <th>connect</th>
+            <th>write_ok</th>
+            <th>Hostname</th>
+            <th>GR role</th>
+          </tr>
+        </thead>
+        <tbody>{"".join(body_rows)}</tbody>
+      </table>
+    </div>
+    """
 
 
 def load_kpi(path: Path) -> dict[str, str]:
@@ -697,12 +975,16 @@ def _metric_row(title: str, value: str, help_text: str, *, sub: str = "", raw_va
     sub_html = f'<div class="metric-sub">{html.escape(sub)}</div>' if sub else ""
     value_html = value if raw_value else html.escape(value)
     return (
-        f'<tr><td class="metric-cell">'
+        f"<tr>"
+        f'<td class="metric-name-cell">'
         f'<div class="metric-title">{html.escape(title)}</div>'
+        f'<div class="metric-help">{html.escape(help_text)}</div>'
+        f"</td>"
+        f'<td class="metric-value-cell">'
         f'<div class="metric-value">{value_html}</div>'
         f"{sub_html}"
-        f'<div class="metric-help">({html.escape(help_text)})</div>'
-        f"</td></tr>"
+        f"</td>"
+        f"</tr>"
     )
 
 
@@ -723,43 +1005,6 @@ def _metrics_summary_html(
     before = primary.get("PRIMARY_BEFORE") or extended.get("primary_before", "N/A")
     after = primary.get("PRIMARY_AFTER") or extended.get("primary_after", "N/A")
     changed = primary.get("PRIMARY_CHANGED") or extended.get("primary_changed", "N/A")
-
-    min_tps = extended.get("min_tps_post", "N/A")
-    max_drop = extended.get("max_tps_drop_pct", "N/A")
-    min_qps = extended.get("min_qps_post", "N/A")
-    peak_lat = (
-        extended.get("peak_lat_post_ms")
-        or kpi.get("peak_latency_failover_ms")
-        or "N/A"
-    )
-    tps_dip = kpi.get("tps_dip_duration_sec", "N/A")
-    tx_failed = kpi.get("transactions_failed_during_failover", "N/A")
-    writes_failed = kpi.get("writes_failed_during_failover", "N/A")
-    peak_write_err = kpi.get("peak_write_err_per_sec", "N/A")
-    trx_profile = kpi.get("trx_profile", "mixed")
-
-    impact_parts: list[str] = []
-    if min_tps != "N/A":
-        impact_parts.append(f"Min TPS post-trigger: {min_tps}")
-    if max_drop != "N/A":
-        impact_parts.append(f"Max TPS drop: {max_drop}%")
-    if min_qps != "N/A":
-        impact_parts.append(f"Min QPS post-trigger: {min_qps}")
-    if peak_lat != "N/A":
-        impact_parts.append(f"Peak p95 latency: {_format_latency_ms(peak_lat)}")
-    if tps_dip not in {"", "N/A"}:
-        impact_parts.append(f"Seconds below 90% baseline (KPI): {tps_dip} s")
-    if tx_failed not in {"", "N/A"}:
-        impact_parts.append(f"Transactions failed (excess over baseline, KPI): {tx_failed}")
-    if writes_failed not in {"", "N/A", "-"}:
-        impact_parts.append(f"Write probe failures (poll count, KPI): {writes_failed}")
-    if peak_write_err not in {"", "N/A", "-", "0", "0.00"}:
-        impact_parts.append(f"Peak write err/s: {peak_write_err}")
-    impact_value = (
-        "".join(f"<div>{html.escape(part)}</div>" for part in impact_parts)
-        if impact_parts
-        else "N/A"
-    )
 
     rows = [
         _metric_row(
@@ -782,52 +1027,20 @@ def _metrics_summary_html(
             METRIC_HELP["recovery"],
             sub=f"Interval after promotion: {_phase_gap_sec(recovery, promote)}",
         ),
-        _metric_row(
-            "Impact on TPS / QPS / latency",
-            impact_value,
-            METRIC_HELP["impact"],
-            sub="See charts on the right for full per-second series.",
-            raw_value=True,
-        ),
     ]
-    if tx_failed not in {"", "N/A"}:
-        rows.append(
-            _metric_row(
-                "Transactions failed during failover",
-                str(tx_failed),
-                METRIC_HELP["transactions_failed"],
-            )
-        )
-    if writes_failed not in {"", "N/A", "-"}:
-        rows.append(
-            _metric_row(
-                "Write probe failures during failover",
-                str(writes_failed),
-                METRIC_HELP["writes_failed"],
-            )
-        )
     rows.append(
         _metric_row(
             "Data loss (if any)",
-            html.escape(str(data_loss)),
+            str(data_loss),
             METRIC_HELP["data_loss"],
         )
     )
 
-    detail_rows = "".join(
-        f"<tr><th>{html.escape(KPI_LABELS.get(k, k))}</th>"
-        f"<td>{html.escape(str(v))}</td></tr>"
-        for k, v in kpi.items()
-        if k != "edition"
+    return (
+        '<table class="metrics">'
+        "<thead><tr><th>Metric</th><th>Value</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
     )
-    detail_table = (
-        f'<details class="kpi-detail"><summary>Raw KPI CSV fields</summary>'
-        f'<table class="kpi"><tbody>{detail_rows}</tbody></table></details>'
-        if kpi
-        else ""
-    )
-
-    return f'<table class="metrics"><tbody>{"".join(rows)}</tbody></table>{detail_table}'
 
 
 def generate_html_report(
@@ -924,10 +1137,13 @@ def generate_html_report(
     }}
     h1 {{ font-size: 1.5rem; margin: 0 0 0.25rem; }}
     .subtitle {{ color: var(--muted); margin-bottom: 1.5rem; }}
-    .grid {{ display: grid; gap: 1rem; grid-template-columns: 1fr; }}
+    .grid {{ display: grid; gap: 1rem; grid-template-columns: 1fr; align-items: stretch; }}
     @media (min-width: 960px) {{
-      .grid {{ grid-template-columns: 320px 1fr; }}
+      .grid {{ grid-template-columns: 360px 1fr; }}
     }}
+    .sidebar {{ display: flex; flex-direction: column; gap: 1rem; min-height: 100%; }}
+    .card.sidebar-meta {{ flex: 1; }}
+    .main-column {{ display: flex; flex-direction: column; gap: 1.25rem; }}
     .card {{
       background: var(--card); border: 1px solid var(--border);
       border-radius: 8px; padding: 1rem 1.25rem;
@@ -936,20 +1152,48 @@ def generate_html_report(
     table {{ width: 100%; border-collapse: collapse; font-size: 0.9rem; }}
     th {{ text-align: left; color: var(--muted); font-weight: 500; padding: 0.35rem 0.5rem 0.35rem 0; }}
     td {{ padding: 0.35rem 0; }}
-    table.kpi th {{ width: 55%; }}
     table.metrics {{ font-size: 0.9rem; }}
-    table.metrics td.metric-cell {{ padding: 0.65rem 0; border-bottom: 1px solid var(--border); }}
-    table.metrics tr:last-child td.metric-cell {{ border-bottom: none; }}
-    .metric-title {{ font-weight: 600; color: var(--text); margin-bottom: 0.2rem; }}
-    .metric-value {{ font-size: 1.05rem; color: var(--accent); margin-bottom: 0.15rem; }}
+    table.metrics thead th {{
+      color: var(--muted); font-weight: 500; padding: 0.35rem 0.65rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+    }}
+    table.metrics tbody td {{
+      padding: 0.65rem 0.65rem 0.65rem 0; border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }}
+    table.metrics tbody tr:last-child td {{ border-bottom: none; }}
+    table.metrics td.metric-name-cell {{ width: 55%; padding-right: 1rem; }}
+    table.metrics td.metric-value-cell {{ font-variant-numeric: tabular-nums; }}
+    .metric-title {{ font-weight: 600; color: var(--accent); margin-bottom: 0.25rem; }}
+    .metric-value {{ font-size: 1.05rem; color: var(--text); margin-bottom: 0.15rem; }}
     .metric-sub {{ color: var(--muted); font-size: 0.82rem; margin-bottom: 0.2rem; }}
     .metric-help {{ color: var(--muted); font-size: 0.78rem; line-height: 1.35; }}
-    .kpi-detail {{ margin-top: 0.75rem; color: var(--muted); font-size: 0.85rem; }}
-    .kpi-detail summary {{ cursor: pointer; color: var(--accent); }}
     .chart-wrap {{ position: relative; height: 320px; margin-bottom: 1rem; }}
     .muted {{ color: var(--muted); font-size: 0.9rem; }}
     ul {{ margin: 0.25rem 0 0; padding-left: 1.25rem; }}
     a {{ color: var(--accent); }}
+    .monitor-summary {{ font-size: 0.88rem; margin: 0 0 0.35rem; }}
+    .monitor-headline {{ font-size: 0.92rem; margin: 0 0 0.35rem; }}
+    .monitor-subhead {{ color: var(--muted); font-size: 0.82rem; margin: 0 0 0.75rem; }}
+    table.monitor-trigger {{ width: 100%; border-collapse: collapse; font-size: 0.8rem; min-width: 520px; }}
+    table.monitor-trigger th, table.monitor-trigger td {{
+      padding: 0.35rem 0.5rem; text-align: left; border-bottom: 1px solid var(--border);
+    }}
+    table.monitor-trigger th {{ color: var(--muted); font-weight: 500; white-space: nowrap; }}
+    table.monitor-trigger td {{ font-variant-numeric: tabular-nums; }}
+    table.monitor-trigger tr.row-at-trigger {{ background: rgba(248, 113, 113, 0.12); }}
+    table.monitor-trigger tr.row-host-change {{ background: rgba(56, 189, 248, 0.10); }}
+    table.monitor-trigger tr.row-fail {{ background: rgba(248, 113, 113, 0.18); }}
+    .cell-bad {{ color: #f87171; font-weight: 600; }}
+    .monitor-note {{ color: var(--accent); font-size: 0.78rem; }}
+    table.throughput-compare {{ width: 100%; border-collapse: collapse; font-size: 0.88rem; }}
+    table.throughput-compare th, table.throughput-compare td {{
+      padding: 0.5rem 0.65rem; text-align: left; border-bottom: 1px solid var(--border);
+    }}
+    table.throughput-compare thead th {{ color: var(--muted); font-weight: 500; }}
+    table.throughput-compare tbody th {{ color: var(--text); font-weight: 500; width: 28%; }}
+    table.throughput-compare td {{ font-variant-numeric: tabular-nums; }}
+    .table-scroll {{ overflow-x: auto; }}
   </style>
 </head>
 <body>
@@ -957,29 +1201,37 @@ def generate_html_report(
   <p class="subtitle">{html.escape(edition)} · {html.escape(scenario)} ({html.escape(trx_profile)}) · {html.escape(edition_dir.name)}</p>
 
   <div class="grid">
-    <div>
-      <div class="card">
+    <div class="sidebar">
+      <div class="card sidebar-meta">
         <h2>Run metadata</h2>
         <table><tbody>{meta_html}</tbody></table>
       </div>
-      <div class="card" style="margin-top:1rem">
-        <h2>Failover metrics</h2>
-        {_metrics_summary_html(kpi, extended, primary, parsed)}
-      </div>
-      {"<div class=\"card\" style=\"margin-top:1rem\"><h2>PNG exports</h2><ul>" + png_links + "</ul></div>" if png_links else ""}
+      {"<div class=\"card\"><h2>PNG exports</h2><ul>" + png_links + "</ul></div>" if png_links else ""}
     </div>
-    <div>
+    <div class="main-column">
       <div class="card">
         <h2>TPS &amp; QPS</h2>
         <div class="chart-wrap"><canvas id="tpsQpsChart"></canvas></div>
       </div>
       <div class="card">
-        <h2>Errors &amp; reconnects</h2>
-        <div class="chart-wrap"><canvas id="errorsChart"></canvas></div>
-      </div>
-      <div class="card">
         <h2>Latency p95 (ms)</h2>
         <div class="chart-wrap"><canvas id="latencyChart"></canvas></div>
+      </div>
+      <div class="card">
+        <h2>Primary transition at trigger</h2>
+        {_monitor_trigger_table_html(edition_dir, {"trigger": trigger, "primary": primary, "event": event, "scenario": scenario})}
+      </div>
+      <div class="card">
+        <h2>Metrics before vs after failover</h2>
+        {_before_after_throughput_table_html({"rows": rows, "trigger": trigger, "parsed": parsed, "kpi": kpi})}
+      </div>
+      <div class="card">
+        <h2>Failover metrics</h2>
+        {_metrics_summary_html(kpi, extended, primary, parsed)}
+      </div>
+      <div class="card">
+        <h2>Errors &amp; reconnects</h2>
+        <div class="chart-wrap"><canvas id="errorsChart"></canvas></div>
       </div>
     </div>
   </div>
@@ -1103,20 +1355,24 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
                 metrics_html = _metrics_summary_html(
                     bundle["kpi"], bundle["extended"], bundle["primary"], bundle["parsed"]
                 )
+                monitor_html = _monitor_trigger_table_html(Path(bundle["dir"]), bundle)
+                compare_html = _before_after_throughput_table_html(bundle)
                 chart_payload[key] = bundle["chart_data"]
                 panels.append(
                     f'<div class="run-panel" id="{panel_id}" data-threads="{threads}" '
                     f'data-scenario="{html.escape(scenario)}"{hidden}>'
-                    f'<div class="grid"><div>'
-                    f'<div class="card"><h2>Run metadata</h2><table><tbody>{meta_html}</tbody></table></div>'
-                    f'<div class="card" style="margin-top:1rem"><h2>Failover metrics</h2>{metrics_html}</div>'
-                    f"</div><div>"
+                    f'<div class="grid"><div class="sidebar">'
+                    f'<div class="card sidebar-meta"><h2>Run metadata</h2><table><tbody>{meta_html}</tbody></table></div>'
+                    f"</div><div class=\"main-column\">"
                     f'<div class="card"><h2>TPS &amp; QPS</h2><div class="chart-wrap">'
                     f'<canvas id="tpsQps_{panel_id}"></canvas></div></div>'
-                    f'<div class="card"><h2>Errors &amp; reconnects</h2><div class="chart-wrap">'
-                    f'<canvas id="errors_{panel_id}"></canvas></div></div>'
                     f'<div class="card"><h2>Latency p95 (ms)</h2><div class="chart-wrap">'
                     f'<canvas id="latency_{panel_id}"></canvas></div></div>'
+                    f'<div class="card"><h2>Primary transition at trigger</h2>{monitor_html}</div>'
+                    f'<div class="card"><h2>Metrics before vs after failover</h2>{compare_html}</div>'
+                    f'<div class="card"><h2>Failover metrics</h2>{metrics_html}</div>'
+                    f'<div class="card"><h2>Errors &amp; reconnects</h2><div class="chart-wrap">'
+                    f'<canvas id="errors_{panel_id}"></canvas></div></div>'
                     f"</div></div></div>"
                 )
             else:
@@ -1173,8 +1429,11 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
     }}
     .toggle-btn:hover {{ border-color: var(--accent); }}
     .toggle-btn.active {{ background: var(--accent); color: #0f172a; border-color: var(--accent); font-weight: 600; }}
-    .grid {{ display: grid; gap: 1rem; grid-template-columns: 1fr; }}
-    @media (min-width: 960px) {{ .grid {{ grid-template-columns: 320px 1fr; }} }}
+    .grid {{ display: grid; gap: 1rem; grid-template-columns: 1fr; align-items: stretch; }}
+    @media (min-width: 960px) {{ .grid {{ grid-template-columns: 360px 1fr; }} }}
+    .sidebar {{ display: flex; flex-direction: column; gap: 1rem; min-height: 100%; }}
+    .card.sidebar-meta {{ flex: 1; }}
+    .main-column {{ display: flex; flex-direction: column; gap: 1.25rem; }}
     .card {{
       background: var(--card); border: 1px solid var(--border);
       border-radius: 8px; padding: 1rem 1.25rem;
@@ -1183,15 +1442,47 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
     table {{ width: 100%; border-collapse: collapse; font-size: 0.9rem; }}
     th {{ text-align: left; color: var(--muted); font-weight: 500; padding: 0.35rem 0.5rem 0.35rem 0; }}
     td {{ padding: 0.35rem 0; }}
-    table.metrics td.metric-cell {{ padding: 0.65rem 0; border-bottom: 1px solid var(--border); }}
-    .metric-title {{ font-weight: 600; color: var(--text); margin-bottom: 0.2rem; }}
-    .metric-value {{ font-size: 1.05rem; color: var(--accent); margin-bottom: 0.15rem; }}
+    table.metrics {{ font-size: 0.9rem; }}
+    table.metrics thead th {{
+      color: var(--muted); font-weight: 500; padding: 0.35rem 0.65rem 0.5rem 0;
+      border-bottom: 1px solid var(--border);
+    }}
+    table.metrics tbody td {{
+      padding: 0.65rem 0.65rem 0.65rem 0; border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }}
+    table.metrics tbody tr:last-child td {{ border-bottom: none; }}
+    table.metrics td.metric-name-cell {{ width: 55%; padding-right: 1rem; }}
+    table.metrics td.metric-value-cell {{ font-variant-numeric: tabular-nums; }}
+    .metric-title {{ font-weight: 600; color: var(--accent); margin-bottom: 0.25rem; }}
+    .metric-value {{ font-size: 1.05rem; color: var(--text); margin-bottom: 0.15rem; }}
     .metric-sub {{ color: var(--muted); font-size: 0.82rem; margin-bottom: 0.2rem; }}
     .metric-help {{ color: var(--muted); font-size: 0.78rem; line-height: 1.35; }}
     .chart-wrap {{ position: relative; height: 320px; margin-bottom: 1rem; }}
     .empty-state {{ text-align: center; padding: 2.5rem 1.5rem; color: var(--muted); }}
     .empty-state h2 {{ color: var(--text); margin: 0 0 0.5rem; font-size: 1.1rem; }}
     .empty-state p {{ margin: 0; }}
+    .monitor-headline {{ font-size: 0.92rem; margin: 0 0 0.35rem; }}
+    .monitor-subhead {{ color: var(--muted); font-size: 0.82rem; margin: 0 0 0.75rem; }}
+    table.monitor-trigger {{ width: 100%; border-collapse: collapse; font-size: 0.8rem; min-width: 520px; }}
+    table.monitor-trigger th, table.monitor-trigger td {{
+      padding: 0.35rem 0.5rem; text-align: left; border-bottom: 1px solid var(--border);
+    }}
+    table.monitor-trigger th {{ color: var(--muted); font-weight: 500; white-space: nowrap; }}
+    table.monitor-trigger td {{ font-variant-numeric: tabular-nums; }}
+    table.monitor-trigger tr.row-at-trigger {{ background: rgba(248, 113, 113, 0.12); }}
+    table.monitor-trigger tr.row-host-change {{ background: rgba(56, 189, 248, 0.10); }}
+    table.monitor-trigger tr.row-fail {{ background: rgba(248, 113, 113, 0.18); }}
+    .cell-bad {{ color: #f87171; font-weight: 600; }}
+    .monitor-note {{ color: var(--accent); font-size: 0.78rem; }}
+    table.throughput-compare {{ width: 100%; border-collapse: collapse; font-size: 0.88rem; }}
+    table.throughput-compare th, table.throughput-compare td {{
+      padding: 0.5rem 0.65rem; text-align: left; border-bottom: 1px solid var(--border);
+    }}
+    table.throughput-compare thead th {{ color: var(--muted); font-weight: 500; }}
+    table.throughput-compare tbody th {{ color: var(--text); font-weight: 500; width: 28%; }}
+    table.throughput-compare td {{ font-variant-numeric: tabular-nums; }}
+    .table-scroll {{ overflow-x: auto; }}
   </style>
 </head>
 <body>
