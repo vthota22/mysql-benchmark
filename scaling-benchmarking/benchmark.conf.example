@@ -38,7 +38,11 @@ SKIP_PREPARE=0
 # Total TPC-C run duration (seconds, including warmup). Workload is independent of scaling.
 TPCC_MAX_TIME=3600
 
+# 1 = run TPC-C only (no cluster resize, no DO API auth); 0 = trigger scaling mid-run
+SKIP_SCALING=0
+
 # --- Scaling trigger ---
+# Ignored when SKIP_SCALING=1 (CLUSTER_ID, SCALE_TARGET_SIZE, DO_API_TOKEN not required).
 # Seconds after TPC-C run starts (including warmup) before cluster resize fires.
 SCALE_TRIGGER_DELAY=180
 

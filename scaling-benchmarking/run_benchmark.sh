@@ -178,7 +178,11 @@ phase2_run_with_scaling() {
   export TPCC_MAX_TIME="${tpcc_max_time}"
 
   log_phase "2_RUN" "starting TPC-C (threads=${TPCC_THREADS} duration=${tpcc_max_time}s)"
-  log_phase "2_RUN" "scale trigger at +${SCALE_TRIGGER_DELAY}s — timing in ${SCALE_TIMING_FILE}"
+  if scaling_enabled; then
+    log_phase "2_RUN" "scale trigger at +${SCALE_TRIGGER_DELAY}s — timing in ${SCALE_TIMING_FILE}"
+  else
+    log_phase "2_RUN" "SKIP_SCALING=1 — no cluster resize (timing in ${SCALE_TIMING_FILE})"
+  fi
 
   : > "${RUN_LOG}"
   : > "${SCALE_TIMING_FILE}"
@@ -193,8 +197,14 @@ phase2_run_with_scaling() {
     echo "RUN_START_EPOCH=${run_start_epoch}"
   } >> "${SCALE_TIMING_FILE}"
 
-  run_scale_workflow "${run_start_epoch}" &
-  local scale_pid=$!
+  local scale_pid=""
+  if scaling_enabled; then
+    run_scale_workflow "${run_start_epoch}" &
+    scale_pid=$!
+  else
+    echo "SKIP_SCALING=1" >> "${SCALE_TIMING_FILE}"
+    log_phase "SCALE_SKIP" "scaling disabled via SKIP_SCALING=1" | tee -a "${SCALE_LOG}"
+  fi
 
   local tpcc_rc=0
   local sysbench_offset_recorded=0
@@ -223,7 +233,9 @@ phase2_run_with_scaling() {
     log_phase "2_RUN" "sysbench completed successfully"
   fi
 
-  wait "${scale_pid}" || true
+  if [[ -n "${scale_pid}" ]]; then
+    wait "${scale_pid}" || true
+  fi
 
   if [[ "${tpcc_rc}" -ne 0 ]]; then
     return "${tpcc_rc}"
@@ -265,7 +277,11 @@ main() {
   unset phase1 phase2 phase3 phase4 2>/dev/null || true
 
   phase1_init_database
-  do_api_auth_check
+  if scaling_enabled; then
+    do_api_auth_check
+  else
+    log_phase "0_DO_API" "SKIP_SCALING=1 — skipping DO API auth"
+  fi
   phase2_run_with_scaling
   phase3_finalize_logs
   phase4_parse_metrics
@@ -279,6 +295,11 @@ echo "Engine:   ${ENGINE}"
 echo "Run dir:  ${RUN_DIR}"
 echo "Sysbench: $("${BENCH_ROOT}/which_sysbench.sh")"
 echo "Host:     ${MYSQL_HOST}:${MYSQL_PORT}/${MYSQL_DB}"
+if scaling_enabled; then
+  echo "Scaling:  trigger at +${SCALE_TRIGGER_DELAY}s -> ${SCALE_TARGET_SIZE}"
+else
+  echo "Scaling:  disabled (SKIP_SCALING=1)"
+fi
 echo ""
 
 main "$@"

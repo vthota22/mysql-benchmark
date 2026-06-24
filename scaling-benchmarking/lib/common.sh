@@ -57,6 +57,10 @@ load_config() {
   source "${config_file}"
 }
 
+scaling_enabled() {
+  [[ "${SKIP_SCALING:-0}" != "1" ]]
+}
+
 require_config() {
   : "${ENGINE:?Set ENGINE in benchmark.conf (standard or advanced)}"
   case "${ENGINE}" in
@@ -71,6 +75,11 @@ require_config() {
   : "${MYSQL_USER:?Set MYSQL_USER in benchmark.conf}"
   : "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in benchmark.conf}"
   : "${MYSQL_DB:?Set MYSQL_DB in benchmark.conf}"
+
+  if ! scaling_enabled; then
+    return 0
+  fi
+
   : "${SCALE_TRIGGER_DELAY:?Set SCALE_TRIGGER_DELAY in benchmark.conf}"
   : "${CLUSTER_ID:?Set CLUSTER_ID in benchmark.conf}"
   : "${SCALE_TARGET_SIZE:?Set SCALE_TARGET_SIZE in benchmark.conf}"
