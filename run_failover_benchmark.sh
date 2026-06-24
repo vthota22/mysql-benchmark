@@ -90,16 +90,35 @@ run_failover_scenario() {
     return 1
   fi
 
+  if [[ "${edition}" == "advanced" ]] && failover_pod_delete_enabled && failover_trigger_enabled; then
+    : > "${scenario_dir}/failover_trigger.log"
+    echo "--- Preparing failover trigger (kubeconfig, kubectl, primary pod) ---"
+    BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${scenario_dir}" prepare \
+      2>&1 | tee -a "${scenario_dir}/failover_trigger.log"
+  fi
+
   echo "--- Baseline load period, then failover trigger ---"
-  sleep_until_failover_trigger
+  if [[ "${edition}" == "advanced" ]] && failover_pod_delete_enabled && failover_trigger_enabled; then
+    sleep_until_failover_trigger_early
+  else
+    sleep_until_failover_trigger
+  fi
 
   if failover_trigger_enabled; then
     echo "--- Triggering failover (${scenario}) ---"
   else
     echo "--- Failover trigger skipped (FAILOVER_TRIGGER_ENABLED=0) — recording trigger time only ---"
   fi
-  BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${scenario_dir}" \
-    2>&1 | tee "${scenario_dir}/failover_trigger.log"
+  if [[ "${edition}" == "advanced" ]] && failover_pod_delete_enabled && failover_trigger_enabled; then
+    BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${scenario_dir}" refresh \
+      2>&1 | tee -a "${scenario_dir}/failover_trigger.log"
+    sleep_until_failover_trigger_final_gap
+    BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${scenario_dir}" fire \
+      2>&1 | tee -a "${scenario_dir}/failover_trigger.log"
+  else
+    BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${scenario_dir}" \
+      2>&1 | tee -a "${scenario_dir}/failover_trigger.log"
+  fi
 
   echo "--- Observing recovery for ${FAILOVER_OBSERVE_SEC}s ---"
   sleep "${FAILOVER_OBSERVE_SEC}"

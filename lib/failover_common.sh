@@ -35,6 +35,8 @@ failover_defaults() {
   : "${FAILOVER_POD_DELETE:=${FAILOVER_TRIGGER_ENABLED}}"
   : "${FAILOVER_POD_DELETE_FORCE:=1}"
   : "${FAILOVER_POD_DELETE_GRACE_SEC:=0}"
+  # Advanced: fetch kubeconfig early; re-resolve primary pod this many seconds before delete
+  : "${FAILOVER_TRIGGER_PREPARE_SEC:=5}"
   : "${FAILOVER_SCENARIOS:=mixed write_only}"
   : "${FAILOVER_SCENARIO_DELAY_SEC:=120}"
   # Space-separated load thread counts; when set, runs each under edition/t<N>/<scenario>/
@@ -669,6 +671,25 @@ sleep_until_failover_trigger() {
   sleep "${delay}"
 }
 
+# Sleep until FAILOVER_TRIGGER_PREPARE_SEC before trigger second (kubeconfig already prepared).
+sleep_until_failover_trigger_early() {
+  failover_defaults
+  local delay="${FAILOVER_TRIGGER_DELAY_SEC:-$(failover_trigger_second)}"
+  local prep_sec="${FAILOVER_TRIGGER_PREPARE_SEC:-5}"
+  local early=$((delay - prep_sec))
+  (( early < 0 )) && early=0
+  echo "Waiting ${early}s until final primary resolution (${prep_sec}s before pod delete at second ${delay})..."
+  sleep "${early}"
+}
+
+# Short final wait after refresh; delete runs immediately when this returns.
+sleep_until_failover_trigger_final_gap() {
+  failover_defaults
+  local prep_sec="${FAILOVER_TRIGGER_PREPARE_SEC:-5}"
+  echo "Final ${prep_sec}s before instant pod delete (trigger second)..."
+  sleep "${prep_sec}"
+}
+
 analyze_primary_change() {
   local monitor_file="${1:?monitor tsv required}"
   local trigger_utc="${2:-}"
@@ -1172,7 +1193,7 @@ function load_timeseries(    line, f, sec) {
   observe_end = trigger + observe_sec
   if (load_end > observe_end) observe_end = load_end
 }
-function detect_hostname_flip_ttd(    sysbench_sec, host) {
+function detect_write_failure_ttd(    sysbench_sec, wo) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
   close(monitor)
   while ((getline line < monitor) > 0) {
@@ -1180,10 +1201,8 @@ function detect_hostname_flip_ttd(    sysbench_sec, host) {
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
     if (sysbench_sec < trigger) continue
-    if (f[3] != "1") continue
-    host = f[4]
-    if (primary_before != "N/A" && host != primary_before && host != "ERROR")
-      return sysbench_sec - trigger
+    wo = monitor_write_ok(f)
+    if (wo == 0) return sysbench_sec - trigger
   }
   close(monitor)
   return -1
@@ -1221,28 +1240,31 @@ function monitor_is_new_format(f) {
   role = monitor_gr_role(f)
   return (role == "PRIMARY" || role == "SECONDARY" || role == "ONLINE" || role == "OFFLINE")
 }
-function is_primary_elected(f,    wo, role, gr, host, changed_host) {
+function is_primary_elected(f,    wo, role, gr) {
   if (f[3] != "1") return 0
   wo = monitor_write_ok(f)
   if (wo != 1) return 0
   role = monitor_gr_role(f)
   gr = monitor_gr_state(f)
-  host = f[4]
-  changed_host = (primary_before != "N/A" && host != primary_before && host != "ERROR")
-  if (!changed_host) return 0
   if (edition == "advanced") {
     return (role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY"))
   }
   return 1
 }
-function detect_primary_election_from_monitor(    sysbench_sec) {
+function detect_primary_election_from_monitor(    sysbench_sec, saw_write_fail, wo) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
   close(monitor)
+  saw_write_fail = 0
   while ((getline line < monitor) > 0) {
     split(line, f, "\t")
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
     if (sysbench_sec < trigger) continue
+    wo = monitor_write_ok(f)
+    if (!saw_write_fail) {
+      if (wo == 0) saw_write_fail = 1
+      else continue
+    }
     if (is_primary_elected(f))
       return sysbench_sec - trigger
   }
@@ -1346,7 +1368,7 @@ function fmt_lat(v) {
 }
 END {
   load_timeseries()
-  failure_sec = detect_hostname_flip_ttd()
+  failure_sec = detect_write_failure_ttd()
   election_sec = detect_primary_election_from_monitor()
   recovery_sec = detect_app_recovery_rto()
   dip_sec = dip_duration(failure_sec, recovery_sec)
@@ -1569,15 +1591,12 @@ function monitor_write_ok(f) {
   if (length(f) >= 10 && f[9] != "" && f[9] != "ERROR") return f[9] + 0
   return -1
 }
-function is_primary_elected(f,    wo, role, gr, host, changed_host) {
+function is_primary_elected(f,    wo, role, gr) {
   if (f[3] != "1") return 0
   wo = monitor_write_ok(f)
   if (wo != 1) return 0
   role = monitor_gr_role(f)
   gr = monitor_gr_state(f)
-  host = f[4]
-  changed_host = (primary_before != "N/A" && host != primary_before && host != "ERROR")
-  if (!changed_host) return 0
   if (edition == "advanced") {
     return (role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY"))
   }
@@ -1600,7 +1619,7 @@ function compute_rto(    sec, stable_count, computed) {
   }
   return computed
 }
-function detect_hostname_flip_ttd(    sysbench_sec, host) {
+function detect_write_failure_ttd(    sysbench_sec, wo) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
   close(monitor)
   while ((getline line < monitor) > 0) {
@@ -1608,10 +1627,8 @@ function detect_hostname_flip_ttd(    sysbench_sec, host) {
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
     if (sysbench_sec < trigger) continue
-    if (f[3] != "1") continue
-    host = f[4]
-    if (primary_before != "N/A" && host != primary_before && host != "ERROR")
-      return sysbench_sec - trigger
+    wo = monitor_write_ok(f)
+    if (wo == 0) return sysbench_sec - trigger
   }
   close(monitor)
   return -1
@@ -1659,17 +1676,20 @@ function failover_tx_failures(fail_rel, rto_rel,    sec, start, end, sum, baseli
   }
   return int(sum + 0.5)
 }
-function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec) {
+function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec, saw_write_fail, wo) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return
   close(monitor)
+  saw_write_fail = 0
   while ((getline line < monitor) > 0) {
     split(line, f, "\t")
     if (f[1] == "timestamp_utc") continue
     elapsed = f[2] + 0
     sysbench_sec = elapsed - monitor_offset
+    wo = monitor_write_ok(f)
     if (f[3] != "1") {
       if (sysbench_sec >= trigger && connect_fail < 0)
         connect_fail = sysbench_sec - trigger
+      if (sysbench_sec >= trigger && wo == 0) saw_write_fail = 1
       continue
     }
     host = f[4]
@@ -1677,8 +1697,11 @@ function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec) {
     gr = monitor_gr_state(f)
     if (primary_before == "N/A" && sysbench_sec < trigger) primary_before = host
     if (sysbench_sec >= trigger) {
-      if (promote_sec < 0 && is_primary_elected(f))
+      if (!saw_write_fail) {
+        if (wo == 0) saw_write_fail = 1
+      } else if (promote_sec < 0 && is_primary_elected(f)) {
         promote_sec = sysbench_sec - trigger
+      }
       if (primary_after == "N/A" && host != "ERROR") primary_after = host
     }
   }
@@ -1718,7 +1741,7 @@ END {
   }
   if (pre_qps_cnt > 0) baseline_qps = pre_qps_sum / pre_qps_cnt
 
-  failure_detect = detect_hostname_flip_ttd()
+  failure_detect = detect_write_failure_ttd()
   if (failure_detect >= 0) failure_detect_abs = trigger + failure_detect
 
   computed_rto = compute_rto()
@@ -1739,11 +1762,11 @@ END {
   print ""
   print "--- Timing (seconds from trigger unless noted) ---"
   if (failure_detect >= 0)
-    printf "Time to detect failure:   %.3f s (%.0f ms · first @@hostname change on monitor)\n", failure_detect, failure_detect * 1000
+    printf "Time to detect failure:   %.3f s (%.0f ms · first write probe failure on monitor)\n", failure_detect, failure_detect * 1000
   else
     print "Time to detect failure:   NOT_DETECTED"
   if (promote_sec >= 0)
-    printf "Time to promote primary:  %.3f s (%.0f ms · GR PRIMARY + hostname change + write probe OK)\n", promote_sec, promote_sec * 1000
+    printf "Time to promote primary:  %.3f s (%.0f ms · GR PRIMARY + write probe OK)\n", promote_sec, promote_sec * 1000
   else
     print "Time to promote primary:  NOT_DETECTED (monitor off or no promotion signal seen)"
   if (rto >= 0)

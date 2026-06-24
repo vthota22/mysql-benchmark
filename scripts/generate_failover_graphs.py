@@ -32,13 +32,13 @@ def _ensure_mpl() -> bool:
 
 METRIC_HELP = {
     "detect": (
-        "Seconds from failover trigger until the primary monitor reports a hostname change "
-        "(HAProxy routing to a different pod). Does not require write_ok=0; use "
-        "Time to promote new primary for when the new primary accepts writes."
+        "Seconds from failover trigger until the primary monitor reports the first write probe "
+        "failure (write_ok=0), including timeouts when the monitor cannot connect."
     ),
     "promote": (
         "Seconds from trigger until the new primary is fully promoted and accepting writes: "
-        "hostname changed, GR PRIMARY role (Advanced), and write probe INSERT succeeds (write_ok=1)."
+        "first monitor poll after the first write failure with GR PRIMARY role (Advanced) "
+        "and write probe INSERT succeeds (write_ok=1)."
     ),
     "recovery": (
         "Seconds from trigger until TPS stays at or above 90% baseline for 30 consecutive seconds (RTO)."
@@ -575,15 +575,24 @@ def _wall_hms(wall: str) -> str:
     return wall
 
 
+def _is_promoted_monitor_row(row: dict[str, str | float], edition: str) -> bool:
+    if row["connect_ok"] != "1" or row["write_ok"] != "1":
+        return False
+    if edition == "advanced":
+        return row["gr_role"] == "PRIMARY" and row["gr_state"] in ("ONLINE", "PRIMARY")
+    return True
+
+
 def _select_monitor_transition_rows(
     monitor_rows: list[dict[str, str | float]],
     trigger: float,
     primary_before: str,
     event: dict[str, str],
 ) -> list[tuple[dict[str, str | float], str]]:
-    """Curated polls: last pre-trigger, first post-trigger (delete), gap on old primary, promotion."""
+    """Curated polls: last pre-trigger, first post-trigger (delete), first write fail, promotion."""
     ordered: list[tuple[dict[str, str | float], str]] = []
     seen: set[tuple[str, str]] = set()
+    edition = event.get("FAILOVER_EDITION", "advanced")
 
     def add(row: dict[str, str | float], note: str = "") -> None:
         key = (str(row["wall"]), str(row["hostname"]))
@@ -602,25 +611,39 @@ def _select_monitor_transition_rows(
     if delete_row:
         add(delete_row, "← pod deleted")
 
-    promote_row: dict[str, str | float] | None = None
+    write_fail_row: dict[str, str | float] | None = None
     for row in post:
-        host = str(row["hostname"])
-        if primary_before and host not in ("ERROR", primary_before, ""):
+        if row["write_ok"] == "0":
+            write_fail_row = row
+            break
+
+    promote_row: dict[str, str | float] | None = None
+    saw_write_fail = False
+    for row in post:
+        if row["write_ok"] == "0":
+            saw_write_fail = True
+        elif saw_write_fail and _is_promoted_monitor_row(row, edition):
             promote_row = row
             break
 
-    if delete_row and promote_row and primary_before:
+    if delete_row and write_fail_row and promote_row:
         delete_sb = float(delete_row["sysbench_sec"])
+        write_fail_sb = float(write_fail_row["sysbench_sec"])
         promote_sb = float(promote_row["sysbench_sec"])
         for row in post:
             sb = float(row["sysbench_sec"])
             if sb <= delete_sb + 0.05 or sb >= promote_sb - 0.05:
                 continue
-            if str(row["hostname"]) == primary_before:
+            if write_fail_row and abs(sb - write_fail_sb) < 0.05:
+                continue
+            if primary_before and str(row["hostname"]) == primary_before:
                 add(row)
 
+    if write_fail_row:
+        add(write_fail_row, "← first write failure")
+
     if promote_row:
-        add(promote_row, "← hostname change")
+        add(promote_row, "← promotion")
 
     return ordered
 
@@ -676,8 +699,8 @@ def _monitor_trigger_table_html(scenario_dir: Path, bundle: dict) -> str:
         row_classes: list[str] = []
         if note == "← pod deleted":
             row_classes.append("row-at-trigger")
-        elif note == "← hostname change":
-            row_classes.append("row-host-change")
+        elif note in ("← promotion", "← hostname change"):
+            row_classes.append("row-promotion")
         if row["connect_ok"] == "0" or row["write_ok"] == "0":
             row_classes.append("row-fail")
         cls = f' class="{" ".join(row_classes)}"' if row_classes else ""
@@ -1182,7 +1205,7 @@ def generate_html_report(
     table.monitor-trigger th {{ color: var(--muted); font-weight: 500; white-space: nowrap; }}
     table.monitor-trigger td {{ font-variant-numeric: tabular-nums; }}
     table.monitor-trigger tr.row-at-trigger {{ background: rgba(248, 113, 113, 0.12); }}
-    table.monitor-trigger tr.row-host-change {{ background: rgba(56, 189, 248, 0.10); }}
+    table.monitor-trigger tr.row-promotion {{ background: rgba(56, 189, 248, 0.10); }}
     table.monitor-trigger tr.row-fail {{ background: rgba(248, 113, 113, 0.18); }}
     .cell-bad {{ color: #f87171; font-weight: 600; }}
     .monitor-note {{ color: var(--accent); font-size: 0.78rem; }}
@@ -1471,7 +1494,7 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
     table.monitor-trigger th {{ color: var(--muted); font-weight: 500; white-space: nowrap; }}
     table.monitor-trigger td {{ font-variant-numeric: tabular-nums; }}
     table.monitor-trigger tr.row-at-trigger {{ background: rgba(248, 113, 113, 0.12); }}
-    table.monitor-trigger tr.row-host-change {{ background: rgba(56, 189, 248, 0.10); }}
+    table.monitor-trigger tr.row-promotion {{ background: rgba(56, 189, 248, 0.10); }}
     table.monitor-trigger tr.row-fail {{ background: rgba(248, 113, 113, 0.18); }}
     .cell-bad {{ color: #f87171; font-weight: 600; }}
     .monitor-note {{ color: var(--accent); font-size: 0.78rem; }}

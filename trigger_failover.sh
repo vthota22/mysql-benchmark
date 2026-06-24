@@ -2,7 +2,13 @@
 # Trigger failover for Standard or Advanced edition during a benchmark run.
 #
 # Usage:
-#   trigger_failover.sh <edition> <results_dir>
+#   trigger_failover.sh <edition> <results_dir> [action]
+#
+# Actions (Advanced pod delete; harness uses prepare → refresh → fire):
+#   prepare  — fetch kubeconfig, validate kubectl, resolve primary pod (during baseline)
+#   refresh  — re-resolve primary pod shortly before trigger second
+#   fire     — instant kubectl delete using prepared kubeconfig (at trigger second)
+#   (omit)   — one-shot: prepare + delete immediately (manual / legacy)
 #
 # Requires benchmark.conf (via BENCHMARK_CONF) and edition-specific settings.
 set -euo pipefail
@@ -15,27 +21,65 @@ source "${SCRIPT_DIR}/lib/failover_common.sh"
 load_benchmark_config "${CONFIG}"
 failover_defaults
 
-EDITION="${1:?Usage: $0 <standard|advanced> <results_dir>}"
-RESULTS_DIR="${2:?Usage: $0 <standard|advanced> <results_dir>}"
+EDITION="${1:?Usage: $0 <standard|advanced> <results_dir> [prepare|refresh|fire]}"
+RESULTS_DIR="${2:?Usage: $0 <standard|advanced> <results_dir> [prepare|refresh|fire]}"
+ACTION="${3:-}"
 mkdir -p "${RESULTS_DIR}"
+
+PREPARED_ENV="${RESULTS_DIR}/failover_trigger_prepared.env"
+TRIGGER_LOG="${RESULTS_DIR}/failover_trigger.log"
+EVENT_FILE="${RESULTS_DIR}/failover_event.txt"
 
 set_mysql_env_for_edition "${EDITION}"
 
-: > "${RESULTS_DIR}/failover_event.txt"
-echo "FAILOVER_EDITION=${EDITION}" >> "${RESULTS_DIR}/failover_event.txt"
-echo "FAILOVER_TRIGGER_ENABLED=${FAILOVER_TRIGGER_ENABLED:-1}" >> "${RESULTS_DIR}/failover_event.txt"
-echo "FAILOVER_POD_DELETE=${FAILOVER_POD_DELETE:-${FAILOVER_TRIGGER_ENABLED:-1}}" >> "${RESULTS_DIR}/failover_event.txt"
+init_failover_event_stub() {
+  : > "${EVENT_FILE}"
+  echo "FAILOVER_EDITION=${EDITION}" >> "${EVENT_FILE}"
+  echo "FAILOVER_TRIGGER_ENABLED=${FAILOVER_TRIGGER_ENABLED:-1}" >> "${EVENT_FILE}"
+  echo "FAILOVER_POD_DELETE=${FAILOVER_POD_DELETE:-${FAILOVER_TRIGGER_ENABLED:-1}}" >> "${EVENT_FILE}"
+}
 
 record_trigger_skipped() {
   local reason="${1:?reason required}"
-  echo "FAILOVER_METHOD=skipped" >> "${RESULTS_DIR}/failover_event.txt"
-  echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${RESULTS_DIR}/failover_event.txt"
-  echo "FAILOVER_SKIP_REASON=${reason}" >> "${RESULTS_DIR}/failover_event.txt"
+  init_failover_event_stub
+  echo "FAILOVER_METHOD=skipped" >> "${EVENT_FILE}"
+  echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
+  echo "FAILOVER_SKIP_REASON=${reason}" >> "${EVENT_FILE}"
   {
     echo "Failover trigger SKIPPED at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "Reason: ${reason}"
     echo "Load continues through observe window; no pod delete / API trigger."
-  } | tee -a "${RESULTS_DIR}/failover_trigger.log"
+  } | tee -a "${TRIGGER_LOG}"
+}
+
+write_failover_prepared_env() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local pod="${2:?pod required}"
+  local ns="${3:?namespace required}"
+  local delete_force="${4:-1}"
+  local delete_grace="${5:-0}"
+
+  cat > "${PREPARED_ENV}" <<EOF
+FAILOVER_PREPARED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+FAILOVER_KUBECONFIG=${kubeconfig}
+FAILOVER_K8S_NAMESPACE=${ns}
+FAILOVER_K8S_CONTEXT=${ADVANCED_K8S_CONTEXT:-}
+FAILOVER_TARGET_POD=${pod}
+FAILOVER_POD_DELETE_FORCE=${delete_force}
+FAILOVER_POD_DELETE_GRACE_SEC=${delete_grace}
+EOF
+}
+
+load_failover_prepared_env() {
+  [[ -f "${PREPARED_ENV}" ]] || {
+    echo "ERROR: missing ${PREPARED_ENV} — run prepare first" >&2
+    return 1
+  }
+  # shellcheck disable=SC1090
+  source "${PREPARED_ENV}"
+  : "${FAILOVER_KUBECONFIG:?FAILOVER_KUBECONFIG missing in prepared env}"
+  : "${FAILOVER_K8S_NAMESPACE:?FAILOVER_K8S_NAMESPACE missing in prepared env}"
+  : "${FAILOVER_TARGET_POD:?FAILOVER_TARGET_POD missing in prepared env}"
 }
 
 trigger_standard_failover() {
@@ -142,7 +186,7 @@ trigger_standard_failover() {
 
 fetch_advanced_kubeconfig() {
   local kubeconfig="${RESULTS_DIR}/kubeconfig"
-  local log="${RESULTS_DIR}/failover_trigger.log"
+  local log="${TRIGGER_LOG}"
 
   if [[ -n "${ADVANCED_KUBECONFIG_PATH:-}" && -f "${ADVANCED_KUBECONFIG_PATH}" ]]; then
     cp "${ADVANCED_KUBECONFIG_PATH}" "${kubeconfig}"
@@ -183,7 +227,7 @@ fetch_advanced_kubeconfig() {
 find_advanced_primary_pod() {
   local kubeconfig="${1:?kubeconfig required}"
   local ns="${ADVANCED_K8S_NAMESPACE:-}"
-  local log="${RESULTS_DIR}/failover_trigger.log"
+  local log="${TRIGGER_LOG}"
   : "${ns:?Set ADVANCED_K8S_NAMESPACE in benchmark.conf}"
 
   local kubectl=(kubectl --kubeconfig="${kubeconfig}")
@@ -243,38 +287,24 @@ find_advanced_primary_pod() {
   echo "${pod}"
 }
 
-trigger_advanced_failover() {
-  if ! failover_pod_delete_enabled; then
-    record_trigger_skipped "FAILOVER_POD_DELETE=0 (load-only control run)"
-    return 0
-  fi
+_advanced_failover_delete_pod() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local pod="${2:?pod required}"
+  local ns="${3:?namespace required}"
+  local delete_force="${4:-1}"
+  local delete_grace="${5:-0}"
 
-  local delete_force="${FAILOVER_POD_DELETE_FORCE:-1}"
-  local delete_grace="${FAILOVER_POD_DELETE_GRACE_SEC:-0}"
   local delete_method="kubectl_delete_pod"
   if [[ "${delete_force}" == "1" ]]; then
     delete_method="kubectl_delete_pod_force"
   fi
 
-  echo "FAILOVER_METHOD=${delete_method}" >> "${RESULTS_DIR}/failover_event.txt"
-  echo "FAILOVER_POD_DELETE_FORCE=${delete_force}" >> "${RESULTS_DIR}/failover_event.txt"
-  echo "FAILOVER_POD_DELETE_GRACE_SEC=${delete_grace}" >> "${RESULTS_DIR}/failover_event.txt"
-  echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${RESULTS_DIR}/failover_event.txt"
-  echo "FAILOVER_POD_DELETE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${RESULTS_DIR}/failover_event.txt"
-
-  if ! command -v kubectl >/dev/null 2>&1; then
-    echo "ERROR: kubectl not found in PATH" >&2
-    return 1
-  fi
-
-  local kubeconfig
-  kubeconfig=$(fetch_advanced_kubeconfig)
-
-  local ns="${ADVANCED_K8S_NAMESPACE:?Set ADVANCED_K8S_NAMESPACE}"
-  local pod
-  pod=$(find_advanced_primary_pod "${kubeconfig}")
-
-  echo "FAILOVER_TARGET_POD=${pod}" >> "${RESULTS_DIR}/failover_event.txt"
+  echo "FAILOVER_METHOD=${delete_method}" >> "${EVENT_FILE}"
+  echo "FAILOVER_POD_DELETE_FORCE=${delete_force}" >> "${EVENT_FILE}"
+  echo "FAILOVER_POD_DELETE_GRACE_SEC=${delete_grace}" >> "${EVENT_FILE}"
+  echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
+  echo "FAILOVER_POD_DELETE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
+  echo "FAILOVER_TARGET_POD=${pod}" >> "${EVENT_FILE}"
 
   local kubectl=(kubectl --kubeconfig="${kubeconfig}")
   if [[ -n "${ADVANCED_K8S_CONTEXT:-}" ]]; then
@@ -285,24 +315,87 @@ trigger_advanced_failover() {
   if [[ "${delete_force}" == "1" ]]; then
     delete_args+=(--grace-period="${delete_grace}" --force)
     echo "Force-deleting primary pod ${pod} in namespace ${ns} (grace-period=${delete_grace})..." \
-      | tee -a "${RESULTS_DIR}/failover_trigger.log"
+      | tee -a "${TRIGGER_LOG}"
     echo "Command: kubectl delete pod ${pod} -n ${ns} --grace-period=${delete_grace} --force --wait=false" \
-      >> "${RESULTS_DIR}/failover_trigger.log"
+      >> "${TRIGGER_LOG}"
   else
     delete_args+=(--grace-period="${delete_grace}")
     echo "Deleting primary pod ${pod} in namespace ${ns} (grace-period=${delete_grace})..." \
-      | tee -a "${RESULTS_DIR}/failover_trigger.log"
+      | tee -a "${TRIGGER_LOG}"
   fi
 
   _failover_snapshot_k8s_events "${RESULTS_DIR}" "pre_delete"
   log_failover_do_events "${RESULTS_DIR}" "advanced" "pre_delete"
 
   "${kubectl[@]}" "${delete_args[@]}" \
-    2>&1 | tee -a "${RESULTS_DIR}/failover_trigger.log"
+    2>&1 | tee -a "${TRIGGER_LOG}"
 
-  echo "Pod delete issued at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${RESULTS_DIR}/failover_trigger.log"
+  echo "Pod delete issued at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${TRIGGER_LOG}"
   _failover_snapshot_k8s_events "${RESULTS_DIR}" "post_delete"
   log_failover_do_events "${RESULTS_DIR}" "advanced" "post_delete"
+}
+
+prepare_advanced_failover_trigger() {
+  if ! failover_pod_delete_enabled; then
+    record_trigger_skipped "FAILOVER_POD_DELETE=0 (load-only control run)"
+    return 0
+  fi
+
+  if ! command -v kubectl >/dev/null 2>&1; then
+    echo "ERROR: kubectl not found in PATH" >&2
+    return 1
+  fi
+
+  init_failover_event_stub
+
+  local delete_force="${FAILOVER_POD_DELETE_FORCE:-1}"
+  local delete_grace="${FAILOVER_POD_DELETE_GRACE_SEC:-0}"
+  local kubeconfig pod ns
+
+  ns="${ADVANCED_K8S_NAMESPACE:?Set ADVANCED_K8S_NAMESPACE}"
+  echo "Preparing Advanced failover trigger at $(date -u +%Y-%m-%dT%H:%M:%SZ)..." | tee -a "${TRIGGER_LOG}"
+  kubeconfig=$(fetch_advanced_kubeconfig)
+  pod=$(find_advanced_primary_pod "${kubeconfig}")
+
+  write_failover_prepared_env "${kubeconfig}" "${pod}" "${ns}" "${delete_force}" "${delete_grace}"
+  echo "Prepared: kubeconfig=${kubeconfig} target_pod=${pod} namespace=${ns}" | tee -a "${TRIGGER_LOG}"
+}
+
+refresh_advanced_failover_trigger() {
+  load_failover_prepared_env
+
+  if ! command -v kubectl >/dev/null 2>&1; then
+    echo "ERROR: kubectl not found in PATH" >&2
+    return 1
+  fi
+
+  local pod
+  pod=$(find_advanced_primary_pod "${FAILOVER_KUBECONFIG}")
+  write_failover_prepared_env "${FAILOVER_KUBECONFIG}" "${pod}" "${FAILOVER_K8S_NAMESPACE}" \
+    "${FAILOVER_POD_DELETE_FORCE:-1}" "${FAILOVER_POD_DELETE_GRACE_SEC:-0}"
+  echo "Refreshed primary pod for delete: ${pod} at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${TRIGGER_LOG}"
+}
+
+fire_advanced_failover_trigger() {
+  if ! failover_pod_delete_enabled; then
+    record_trigger_skipped "FAILOVER_POD_DELETE=0 (load-only control run)"
+    return 0
+  fi
+
+  load_failover_prepared_env
+
+  local pod
+  pod=$(find_advanced_primary_pod "${FAILOVER_KUBECONFIG}")
+  write_failover_prepared_env "${FAILOVER_KUBECONFIG}" "${pod}" "${FAILOVER_K8S_NAMESPACE}" \
+    "${FAILOVER_POD_DELETE_FORCE:-1}" "${FAILOVER_POD_DELETE_GRACE_SEC:-0}"
+
+  _advanced_failover_delete_pod "${FAILOVER_KUBECONFIG}" "${pod}" "${FAILOVER_K8S_NAMESPACE}" \
+    "${FAILOVER_POD_DELETE_FORCE:-1}" "${FAILOVER_POD_DELETE_GRACE_SEC:-0}"
+}
+
+trigger_advanced_failover() {
+  prepare_advanced_failover_trigger
+  fire_advanced_failover_trigger
 }
 
 log_do_events() {
@@ -312,6 +405,7 @@ log_do_events() {
 case "${EDITION}" in
   standard)
     if failover_trigger_enabled; then
+      init_failover_event_stub
       trigger_standard_failover
       : > "${RESULTS_DIR}/do_events.log"
       log_do_events
@@ -321,7 +415,22 @@ case "${EDITION}" in
     ;;
   advanced)
     : > "${RESULTS_DIR}/do_events.log"
-    trigger_advanced_failover
+    case "${ACTION}" in
+      prepare) prepare_advanced_failover_trigger ;;
+      refresh) refresh_advanced_failover_trigger ;;
+      fire) fire_advanced_failover_trigger ;;
+      "")
+        if failover_trigger_enabled; then
+          trigger_advanced_failover
+        else
+          record_trigger_skipped "FAILOVER_TRIGGER_ENABLED=0"
+        fi
+        ;;
+      *)
+        echo "ERROR: Unknown action '${ACTION}' (use prepare, refresh, fire, or omit)" >&2
+        exit 1
+        ;;
+    esac
     ;;
   *)
     echo "ERROR: Unknown edition '${EDITION}' (use standard or advanced)" >&2
