@@ -1250,18 +1250,17 @@ function is_primary_elected(f,    wo, role, gr) {
   }
   return 1
 }
-function detect_primary_election_from_monitor(    sysbench_sec, saw_write_fail, wo) {
+function detect_primary_election_from_monitor(    sysbench_sec, saw_connect_fail) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
   close(monitor)
-  saw_write_fail = 0
+  saw_connect_fail = 0
   while ((getline line < monitor) > 0) {
     split(line, f, "\t")
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
     if (sysbench_sec < trigger) continue
-    wo = monitor_write_ok(f)
-    if (!saw_write_fail) {
-      if (wo == 0) saw_write_fail = 1
+    if (!saw_connect_fail) {
+      if (f[3] != "1") saw_connect_fail = 1
       else continue
     }
     if (is_primary_elected(f))
@@ -1368,18 +1367,19 @@ function fmt_lat(v) {
 END {
   load_timeseries()
   failure_sec = detect_connect_failure_ttd()
-  election_sec = detect_primary_election_from_monitor()
+  promote_total_sec = detect_primary_election_from_monitor()
+  election_sec = phase_duration(promote_total_sec, failure_sec)
   recovery_sec = detect_app_recovery_rto()
   dip_sec = dip_duration(failure_sec, recovery_sec)
   peak_lat = peak_latency(failure_sec, recovery_sec)
   peak_err_window = 0
   tx_failed = failover_errors_in_window(failure_sec, recovery_sec)
-  writes_failed = count_write_probe_failures(recovery_sec, election_sec)
+  writes_failed = count_write_probe_failures(recovery_sec, promote_total_sec)
 
-  print "edition,scenario,trx_profile,failure_detection_sec,primary_election_sec,app_recovery_sec,tps_dip_duration_sec,peak_latency_failover_ms,transactions_failed_during_failover,writes_failed_during_failover,peak_write_err_per_sec,data_loss"
-  printf "%s,%s,%s,%s,%s,%s,%d,%s,%d,%d,%.2f,%s\n", \
+  print "edition,scenario,trx_profile,failure_detection_sec,primary_election_sec,total_failover_sec,app_recovery_sec,tps_dip_duration_sec,peak_latency_failover_ms,transactions_failed_during_failover,writes_failed_during_failover,peak_write_err_per_sec,data_loss"
+  printf "%s,%s,%s,%s,%s,%s,%s,%d,%s,%d,%d,%.2f,%s\n", \
     edition, scenario, trx_profile, \
-    fmt_sec(failure_sec), fmt_sec(election_sec), fmt_sec(recovery_sec), \
+    fmt_sec(failure_sec), fmt_sec(election_sec), fmt_sec(promote_total_sec), fmt_sec(recovery_sec), \
     dip_sec, fmt_lat(peak_lat), tx_failed, writes_failed, peak_err_window, tpcc_check
 }
 AWK
@@ -1631,6 +1631,11 @@ function detect_connect_failure_ttd(    sysbench_sec) {
   close(monitor)
   return -1
 }
+function phase_duration(end_rel, start_rel) {
+  if (end_rel < 0 || start_rel < 0) return -1
+  if (end_rel < start_rel) return -1
+  return end_rel - start_rel
+}
 function count_write_probe_failures(rto_rel, promote_rel,    sysbench_sec, wo, end_abs, count) {
   count = 0
   end_abs = load_end_sec
@@ -1674,20 +1679,19 @@ function failover_tx_failures(fail_rel, rto_rel,    sec, start, end, sum, baseli
   }
   return int(sum + 0.5)
 }
-function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec, saw_write_fail, wo) {
+function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec, saw_connect_fail) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return
   close(monitor)
-  saw_write_fail = 0
+  saw_connect_fail = 0
   while ((getline line < monitor) > 0) {
     split(line, f, "\t")
     if (f[1] == "timestamp_utc") continue
     elapsed = f[2] + 0
     sysbench_sec = elapsed - monitor_offset
-    wo = monitor_write_ok(f)
     if (f[3] != "1") {
       if (sysbench_sec >= trigger && connect_fail < 0)
         connect_fail = sysbench_sec - trigger
-      if (sysbench_sec >= trigger && wo == 0) saw_write_fail = 1
+      if (sysbench_sec >= trigger) saw_connect_fail = 1
       continue
     }
     host = f[4]
@@ -1695,8 +1699,8 @@ function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec, saw_write_fail
     gr = monitor_gr_state(f)
     if (primary_before == "N/A" && sysbench_sec < trigger) primary_before = host
     if (sysbench_sec >= trigger) {
-      if (!saw_write_fail) {
-        if (wo == 0) saw_write_fail = 1
+      if (!saw_connect_fail) {
+        continue
       } else if (promote_sec < 0 && is_primary_elected(f)) {
         promote_sec = sysbench_sec - trigger
       }
@@ -1741,6 +1745,7 @@ END {
 
   failure_detect = detect_connect_failure_ttd()
   if (failure_detect >= 0) failure_detect_abs = trigger + failure_detect
+  promote_after_detect = phase_duration(promote_sec, failure_detect)
 
   computed_rto = compute_rto()
   if (computed_rto >= 0) rto = computed_rto
@@ -1758,15 +1763,19 @@ END {
   print "Trigger second:           " trigger " (from sysbench start)"
   print "Target pod:               " (target_pod != "" ? target_pod : "N/A")
   print ""
-  print "--- Timing (seconds from trigger unless noted) ---"
+  print "--- Timing ---"
   if (failure_detect >= 0)
-    printf "Time to detect failure:   %.3f s (%.0f ms · first connect failure on monitor, connect_ok=0)\n", failure_detect, failure_detect * 1000
+    printf "Time to detect failure:   %.3f s (%.0f ms · from trigger, first connect failure connect_ok=0)\n", failure_detect, failure_detect * 1000
   else
     print "Time to detect failure:   NOT_DETECTED"
-  if (promote_sec >= 0)
-    printf "Time to promote primary:  %.3f s (%.0f ms · GR PRIMARY + write probe OK)\n", promote_sec, promote_sec * 1000
+  if (promote_after_detect >= 0)
+    printf "Time to promote primary:  %.3f s (%.0f ms · from first connect failure, GR PRIMARY + write probe OK)\n", promote_after_detect, promote_after_detect * 1000
   else
     print "Time to promote primary:  NOT_DETECTED (monitor off or no promotion signal seen)"
+  if (promote_sec >= 0)
+    printf "Total failover time:      %.3f s (%.0f ms · from trigger to promotion)\n", promote_sec, promote_sec * 1000
+  else
+    print "Total failover time:      NOT_DETECTED"
   if (rto >= 0)
     printf "Application recovery RTO: %.3f s (%.0f ms · %.0f%% baseline for %ds)\n", rto, rto * 1000, recovery_pct * 100, stable
   else
@@ -1835,7 +1844,7 @@ write_failover_comparison() {
   local kpi_csv="${results_root}/failover_kpi.csv"
 
   echo "edition,scenario,trigger_method,trigger_utc,baseline_tps,outage_start_sec,outage_duration_sec,rto_sec,peak_err_per_sec,peak_reconn_per_sec,peak_lat_p95_ms" > "${combined_csv}"
-  echo "edition,scenario,trx_profile,failure_detection_sec,primary_election_sec,app_recovery_sec,tps_dip_duration_sec,peak_latency_failover_ms,transactions_failed_during_failover,writes_failed_during_failover,peak_write_err_per_sec,data_loss" > "${kpi_csv}"
+  echo "edition,scenario,trx_profile,failure_detection_sec,primary_election_sec,total_failover_sec,app_recovery_sec,tps_dip_duration_sec,peak_latency_failover_ms,transactions_failed_during_failover,writes_failed_during_failover,peak_write_err_per_sec,data_loss" > "${kpi_csv}"
 
   {
     echo "=== Failover Benchmark — Standard vs Advanced ==="

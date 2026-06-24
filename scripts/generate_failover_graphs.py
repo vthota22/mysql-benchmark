@@ -36,9 +36,11 @@ METRIC_HELP = {
         "connect failure (connect_ok=0), including timeouts when the monitor cannot connect."
     ),
     "promote": (
-        "Seconds from trigger until the new primary is fully promoted and accepting writes: "
-        "first monitor poll after the first write failure with GR PRIMARY role (Advanced) "
-        "and write probe INSERT succeeds (write_ok=1)."
+        "Seconds from the first connect failure until the new primary is fully promoted "
+        "and accepting writes: GR PRIMARY role (Advanced) and write probe INSERT succeeds (write_ok=1)."
+    ),
+    "total_failover": (
+        "Seconds from failover trigger until promotion completes (detection lag + promotion time)."
     ),
     "recovery": (
         "Seconds from trigger until TPS stays at or above 90% baseline for 30 consecutive seconds (RTO)."
@@ -453,7 +455,9 @@ def _before_after_throughput_table_html(bundle: dict) -> str:
     kpi = bundle.get("kpi", {})
 
     before_tps, before_qps, before_lat = _resolve_baseline_metrics(parsed, rows, trigger)
-    promote_sec = _parse_kpi_sec(kpi.get("primary_election_sec"))
+    promote_sec = _parse_kpi_sec(kpi.get("total_failover_sec")) or _parse_kpi_sec(
+        extended.get("total_failover_sec")
+    )
     after_tps, after_qps, after_lat, window_note = _averages_after_failover(
         rows, trigger, promote_sec
     )
@@ -943,6 +947,7 @@ def _parse_extended_metrics(path: Path) -> dict[str, str]:
     patterns = {
         "failure_detect_sec": r"Time to detect failure:\s+([\d.]+)\s+s\b",
         "promote_sec": r"Time to promote primary:\s+([\d.]+)\s+s\b",
+        "total_failover_sec": r"Total failover time:\s+([\d.]+)\s+s\b",
         "rto_sec": r"Application recovery RTO:\s+([\d.]+)\s+s\b",
         "primary_before": r"Primary before:\s+(\S+)",
         "primary_after": r"Primary after:\s+(\S+)",
@@ -1037,6 +1042,7 @@ def _metrics_summary_html(
 
     detect = kpi.get("failure_detection_sec") or extended.get("failure_detect_sec", "N/A")
     promote = kpi.get("primary_election_sec") or extended.get("promote_sec", "N/A")
+    total_failover = kpi.get("total_failover_sec") or extended.get("total_failover_sec", "N/A")
     recovery = kpi.get("app_recovery_sec") or parsed.get("RTO_SEC") or extended.get("rto_sec", "N/A")
     data_loss = kpi.get("data_loss") or extended.get("tpcc_check", "N/A")
 
@@ -1055,7 +1061,7 @@ def _metrics_summary_html(
             _format_duration_sec(promote),
             METRIC_HELP["promote"],
             sub=(
-                f"Interval after detection: {_phase_gap_sec(promote, detect)} · "
+                f"Total from trigger: {_format_duration_sec(total_failover)} · "
                 f"Primary: {before} → {after} ({changed})"
             ),
         ),
@@ -1063,7 +1069,7 @@ def _metrics_summary_html(
             "Time for application recovery",
             _format_duration_sec(recovery),
             METRIC_HELP["recovery"],
-            sub=f"Interval after promotion: {_phase_gap_sec(recovery, promote)}",
+            sub=f"Interval after promotion: {_phase_gap_sec(recovery, total_failover)}",
         ),
     ]
     rows.append(
