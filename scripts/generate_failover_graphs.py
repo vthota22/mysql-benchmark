@@ -32,8 +32,8 @@ def _ensure_mpl() -> bool:
 
 METRIC_HELP = {
     "detect": (
-        "Seconds from failover trigger until the primary monitor reports the first write probe "
-        "failure (write_ok=0), including timeouts when the monitor cannot connect."
+        "Seconds from failover trigger until the primary monitor reports the first "
+        "connect failure (connect_ok=0), including timeouts when the monitor cannot connect."
     ),
     "promote": (
         "Seconds from trigger until the new primary is fully promoted and accepting writes: "
@@ -55,12 +55,16 @@ def load_metadata(path: Path) -> dict[str, str]:
     if not path.exists():
         return meta
     for line in path.read_text().splitlines():
-        if "=" in line:
-            key, _, value = line.partition("=")
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-                value = value[1:-1]
-            meta[key.strip()] = value
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        meta[key.strip()] = value
     return meta
 
 
@@ -157,6 +161,7 @@ THREAD_DIR_RE = re.compile(r"^t(\d+)$")
 EDITION_NAMES = {"advanced", "standard"}
 DEFAULT_THREAD_MATRIX = (4, 8, 16, 32)
 DEFAULT_SCENARIOS = ("mixed", "write_only")
+VALID_SCENARIO_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 def resolve_edition_name(
@@ -255,7 +260,14 @@ def load_edition_benchmark_config(edition_dir: Path) -> dict[str, str]:
 
 
 def _parse_space_list(value: str) -> list[str]:
-    return [part for part in value.split() if part]
+    parts: list[str] = []
+    for part in value.split():
+        token = part.strip().strip("\"'")
+        if not token or token.startswith("#"):
+            break
+        if VALID_SCENARIO_RE.match(token):
+            parts.append(token)
+    return parts
 
 
 def parent_edition_dir(scenario_dir: Path) -> Path | None:
@@ -314,8 +326,10 @@ def resolve_scenario_list(
     discovered: set[str] = set()
     for scenarios in thread_runs.values():
         discovered.update(scenarios.keys())
+    if discovered:
+        return sorted(discovered)
     planned = _planned_from_conf_keys(edition_dir, "FAILOVER_SCENARIOS", DEFAULT_SCENARIOS)
-    return sorted(planned | discovered)
+    return sorted(planned)
 
 
 def discover_thread_runs(edition_dir: Path) -> dict[int, dict[str, Path]]:
@@ -589,7 +603,7 @@ def _select_monitor_transition_rows(
     primary_before: str,
     event: dict[str, str],
 ) -> list[tuple[dict[str, str | float], str]]:
-    """Curated polls: last pre-trigger, first post-trigger (delete), first write fail, promotion."""
+    """Curated polls: last pre-trigger, first post-trigger (delete), first connect fail, promotion."""
     ordered: list[tuple[dict[str, str | float], str]] = []
     seen: set[tuple[str, str]] = set()
     edition = event.get("FAILOVER_EDITION", "advanced")
@@ -611,36 +625,37 @@ def _select_monitor_transition_rows(
     if delete_row:
         add(delete_row, "← pod deleted")
 
-    write_fail_row: dict[str, str | float] | None = None
+    connect_fail_row: dict[str, str | float] | None = None
     for row in post:
-        if row["write_ok"] == "0":
-            write_fail_row = row
+        if row["connect_ok"] == "0":
+            connect_fail_row = row
             break
 
     promote_row: dict[str, str | float] | None = None
-    saw_write_fail = False
+    saw_failure = False
     for row in post:
-        if row["write_ok"] == "0":
-            saw_write_fail = True
-        elif saw_write_fail and _is_promoted_monitor_row(row, edition):
+        if row["connect_ok"] == "0" or row["write_ok"] == "0":
+            saw_failure = True
+        elif saw_failure and _is_promoted_monitor_row(row, edition):
             promote_row = row
             break
 
-    if delete_row and write_fail_row and promote_row:
+    failure_row = connect_fail_row
+    if delete_row and failure_row and promote_row:
         delete_sb = float(delete_row["sysbench_sec"])
-        write_fail_sb = float(write_fail_row["sysbench_sec"])
+        failure_sb = float(failure_row["sysbench_sec"])
         promote_sb = float(promote_row["sysbench_sec"])
         for row in post:
             sb = float(row["sysbench_sec"])
             if sb <= delete_sb + 0.05 or sb >= promote_sb - 0.05:
                 continue
-            if write_fail_row and abs(sb - write_fail_sb) < 0.05:
+            if failure_row and abs(sb - failure_sb) < 0.05:
                 continue
             if primary_before and str(row["hostname"]) == primary_before:
                 add(row)
 
-    if write_fail_row:
-        add(write_fail_row, "← first write failure")
+    if connect_fail_row:
+        add(connect_fail_row, "← first connect failure")
 
     if promote_row:
         add(promote_row, "← promotion")

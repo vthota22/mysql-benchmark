@@ -1193,7 +1193,7 @@ function load_timeseries(    line, f, sec) {
   observe_end = trigger + observe_sec
   if (load_end > observe_end) observe_end = load_end
 }
-function detect_write_failure_ttd(    sysbench_sec, wo) {
+function detect_connect_failure_ttd(    sysbench_sec) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
   close(monitor)
   while ((getline line < monitor) > 0) {
@@ -1201,8 +1201,7 @@ function detect_write_failure_ttd(    sysbench_sec, wo) {
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
     if (sysbench_sec < trigger) continue
-    wo = monitor_write_ok(f)
-    if (wo == 0) return sysbench_sec - trigger
+    if (f[3] != "1") return sysbench_sec - trigger
   }
   close(monitor)
   return -1
@@ -1368,7 +1367,7 @@ function fmt_lat(v) {
 }
 END {
   load_timeseries()
-  failure_sec = detect_write_failure_ttd()
+  failure_sec = detect_connect_failure_ttd()
   election_sec = detect_primary_election_from_monitor()
   recovery_sec = detect_app_recovery_rto()
   dip_sec = dip_duration(failure_sec, recovery_sec)
@@ -1619,7 +1618,7 @@ function compute_rto(    sec, stable_count, computed) {
   }
   return computed
 }
-function detect_write_failure_ttd(    sysbench_sec, wo) {
+function detect_connect_failure_ttd(    sysbench_sec) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
   close(monitor)
   while ((getline line < monitor) > 0) {
@@ -1627,8 +1626,7 @@ function detect_write_failure_ttd(    sysbench_sec, wo) {
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
     if (sysbench_sec < trigger) continue
-    wo = monitor_write_ok(f)
-    if (wo == 0) return sysbench_sec - trigger
+    if (f[3] != "1") return sysbench_sec - trigger
   }
   close(monitor)
   return -1
@@ -1741,7 +1739,7 @@ END {
   }
   if (pre_qps_cnt > 0) baseline_qps = pre_qps_sum / pre_qps_cnt
 
-  failure_detect = detect_write_failure_ttd()
+  failure_detect = detect_connect_failure_ttd()
   if (failure_detect >= 0) failure_detect_abs = trigger + failure_detect
 
   computed_rto = compute_rto()
@@ -1762,7 +1760,7 @@ END {
   print ""
   print "--- Timing (seconds from trigger unless noted) ---"
   if (failure_detect >= 0)
-    printf "Time to detect failure:   %.3f s (%.0f ms · first write probe failure on monitor)\n", failure_detect, failure_detect * 1000
+    printf "Time to detect failure:   %.3f s (%.0f ms · first connect failure on monitor, connect_ok=0)\n", failure_detect, failure_detect * 1000
   else
     print "Time to detect failure:   NOT_DETECTED"
   if (promote_sec >= 0)
