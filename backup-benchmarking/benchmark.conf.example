@@ -1,0 +1,50 @@
+# backup-benchmarking — sysbench TPC-C under load while measuring backup impact
+# Copy and edit:
+#   cp benchmark.conf.example benchmark.conf
+
+# MySQL engine edition for this run (standard or advanced).
+ENGINE="advanced"
+
+# --- MySQL connection ---
+MYSQL_HOST="your-cluster.db.ondigitalocean.com"
+MYSQL_PORT=25060
+MYSQL_USER="doadmin"
+MYSQL_PASSWORD="CHANGE_ME"
+MYSQL_DB="sbtest_tpcc"
+
+# --- Cluster details ---
+CLUSTER_ID="your-cluster-uuid"
+CLUSTER_SLUG="gd-4vcpu-16gb"
+CLUSTER_NUM_NODES=1
+CLUSTER_STORAGE_SIZE_GIB=200
+
+# --- DigitalOcean API ---
+DO_API_TOKEN=""
+DO_API_URL="https://api.digitalocean.com"
+
+# --- Sysbench TPC-C ---
+TPCC_SCALE=10
+TPCC_TABLES=10
+TPCC_THREADS=16
+TPCC_PREP_THREADS=16
+TPCC_CHECK_THREADS=
+TPCC_WARMUP_SEC=0
+TPCC_REPORT_INTERVAL=1
+TPCC_FORCE_PK=1
+TPCC_TRX_LEVEL=RR
+
+# Survive backup-related transient errors and TPC-C lock contention.
+TPCC_IGNORE_ERRORS="1290,1836,1053,2013,2006,2055,2011,3100,1205,1213,1020"
+
+# 1 = skip prepare when TPC-C tables already exist; 0 = drop DB and reload dataset
+SKIP_PREPARE=0
+
+# Total TPC-C run duration (seconds). Backups are monitored throughout.
+TPCC_MAX_TIME=3600
+
+# --- Backup polling ---
+# How often to poll the list-backups API (seconds).
+BACKUP_POLL_INTERVAL_SEC=300
+
+# --- Output ---
+RESULTS_DIR="results"
