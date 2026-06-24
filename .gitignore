@@ -3,5 +3,9 @@ scaling-benchmarking/scripts/.venv/
 benchmark.conf
 scaling-benchmarking/benchmark.conf
 scaling-benchmarking/results/
+scaling-benchmarking/reports/
+scaling-benchmarking/reports2/
+scaling-benchmarking/combine_reports.py
+scaling-benchmarking/adv_mysql_backup_and_scaling_2026-06-23.html
 scaling-benchmarking/logs/
 secrets/

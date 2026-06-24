@@ -191,6 +191,77 @@ def fmt_duration(seconds: str | int | None) -> str:
     return f"{total}s"
 
 
+def fmt_epoch(epoch: str | int | None) -> str:
+    if epoch is None or epoch == "":
+        return "N/A"
+    from datetime import timezone
+    return datetime.fromtimestamp(int(epoch), tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+SIZE_SLUG_RE = re.compile(r"(\d+)vcpu-(\d+)gb")
+
+
+def parse_size_slug(slug: str) -> tuple[int, int]:
+    """Extract (vcpus, ram_gb) from a slug like 'gd-4vcpu-16gb'."""
+    m = SIZE_SLUG_RE.search(slug)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return 0, 0
+
+
+def detect_scale_type(
+    before: "ClusterState | None", after: "ClusterState | None"
+) -> str:
+    """Determine the scaling operation type and direction from cluster state."""
+    if before is None or after is None:
+        return "Scaling benchmark report"
+
+    parts: list[str] = []
+
+    before_vcpu, before_ram = parse_size_slug(before.size)
+    after_vcpu, after_ram = parse_size_slug(after.size)
+    if (after_vcpu, after_ram) > (before_vcpu, before_ram):
+        parts.append("Vertical scale-up")
+    elif (after_vcpu, after_ram) < (before_vcpu, before_ram):
+        parts.append("Vertical scale-down")
+
+    if after.num_nodes > before.num_nodes:
+        parts.append("Horizontal scale-up")
+    elif after.num_nodes < before.num_nodes:
+        parts.append("Horizontal scale-down")
+
+    if after.storage_mib > before.storage_mib:
+        parts.append("Storage scale-up")
+    elif after.storage_mib < before.storage_mib:
+        parts.append("Storage scale-down")
+
+    if not parts:
+        return "Scaling benchmark report"
+
+    return " + ".join(parts) + " benchmark report"
+
+
+def scale_summary_line(
+    before: "ClusterState | None", after: "ClusterState | None"
+) -> str:
+    """One-line summary of what changed (e.g. '1 → 3 nodes')."""
+    if before is None or after is None:
+        return ""
+
+    changes: list[str] = []
+    before_vcpu, before_ram = parse_size_slug(before.size)
+    after_vcpu, after_ram = parse_size_slug(after.size)
+    if (before_vcpu, before_ram) != (after_vcpu, after_ram):
+        changes.append(f"{before.size} → {after.size}")
+    if before.num_nodes != after.num_nodes:
+        changes.append(f"{before.num_nodes} → {after.num_nodes} nodes")
+    if before.storage_mib != after.storage_mib:
+        changes.append(
+            f"{before.storage_mib / 1024:.0f} → {after.storage_mib / 1024:.0f} GiB storage"
+        )
+    return " · ".join(changes)
+
+
 def tpcc_dataset_items(conf: dict[str, str]) -> list[tuple[str, str]]:
     scale = int(conf.get("TPCC_SCALE") or 10)
     tables = int(conf.get("TPCC_TABLES") or 10)
@@ -340,20 +411,54 @@ def build_metrics_figure(
     return fig
 
 
-def phase_summary(metrics: list[MetricRow]) -> list[tuple[str, str]]:
-    summary: list[tuple[str, str]] = []
-    for phase in ("pre_scaling", "during_scaling", "post_scaling"):
+def phase_summary_pivoted(metrics: list[MetricRow]) -> str:
+    """Render phase summary as a pivoted table: phases as columns, metrics as rows."""
+    phases = ("pre_scaling", "during_scaling", "post_scaling")
+    phase_labels = ("Pre-scaling", "During scaling", "Post-scaling")
+    stats: dict[str, dict[str, str]] = {}
+
+    for phase in phases:
         rows = [m for m in metrics if m.phase == phase]
-        if not rows:
-            continue
-        avg_tps = sum(m.tps for m in rows) / len(rows)
-        max_err = max(m.err_per_sec for m in rows)
-        avg_lat = sum(m.lat_p95 for m in rows) / len(rows)
-        summary.append((f"{phase} samples", str(len(rows))))
-        summary.append((f"{phase} avg TPS", f"{avg_tps:.2f}"))
-        summary.append((f"{phase} avg p95 latency (ms)", f"{avg_lat:.2f}"))
-        summary.append((f"{phase} max err/s", f"{max_err:.2f}"))
-    return summary
+        if rows:
+            stats[phase] = {
+                "Samples": str(len(rows)),
+                "Avg TPS": f"{sum(m.tps for m in rows) / len(rows):.2f}",
+                "Avg p95 latency (ms)": f"{sum(m.lat_p95 for m in rows) / len(rows):.2f}",
+                "Max errors/s": f"{max(m.err_per_sec for m in rows):.2f}",
+                "Avg QPS": f"{sum(m.qps for m in rows) / len(rows):.2f}",
+                "Max latency p95 (ms)": f"{max(m.lat_p95 for m in rows):.2f}",
+            }
+        else:
+            stats[phase] = {k: "N/A" for k in (
+                "Samples", "Avg TPS", "Avg p95 latency (ms)",
+                "Max errors/s", "Avg QPS", "Max latency p95 (ms)",
+            )}
+
+    header = "<tr><th>Metric</th>" + "".join(
+        f"<th>{html.escape(lbl)}</th>" for lbl in phase_labels
+    ) + "</tr>"
+
+    metric_keys = [
+        "Samples", "Avg TPS", "Avg p95 latency (ms)",
+        "Max errors/s", "Avg QPS", "Max latency p95 (ms)",
+    ]
+    body_rows = ""
+    for key in metric_keys:
+        body_rows += "<tr>"
+        body_rows += f"<th>{html.escape(key)}</th>"
+        for phase in phases:
+            body_rows += f"<td>{html.escape(stats[phase][key])}</td>"
+        body_rows += "</tr>"
+
+    return f"""
+  <section>
+    <h2>Phase summary</h2>
+    <table class="kv">
+      <thead>{header}</thead>
+      <tbody>{body_rows}</tbody>
+    </table>
+  </section>
+  """
 
 
 def is_zero_tps(row: MetricRow) -> bool:
@@ -503,20 +608,17 @@ def generate_report(run_dir: Path, output_path: Path | None = None) -> Path:
 
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     success = timing.get("SCALE_SUCCESS", "unknown")
+    report_title = detect_scale_type(before, after)
+    scale_summary = scale_summary_line(before, after)
 
     timing_items = [
         ("Scale trigger delay", fmt_duration(conf.get("SCALE_TRIGGER_DELAY"))),
-        ("Scale started at (elapsed)", fmt_duration(timing.get("SCALE_START_ELAPSED"))),
-        ("Scale completed at (elapsed)", fmt_duration(timing.get("SCALE_COMPLETE_ELAPSED"))),
+        ("Scale started at", fmt_epoch(timing.get("SCALE_START_EPOCH"))),
+        ("Scale completed at", fmt_epoch(timing.get("SCALE_COMPLETE_EPOCH"))),
         ("Resize duration", fmt_duration(timing.get("SCALE_DURATION_SEC"))),
-        ("Poll duration", fmt_duration(timing.get("SCALE_POLL_DURATION_SEC"))),
-        ("Scale success", success),
-        ("Trigger RC", timing.get("SCALE_TRIGGER_RC", "N/A")),
-        ("Poll RC", timing.get("SCALE_POLL_RC", "N/A")),
     ]
 
     config_items = [
-        ("Run directory", str(run_dir)),
         ("Engine", conf.get("ENGINE", timing.get("ENGINE", "N/A"))),
         ("Cluster ID", conf.get("CLUSTER_ID", "N/A")),
         ("MySQL host", conf.get("MYSQL_HOST", "N/A")),
@@ -555,7 +657,7 @@ def generate_report(run_dir: Path, output_path: Path | None = None) -> Path:
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Scaling benchmark report — {html.escape(run_dir.name)}</title>
+  <title>{html.escape(report_title)} — {html.escape(run_dir.name)}</title>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     body {{
@@ -604,9 +706,9 @@ def generate_report(run_dir: Path, output_path: Path | None = None) -> Path:
   </style>
 </head>
 <body>
-  <h1>Scaling benchmark report</h1>
+  <h1>{html.escape(report_title)}</h1>
   <p class="meta">
-    <strong>{html.escape(run_dir.name)}</strong>
+    {html.escape(scale_summary)}
     &nbsp;·&nbsp; generated {html.escape(generated_at)}
     &nbsp;·&nbsp; <span class="badge">SCALE_SUCCESS={html.escape(success)}</span>
   </p>
@@ -615,7 +717,7 @@ def generate_report(run_dir: Path, output_path: Path | None = None) -> Path:
   {render_kv_table("TPC-C dataset", tpcc_dataset_items(conf))}
   {render_kv_table("Scaling timing", timing_items)}
   {render_kv_table("Run configuration", config_items)}
-  {render_kv_table("Phase summary", phase_summary(metrics))}
+  {phase_summary_pivoted(metrics)}
   {render_downtime_section(downtime_episodes, downtime_by_phase)}
 
   <section>
