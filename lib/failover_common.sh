@@ -28,6 +28,7 @@ failover_defaults() {
   : "${FAILOVER_MONITOR_INTERVAL:=1}"
   : "${FAILOVER_MONITOR_CONNECT_TIMEOUT:=1}"
   : "${FAILOVER_MONITOR_OP_TIMEOUT:=1}"
+  : "${FAILOVER_GR_POD_MONITOR:=1}"
   : "${FAILOVER_COLLECT_K8S_EVENTS:=1}"
   : "${FAILOVER_RUN_TPCC_CHECK:=0}"
   : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011}"
@@ -449,6 +450,121 @@ stop_primary_monitor() {
   fi
 }
 
+_failover_kubectl_cmd() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local -a kubectl=(kubectl --kubeconfig="${kubeconfig}")
+  [[ -n "${ADVANCED_K8S_CONTEXT:-}" ]] && kubectl+=(--context="${ADVANCED_K8S_CONTEXT}")
+  printf '%s\n' "${kubectl[@]}"
+}
+
+_failover_list_mysql_pods() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local -a kubectl
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+  "${kubectl[@]}" get pods -n "${ns}" --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null \
+    | grep -E 'mysql-[0-9]+$' | sort || true
+}
+
+_failover_poll_gr_pod_once() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local pod="${3:?pod required}"
+  local -a kubectl
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+  _failover_run_timeout 2 "${kubectl[@]}" exec -n "${ns}" "${pod}" -c mysql -- \
+    mysql -N -B -e "
+SELECT @@hostname,
+       IFNULL((SELECT MEMBER_ROLE FROM performance_schema.replication_group_members
+               WHERE MEMBER_ID = @@server_uuid LIMIT 1), 'N/A'),
+       IFNULL((SELECT MEMBER_STATE FROM performance_schema.replication_group_members
+               WHERE MEMBER_ID = @@server_uuid LIMIT 1), 'N/A');" 2>/dev/null || true
+}
+
+start_gr_pod_monitor() {
+  local results_dir="${1:?results dir required}"
+  local pid_file="${results_dir}/gr_pod_monitor.pid"
+  local out_file="${results_dir}/gr_pod_monitor.tsv"
+  local meta_file="${results_dir}/gr_pod_monitor_meta.txt"
+  local kubeconfig="${results_dir}/kubeconfig"
+  local ns="${ADVANCED_K8S_NAMESPACE:-}"
+
+  command -v kubectl >/dev/null 2>&1 || return 0
+  [[ -f "${kubeconfig}" ]] || return 0
+  [[ -n "${ns}" ]] || return 0
+
+  local interval="${FAILOVER_MONITOR_INTERVAL}"
+  local start_epoch
+  start_epoch=$(python3 -c "import time; print('%.3f' % time.time())")
+
+  : > "${out_file}"
+  echo -e "timestamp_utc\telapsed_sec\tpod\tconnect_ok\thostname\tgr_member_role\tgr_member_state" >> "${out_file}"
+  {
+    echo "GR_POD_MONITOR_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "GR_POD_MONITOR_START_EPOCH=${start_epoch}"
+    echo "GR_POD_MONITOR_INTERVAL_SEC=${interval}"
+    echo "GR_POD_MONITOR_NAMESPACE=${ns}"
+  } > "${meta_file}"
+
+  (
+    local tick=0 target_epoch elapsed ts due_tick pod line host role state
+    while true; do
+      due_tick=$(python3 -c "
+import math, time
+start = float('${start_epoch}')
+interval = float('${interval}')
+print(int(math.floor((time.time() - start) / interval)))
+")
+      while (( tick < due_tick )); do
+        tick=$((tick + 1))
+      done
+
+      target_epoch=$(python3 -c "print(float('${start_epoch}') + ${tick} * float('${interval}'))")
+      _failover_monitor_sleep_until "${target_epoch}"
+
+      elapsed=$(python3 -c "print('%.3f' % (float('${target_epoch}') - float('${start_epoch}')))")
+      ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+      while IFS= read -r pod; do
+        [[ -n "${pod}" ]] || continue
+        line=$(_failover_poll_gr_pod_once "${kubeconfig}" "${ns}" "${pod}")
+        if [[ "${line}" == *$'\t'* ]]; then
+          host=${line%%$'\t'*}
+          rest=${line#*$'\t'}
+          role=${rest%%$'\t'*}
+          state=${rest#*$'\t'}
+          echo -e "${ts}\t${elapsed}\t${pod}\t1\t${host}\t${role}\t${state}" >> "${out_file}"
+        else
+          echo -e "${ts}\t${elapsed}\t${pod}\t0\tERROR\tERROR\tERROR" >> "${out_file}"
+        fi
+      done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
+
+      tick=$((tick + 1))
+    done
+  ) &
+
+  echo $! > "${pid_file}"
+  echo "GR pod monitor started (pid=$(cat "${pid_file}"), ${interval}s grid, direct kubectl exec per mysql pod)"
+}
+
+stop_gr_pod_monitor() {
+  local results_dir="${1:?results dir required}"
+  local pid_file="${results_dir}/gr_pod_monitor.pid"
+
+  if [[ -f "${pid_file}" ]]; then
+    local pid
+    pid=$(cat "${pid_file}")
+    if kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+    fi
+    rm -f "${pid_file}"
+  fi
+  if [[ -f "${results_dir}/gr_pod_monitor_meta.txt" ]]; then
+    echo "GR_POD_MONITOR_END_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${results_dir}/gr_pod_monitor_meta.txt"
+  fi
+}
+
 _failover_snapshot_k8s_events() {
   local results_dir="${1:?results dir required}"
   local label="${2:?label required}"
@@ -492,6 +608,9 @@ start_failover_watchers() {
   fi
   if [[ "${edition}" == "advanced" ]]; then
     : > "${results_dir}/k8s_events.log"
+    if [[ "${FAILOVER_GR_POD_MONITOR:-1}" == "1" ]]; then
+      start_gr_pod_monitor "${results_dir}"
+    fi
   fi
 }
 
@@ -499,6 +618,7 @@ stop_failover_watchers() {
   local results_dir="${1:?results dir required}"
 
   stop_k8s_event_collector "${results_dir}"
+  stop_gr_pod_monitor "${results_dir}"
   if failover_monitor_enabled; then
     stop_primary_monitor "${results_dir}"
   fi
@@ -1075,6 +1195,7 @@ analyze_failover_metrics() {
 
   write_failover_extended_metrics "${results_dir}"
   write_failover_kpi "${results_dir}"
+  write_failover_promotion_breakdown "${results_dir}"
 
   echo "Analysis written: ${analysis_file}"
   echo "Metrics CSV:      ${csv_file}"
@@ -1385,6 +1506,269 @@ END {
 AWK
 
   echo "KPI CSV: ${kpi_csv}"
+}
+
+# Decompose primary_election_sec (TTD → GR PRIMARY + write on client VIP) into sub-phases.
+# Writes failover_promotion_breakdown.txt and failover_promotion_breakdown.csv
+write_failover_promotion_breakdown() {
+  local results_dir="${1:?results dir required}"
+  local monitor="${results_dir}/primary_monitor.tsv"
+  local gr_monitor="${results_dir}/gr_pod_monitor.tsv"
+  local timing_file="${results_dir}/sysbench_timing.txt"
+  local event_file="${results_dir}/failover_event.txt"
+  local txt_out="${results_dir}/failover_promotion_breakdown.txt"
+  local csv_out="${results_dir}/failover_promotion_breakdown.csv"
+
+  failover_defaults
+
+  [[ -f "${monitor}" ]] || return 0
+
+  local trigger_second edition
+  trigger_second=$(failover_trigger_second)
+  edition="unknown"
+  if [[ -f "${timing_file}" ]]; then
+    # shellcheck disable=SC1090
+    source "${timing_file}" 2>/dev/null || true
+    trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
+  fi
+  if [[ -f "${event_file}" ]]; then
+    edition=$(grep -E '^FAILOVER_EDITION=' "${event_file}" | tail -1 | cut -d= -f2- || echo "unknown")
+  fi
+
+  local monitor_offset=0
+  if [[ -f "${results_dir}/primary_monitor_meta.txt" && -f "${timing_file}" ]]; then
+    local monitor_start sysbench_ready
+    monitor_start=$(grep -E '^MONITOR_START_EPOCH=' "${results_dir}/primary_monitor_meta.txt" | cut -d= -f2- || true)
+    sysbench_ready=$(grep -E '^SYSBENCH_READY_EPOCH=' "${timing_file}" | cut -d= -f2- || true)
+    if [[ -n "${monitor_start}" && -n "${sysbench_ready}" ]]; then
+      monitor_offset=$(python3 -c "print('%.3f' % (float('${sysbench_ready}') - float('${monitor_start}')))")
+    fi
+  fi
+
+  local primary_before="N/A"
+  primary_before=$(analyze_primary_change "${monitor}" "" 2>/dev/null \
+    | grep '^PRIMARY_BEFORE=' | cut -d= -f2- || echo "N/A")
+
+  awk -v trigger="${trigger_second}" \
+      -v edition="${edition}" \
+      -v monitor="${monitor}" \
+      -v gr_monitor="${gr_monitor}" \
+      -v monitor_offset="${monitor_offset}" \
+      -v primary_before="${primary_before}" \
+      -v txt_out="${txt_out}" \
+      -v csv_out="${csv_out}" \
+      -f - <<'AWK'
+function monitor_gr_state(f) { return f[7] }
+function monitor_gr_role(f) {
+  if (length(f) >= 9 && f[8] != "" && f[8] != "ERROR") return f[8]
+  return ""
+}
+function monitor_write_ok(f) {
+  if (length(f) >= 10 && f[9] != "" && f[9] != "ERROR") return f[9] + 0
+  return -1
+}
+function is_primary_elected(f,    wo, role, gr) {
+  if (f[3] != "1") return 0
+  wo = monitor_write_ok(f)
+  if (wo != 1) return 0
+  role = monitor_gr_role(f)
+  gr = monitor_gr_state(f)
+  if (edition == "advanced") {
+    return (role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY"))
+  }
+  return 1
+}
+function fmt_sec(v) {
+  if (v < 0) return "NOT_DETECTED"
+  if (v < 1) return sprintf("%.3f", v)
+  if (v == int(v)) return sprintf("%d", v)
+  return sprintf("%.2f", v)
+}
+function fmt_phase(v) {
+  if (v < 0) return "NOT_REACHED"
+  return fmt_sec(v)
+}
+function phase_duration(end_rel, start_rel) {
+  if (end_rel < 0 || start_rel < 0) return -1
+  if (end_rel < start_rel) return -1
+  return end_rel - start_rel
+}
+function scan_ha_monitor(    line, f, sysbench_sec, host, wo) {
+  if (monitor == "" || ( (getline _ < monitor) <= 0 )) return
+  close(monitor)
+  while ((getline line < monitor) > 0) {
+    split(line, f, "\t")
+    if (f[1] == "timestamp_utc") continue
+    sysbench_sec = (f[2] + 0) - monitor_offset
+    host = f[4]
+    wo = monitor_write_ok(f)
+    if (primary_before == "N/A" && sysbench_sec < trigger && f[3] == "1" && host != "ERROR")
+      primary_before = host
+    if (sysbench_sec < trigger) continue
+    if (stale_ha_end < 0 && f[3] == "1" && host == primary_before && wo == 1)
+      stale_ha_end = sysbench_sec - trigger
+    if (ttd < 0 && f[3] != "1") {
+      ttd = sysbench_sec - trigger
+      continue
+    }
+    if (ttd < 0) continue
+    if (vip_connect < 0 && f[3] == "1") {
+      vip_connect = sysbench_sec - trigger
+      if (wo != 1) vip_connect_only = vip_connect
+    }
+    if (vip_connect_only < 0 && f[3] == "1" && wo != 1)
+      vip_connect_only = sysbench_sec - trigger
+    if (new_host < 0 && f[3] == "1" && host != "ERROR" && primary_before != "N/A" && host != primary_before)
+      new_host = sysbench_sec - trigger
+    if (gr_on_vip < 0 && is_primary_elected(f))
+      gr_on_vip = sysbench_sec - trigger
+    if (write_ok < 0 && is_primary_elected(f))
+      write_ok = sysbench_sec - trigger
+  }
+  close(monitor)
+}
+function scan_gr_pods(    line, f, sysbench_sec, rel, pod, role, state) {
+  if (gr_monitor == "" || ( (getline _ < gr_monitor) <= 0 )) return
+  close(gr_monitor)
+  while ((getline line < gr_monitor) > 0) {
+    split(line, f, "\t")
+    if (f[1] == "timestamp_utc") continue
+    if (f[4] != "1") continue
+    sysbench_sec = (f[2] + 0) - monitor_offset
+    if (sysbench_sec < trigger) continue
+    role = f[6]
+    state = f[7]
+    pod = f[3]
+    if (role == "PRIMARY" && (state == "ONLINE" || state == "PRIMARY")) {
+      rel = sysbench_sec - trigger
+      if (gr_pod_primary < 0 || rel < gr_pod_primary) {
+        gr_pod_primary = rel
+        gr_pod_primary_name = pod
+      }
+    }
+  }
+  close(gr_monitor)
+}
+function max_rel(a, b) {
+  if (a < 0) return b
+  if (b < 0) return a
+  return (a > b) ? a : b
+}
+function emit_csv_row(phase, anchor, time_abs, dur_ttd, desc) {
+  printf "%s,%s,%s,%s,\"%s\"\n", phase, anchor, fmt_sec(time_abs), fmt_phase(dur_ttd), desc >> csv_out
+}
+BEGIN {
+  ttd = -1
+  stale_ha_end = -1
+  vip_connect = -1
+  vip_connect_only = -1
+  new_host = -1
+  gr_on_vip = -1
+  write_ok = -1
+  gr_pod_primary = -1
+  gr_pod_primary_name = ""
+
+  scan_ha_monitor()
+  scan_gr_pods()
+
+  promote_total = phase_duration(write_ok, ttd)
+  vip_outage = phase_duration(vip_connect, ttd)
+  host_switch = phase_duration(new_host, vip_connect)
+  gr_on_vip_lag = phase_duration(gr_on_vip, (new_host >= 0 ? new_host : vip_connect))
+  write_lag = phase_duration(write_ok, gr_on_vip)
+  gr_election = gr_pod_primary
+  ha_after_gr = phase_duration(vip_connect, gr_pod_primary)
+  promote_gr_wait = -1
+  promote_ha_route = -1
+  if (ttd >= 0 && write_ok >= 0) {
+    if (gr_pod_primary >= 0) {
+      promote_gr_wait = (gr_pod_primary > ttd) ? gr_pod_primary - ttd : 0
+      promote_ha_route = write_ok - max_rel(gr_pod_primary, ttd)
+    }
+  }
+
+  print "phase,anchor,time_from_trigger_sec,duration_from_ttd_sec,description" > csv_out
+  emit_csv_row("stale_ha_routing", "trigger", stale_ha_end, -1,
+    "VIP still routed to old primary with writes OK (after trigger, before sustained outage)")
+  emit_csv_row("failure_detection_ttd", "trigger", ttd, 0,
+    "First connect failure on client VIP (connect_ok=0)")
+  emit_csv_row("gr_election_internal", "trigger", gr_pod_primary, phase_duration(gr_pod_primary, ttd),
+    "First GR PRIMARY+ONLINE on any mysql pod (direct kubectl exec, bypasses VIP)")
+  emit_csv_row("promote_gr_election_after_ttd", "ttd", gr_pod_primary, promote_gr_wait,
+    "Wait for GR PRIMARY after TTD (0 if GR elected before client detected failure)")
+  emit_csv_row("promote_ha_routing_to_primary", "ttd", write_ok, promote_ha_route,
+    "HA/operator routing: GR ready -> client VIP writable PRIMARY + write probe OK")
+  emit_csv_row("vip_outage", "ttd", vip_connect, vip_outage,
+    "Client VIP blackout (connect_ok=0 on HA endpoint)")
+  emit_csv_row("vip_connect_restored", "ttd", vip_connect, vip_outage,
+    "First TCP/MySQL connect succeeds on client VIP")
+  emit_csv_row("ha_routes_new_host", "ttd", new_host, phase_duration(new_host, ttd),
+    "VIP session lands on new mysql pod (hostname changed)")
+  emit_csv_row("gr_primary_on_vip", "ttd", gr_on_vip, phase_duration(gr_on_vip, ttd),
+    "GR PRIMARY+ONLINE visible through client VIP")
+  emit_csv_row("write_probe_ok", "ttd", write_ok, promote_total,
+    "Write probe INSERT succeeds on client VIP (end of promote metric)")
+  emit_csv_row("operator_ha_lag_after_gr", "ttd", vip_connect, ha_after_gr,
+    "VIP connect restored after internal GR election (operator + HAProxy lag)")
+  emit_csv_row("host_switch_after_connect", "ttd", new_host, host_switch,
+    "Delay from first VIP connect to routing to new pod")
+  emit_csv_row("write_accept_after_gr", "ttd", write_ok, write_lag,
+    "Delay from GR PRIMARY on VIP to write probe OK")
+  emit_csv_row("promote_total", "ttd", write_ok, promote_total,
+    "Total time to promote (same as primary_election_sec KPI)")
+
+  print "=== Failover Promotion Breakdown ===" > txt_out
+  print "Reference: seconds from failover trigger (sysbench second " trigger ")" >> txt_out
+  print "Primary before failover: " primary_before >> txt_out
+  if (gr_pod_primary_name != "") print "GR PRIMARY pod (internal): " gr_pod_primary_name >> txt_out
+  print "" >> txt_out
+  print "--- Phases (time to promote = TTD -> write probe OK) ---" >> txt_out
+  if (stale_ha_end >= 0)
+    printf "Stale HA routing (old primary still writable):  %s from trigger\n", fmt_sec(stale_ha_end) >> txt_out
+  else
+    print "Stale HA routing (old primary still writable):  none detected" >> txt_out
+  printf "TTD (first VIP connect failure):               %s\n", fmt_sec(ttd) >> txt_out
+  print "" >> txt_out
+  print "--- Promote = GR election (after TTD) + HA routing (sum = time to promote) ---" >> txt_out
+  if (gr_pod_primary >= 0 && promote_gr_wait >= 0 && promote_ha_route >= 0) {
+    printf "  GR election after TTD:                       %s\n", fmt_phase(promote_gr_wait) >> txt_out
+    printf "  HA routing to writable primary on VIP:       %s\n", fmt_phase(promote_ha_route) >> txt_out
+    printf "  (GR PRIMARY at %s from trigger", fmt_sec(gr_pod_primary) >> txt_out
+    if (gr_pod_primary_name != "") printf " on %s", gr_pod_primary_name >> txt_out
+    print ")" >> txt_out
+  } else if (promote_total >= 0) {
+    print "  GR + HA split: NOT_COLLECTED (need gr_pod_monitor.tsv from Advanced run)" >> txt_out
+    printf "  VIP-only promote window:                     %s\n", fmt_phase(promote_total) >> txt_out
+  }
+  print "" >> txt_out
+  print "Sub-phases after TTD (detail):" >> txt_out
+  if (gr_pod_primary >= 0)
+    printf "  GR election (internal, any pod):             %s  (+%s from TTD)\n", fmt_sec(gr_pod_primary), fmt_phase(phase_duration(gr_pod_primary, ttd)) >> txt_out
+  else
+    print "  GR election (internal, any pod):             NOT_COLLECTED (enable FAILOVER_GR_POD_MONITOR=1)" >> txt_out
+  if (ha_after_gr >= 0)
+    printf "  Operator + HAProxy lag (GR -> VIP connect):  %s\n", fmt_phase(ha_after_gr) >> txt_out
+  else if (gr_pod_primary >= 0 && vip_connect < 0)
+    print "  Operator + HAProxy lag (GR -> VIP connect):  NOT_REACHED (VIP never restored)" >> txt_out
+  printf "  VIP outage (connect_ok=0):                   %s\n", fmt_phase(vip_outage) >> txt_out
+  if (host_switch >= 0)
+    printf "  HA route to new host (after connect):        %s\n", fmt_phase(host_switch) >> txt_out
+  else if (new_host >= 0)
+    print "  HA route to new host (after connect):        0 (same tick as connect)" >> txt_out
+  if (write_lag >= 0)
+    printf "  Write accept after GR PRIMARY on VIP:        %s\n", fmt_phase(write_lag) >> txt_out
+  else if (write_ok >= 0)
+    print "  Write accept after GR PRIMARY on VIP:        0 (same tick as GR PRIMARY)" >> txt_out
+  print "" >> txt_out
+  printf "Time to promote new primary (total):           %s from TTD\n", fmt_phase(promote_total) >> txt_out
+  print "" >> txt_out
+  print "CSV: " csv_out >> txt_out
+  print "Note: 1s monitor grid + 1s connect timeout quantize timings by up to ~2s." >> txt_out
+}
+AWK
+
+  echo "Promotion breakdown: ${txt_out}"
+  echo "Promotion breakdown CSV: ${csv_out}"
 }
 
 run_failover_tpcc_check() {
@@ -1948,6 +2332,7 @@ reanalyze_failover_scenario() {
 
   write_failover_kpi "${scenario_dir}"
   write_failover_extended_metrics "${scenario_dir}"
+  write_failover_promotion_breakdown "${scenario_dir}"
   return 0
 }
 

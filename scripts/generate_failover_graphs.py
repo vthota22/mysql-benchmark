@@ -454,6 +454,7 @@ def _before_after_throughput_table_html(bundle: dict) -> str:
     trigger = float(bundle.get("trigger", 0))
     parsed = bundle.get("parsed", {})
     kpi = bundle.get("kpi", {})
+    extended = bundle.get("extended", {})
 
     before_tps, before_qps, before_lat = _resolve_baseline_metrics(parsed, rows, trigger)
     promote_sec = _parse_kpi_sec(kpi.get("total_failover_sec")) or _parse_kpi_sec(
@@ -1094,6 +1095,230 @@ def _metrics_summary_html(
     )
 
 
+def load_promotion_breakdown(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, str]] = []
+    with path.open(newline="", encoding="utf-8", errors="replace") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            rows.append(dict(row))
+    return rows
+
+
+def _breakdown_cell_time(raw: str) -> str:
+    if raw in {"", "N/A", "NOT_DETECTED", "NOT_REACHED"}:
+        return "N/A"
+    return _format_duration_sec(raw)
+
+
+def _breakdown_cell_duration(raw: str) -> str:
+    if raw in {"", "N/A", "NOT_DETECTED", "NOT_REACHED"}:
+        return "N/A"
+    if raw in {"0", "0.0", "0.00", "0.000"}:
+        return "0 s"
+    return _format_duration_sec(raw)
+
+
+# Ordered phases for the HTML promotion breakdown table.
+PROMOTION_BREAKDOWN_PHASES: list[tuple[str, str, str]] = [
+    (
+        "stale_ha_routing",
+        "Stale HA routing",
+        "VIP still served writes from old primary after trigger (before sustained outage)",
+    ),
+    (
+        "failure_detection_ttd",
+        "Time to detect failure (TTD)",
+        "First connect failure on client VIP (connect_ok=0)",
+    ),
+    (
+        "gr_election_internal",
+        "GR election (internal)",
+        "First GR PRIMARY+ONLINE on any mysql pod (direct pod poll, bypasses VIP)",
+    ),
+    (
+        "operator_ha_lag_after_gr",
+        "Operator + HAProxy lag",
+        "VIP connect restored after internal GR election (operator endpoint + HA routing)",
+    ),
+    (
+        "vip_outage",
+        "Client VIP outage",
+        "Client path down: connect_ok=0 on HA endpoint (blackout after TTD)",
+    ),
+    (
+        "vip_connect_restored",
+        "VIP connect restored",
+        "First successful TCP/MySQL connect on client VIP after TTD",
+    ),
+    (
+        "ha_routes_new_host",
+        "HA routes to new pod",
+        "Client VIP session lands on new mysql pod (hostname changed)",
+    ),
+    (
+        "gr_primary_on_vip",
+        "GR PRIMARY on VIP",
+        "GR PRIMARY+ONLINE visible through client VIP path",
+    ),
+    (
+        "write_probe_ok",
+        "Accept new writes",
+        "Write probe INSERT succeeds on client VIP (promotion complete)",
+    ),
+    (
+        "promote_total",
+        "Time to promote new primary (total)",
+        "TTD → write probe OK (same as Failover metrics KPI)",
+    ),
+]
+
+
+def _promotion_split_summary_html(by_phase: dict[str, str]) -> str:
+    """Two-part promote split: GR election (after TTD) + HA routing = total promote."""
+    gr_row = by_phase.get("promote_gr_election_after_ttd", {})
+    ha_row = by_phase.get("promote_ha_routing_to_primary", {})
+    total_row = by_phase.get("promote_total", {})
+    gr_dur = gr_row.get("duration_from_ttd_sec", "")
+    ha_dur = ha_row.get("duration_from_ttd_sec", "")
+    total_dur = total_row.get("duration_from_ttd_sec", "")
+    gr_internal = by_phase.get("gr_election_internal", {}).get("time_from_trigger_sec", "")
+
+    if gr_dur in {"", "NOT_REACHED", "NOT_DETECTED"} or ha_dur in {"", "NOT_REACHED", "NOT_DETECTED"}:
+        vip_dur = by_phase.get("vip_outage", {}).get("duration_from_ttd_sec", total_dur)
+        return f"""
+      <p class="muted" style="margin:0 0 0.75rem">
+        <strong>Promote = GR election (internal) + HA routing</strong> requires
+        <code>gr_pod_monitor.tsv</code> (Advanced runs with <code>FAILOVER_GR_POD_MONITOR=1</code>).
+        Reanalyze after a new run, or see VIP-only window below.
+      </p>
+      <table class="metrics promotion-breakdown">
+        <thead><tr><th>Component</th><th>Duration (from TTD)</th></tr></thead>
+        <tbody>
+          <tr><td class="phase-name-cell"><div class="metric-title">Client VIP promote window</div>
+            <div class="metric-help">Full promote time without GR/HA split (connect failure → write OK)</div></td>
+            <td class="num">{html.escape(_breakdown_cell_duration(vip_dur if vip_dur not in {"", "NOT_REACHED"} else total_dur))}</td></tr>
+        </tbody>
+      </table>
+        """
+
+    gr_at = _breakdown_cell_time(gr_internal)
+    rows = [
+        (
+            "GR election (internal)",
+            "Wait for GR PRIMARY+ONLINE on a mysql pod (direct pod poll). "
+            "0 s if GR finished before TTD.",
+            _breakdown_cell_duration(gr_dur),
+            gr_at,
+        ),
+        (
+            "HA routing to writable primary",
+            "Operator + HAProxy: GR ready → client VIP sees PRIMARY + write probe OK.",
+            _breakdown_cell_duration(ha_dur),
+            "—",
+        ),
+        (
+            "Time to promote (total)",
+            "Sum of above (= KPI primary_election_sec).",
+            _breakdown_cell_duration(total_dur),
+            _breakdown_cell_time(total_row.get("time_from_trigger_sec", "N/A")),
+        ),
+    ]
+    body = []
+    for i, (title, help_text, dur, at_trig) in enumerate(rows):
+        cls = ' class="row-total"' if i == len(rows) - 1 else ""
+        if i == 0:
+            body.append(
+                f"<tr{cls}><td class=\"phase-name-cell\"><div class=\"metric-title\">{html.escape(title)}</div>"
+                f'<div class="metric-help">{html.escape(help_text)}</div></td>'
+                f'<td class="num">{html.escape(dur)}</td>'
+                f'<td class="num">{html.escape(at_trig)}</td></tr>'
+            )
+        else:
+            body.append(
+                f"<tr{cls}><td class=\"phase-name-cell\"><div class=\"metric-title\">{html.escape(title)}</div>"
+                f'<div class="metric-help">{html.escape(help_text)}</div></td>'
+                f'<td class="num">{html.escape(dur)}</td>'
+                f'<td class="num">—</td></tr>'
+            )
+    return f"""
+      <p class="muted" style="margin:0 0 0.5rem">
+        <strong>Promote (from TTD)</strong> = GR election (internal) + HA routing to writable primary on VIP.
+      </p>
+      <table class="metrics promotion-breakdown" style="margin-bottom:1.25rem">
+        <thead><tr><th>Component</th><th>Duration (from TTD)</th><th>GR at (from trigger)</th></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>
+    """
+
+
+def _promotion_breakdown_html(scenario_dir: Path) -> str:
+    breakdown_rows = load_promotion_breakdown(scenario_dir / "failover_promotion_breakdown.csv")
+    if not breakdown_rows:
+        return (
+            '<p class="muted">No promotion breakdown yet. Re-run analysis or '
+            '<code>./reanalyze_failover.sh</code> on this scenario.</p>'
+        )
+
+    by_phase = {row.get("phase", ""): row for row in breakdown_rows}
+    summary_html = _promotion_split_summary_html(by_phase)
+
+    detail_phases = [
+        k for k, _, _ in PROMOTION_BREAKDOWN_PHASES
+        if k not in {
+            "promote_gr_election_after_ttd",
+            "promote_ha_routing_to_primary",
+            "operator_ha_lag_after_gr",
+            "host_switch_after_connect",
+            "write_accept_after_gr",
+            "vip_connect_restored",
+            "write_probe_ok",
+        }
+    ]
+    body_rows: list[str] = []
+    for phase_key in detail_phases:
+        title_help = next((t, h) for k, t, h in PROMOTION_BREAKDOWN_PHASES if k == phase_key)
+        title, help_text = title_help
+        row = by_phase.get(phase_key, {})
+        anchor = row.get("anchor", "")
+        anchor_label = "Failover trigger" if anchor == "trigger" else "First connect failure (TTD)"
+        at_trigger = _breakdown_cell_time(row.get("time_from_trigger_sec", "N/A"))
+        dur_ttd = _breakdown_cell_duration(row.get("duration_from_ttd_sec", "N/A"))
+        if phase_key in ("failure_detection_ttd", "stale_ha_routing"):
+            dur_ttd = "—"
+        row_class = ' class="row-total"' if phase_key == "promote_total" else ""
+        body_rows.append(
+            f"<tr{row_class}>"
+            f'<td class="phase-name-cell"><div class="metric-title">{html.escape(title)}</div>'
+            f'<div class="metric-help">{html.escape(help_text)}</div></td>'
+            f'<td>{html.escape(anchor_label)}</td>'
+            f'<td class="num">{html.escape(at_trigger)}</td>'
+            f'<td class="num">{html.escape(dur_ttd)}</td>'
+            f"</tr>"
+        )
+
+    return f"""
+      {summary_html}
+      <h3 style="font-size:0.92rem;color:var(--accent);margin:0 0 0.5rem">Detail timeline</h3>
+      <table class="metrics promotion-breakdown">
+        <thead>
+          <tr>
+            <th>Phase</th>
+            <th>Anchor</th>
+            <th>At (from trigger)</th>
+            <th>Duration (from TTD)</th>
+          </tr>
+        </thead>
+        <tbody>{''.join(body_rows)}</tbody>
+      </table>
+      <p class="muted" style="margin:0.75rem 0 0">
+        Full log: <code>failover_promotion_breakdown.txt</code>
+        · 1s monitor grid quantizes sub-second steps.
+      </p>
+    """
+
+
 def generate_html_report(
     edition_dir: Path,
     rows: list[dict[str, float]],
@@ -1215,6 +1440,12 @@ def generate_html_report(
     table.metrics tbody tr:last-child td {{ border-bottom: none; }}
     table.metrics td.metric-name-cell {{ width: 55%; padding-right: 1rem; }}
     table.metrics td.metric-value-cell {{ font-variant-numeric: tabular-nums; }}
+    table.promotion-breakdown td.phase-name-cell {{ width: 42%; }}
+    table.promotion-breakdown td.num {{ font-variant-numeric: tabular-nums; white-space: nowrap; }}
+    table.promotion-breakdown tr.row-total td {{
+      background: rgba(56, 189, 248, 0.10); font-weight: 600;
+    }}
+    table.promotion-breakdown tr.row-total .metric-title {{ color: #38bdf8; }}
     .metric-title {{ font-weight: 600; color: var(--accent); margin-bottom: 0.25rem; }}
     .metric-value {{ font-size: 1.05rem; color: var(--text); margin-bottom: 0.15rem; }}
     .metric-sub {{ color: var(--muted); font-size: 0.82rem; margin-bottom: 0.2rem; }}
@@ -1274,11 +1505,15 @@ def generate_html_report(
       </div>
       <div class="card">
         <h2>Metrics before vs after failover</h2>
-        {_before_after_throughput_table_html({"rows": rows, "trigger": trigger, "parsed": parsed, "kpi": kpi})}
+        {_before_after_throughput_table_html({"rows": rows, "trigger": trigger, "parsed": parsed, "kpi": kpi, "extended": extended})}
       </div>
       <div class="card">
         <h2>Failover metrics</h2>
         {_metrics_summary_html(kpi, extended, primary, parsed)}
+      </div>
+      <div class="card">
+        <h2>Time to promote — phase breakdown</h2>
+        {_promotion_breakdown_html(edition_dir)}
       </div>
       <div class="card">
         <h2>Errors &amp; reconnects</h2>
@@ -1406,6 +1641,7 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
                 metrics_html = _metrics_summary_html(
                     bundle["kpi"], bundle["extended"], bundle["primary"], bundle["parsed"]
                 )
+                breakdown_html = _promotion_breakdown_html(Path(bundle["dir"]))
                 monitor_html = _monitor_trigger_table_html(Path(bundle["dir"]), bundle)
                 compare_html = _before_after_throughput_table_html(bundle)
                 chart_payload[key] = bundle["chart_data"]
@@ -1422,6 +1658,7 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
                     f'<div class="card"><h2>Primary transition at trigger</h2>{monitor_html}</div>'
                     f'<div class="card"><h2>Metrics before vs after failover</h2>{compare_html}</div>'
                     f'<div class="card"><h2>Failover metrics</h2>{metrics_html}</div>'
+                    f'<div class="card"><h2>Time to promote — phase breakdown</h2>{breakdown_html}</div>'
                     f'<div class="card"><h2>Errors &amp; reconnects</h2><div class="chart-wrap">'
                     f'<canvas id="errors_{panel_id}"></canvas></div></div>'
                     f"</div></div></div>"
@@ -1505,6 +1742,12 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
     table.metrics tbody tr:last-child td {{ border-bottom: none; }}
     table.metrics td.metric-name-cell {{ width: 55%; padding-right: 1rem; }}
     table.metrics td.metric-value-cell {{ font-variant-numeric: tabular-nums; }}
+    table.promotion-breakdown td.phase-name-cell {{ width: 42%; }}
+    table.promotion-breakdown td.num {{ font-variant-numeric: tabular-nums; white-space: nowrap; }}
+    table.promotion-breakdown tr.row-total td {{
+      background: rgba(56, 189, 248, 0.10); font-weight: 600;
+    }}
+    table.promotion-breakdown tr.row-total .metric-title {{ color: #38bdf8; }}
     .metric-title {{ font-weight: 600; color: var(--accent); margin-bottom: 0.25rem; }}
     .metric-value {{ font-size: 1.05rem; color: var(--text); margin-bottom: 0.15rem; }}
     .metric-sub {{ color: var(--muted); font-size: 0.82rem; margin-bottom: 0.2rem; }}

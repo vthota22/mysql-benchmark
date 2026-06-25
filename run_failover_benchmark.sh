@@ -140,6 +140,7 @@ run_failover_scenario() {
   echo "  Analysis:         ${scenario_dir}/failover_analysis.txt"
   echo "  KPI CSV:          ${scenario_dir}/failover_kpi.csv"
   echo "  Extended metrics: ${scenario_dir}/failover_extended_metrics.txt"
+  echo "  Promotion breakdown: ${scenario_dir}/failover_promotion_breakdown.txt"
   echo "  Metrics CSV:      ${scenario_dir}/failover_metrics.csv"
   echo "  Time series:      ${scenario_dir}/failover_timeseries.csv"
   echo "  Graphs:           ${scenario_dir}/graphs/"
