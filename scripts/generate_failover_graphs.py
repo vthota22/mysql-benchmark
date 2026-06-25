@@ -677,7 +677,7 @@ def _monitor_trigger_table_html(scenario_dir: Path, bundle: dict) -> str:
     primary_after = bundle.get("primary", {}).get("PRIMARY_AFTER", "")
     scenario = bundle.get("scenario", "")
     event = bundle.get("event", {})
-    trigger_utc = event.get("FAILOVER_TRIGGER_UTC") or event.get("FAILOVER_POD_DELETE_UTC", "")
+    trigger_utc = event.get("FAILOVER_TRIGGER_UTC") or event.get("FAILOVER_POD_DELETE_UTC") or event.get("FAILOVER_MYSQLD_KILL_UTC", "")
     target_pod = event.get("FAILOVER_TARGET_POD", primary_before)
 
     if not monitor_rows:

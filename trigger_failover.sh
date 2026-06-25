@@ -37,6 +37,7 @@ init_failover_event_stub() {
   echo "FAILOVER_EDITION=${EDITION}" >> "${EVENT_FILE}"
   echo "FAILOVER_TRIGGER_ENABLED=${FAILOVER_TRIGGER_ENABLED:-1}" >> "${EVENT_FILE}"
   echo "FAILOVER_POD_DELETE=${FAILOVER_POD_DELETE:-${FAILOVER_TRIGGER_ENABLED:-1}}" >> "${EVENT_FILE}"
+  echo "FAILOVER_ADVANCED_TRIGGER_METHOD=${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}" >> "${EVENT_FILE}"
 }
 
 record_trigger_skipped() {
@@ -335,9 +336,49 @@ _advanced_failover_delete_pod() {
   log_failover_do_events "${RESULTS_DIR}" "advanced" "post_delete"
 }
 
+_advanced_failover_kill_mysqld() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local pod="${2:?pod required}"
+  local ns="${3:?namespace required}"
+  local container="${ADVANCED_K8S_MYSQL_CONTAINER:-mysql}"
+  local signal="${FAILOVER_MYSQLD_KILL_SIGNAL:-9}"
+
+  echo "FAILOVER_METHOD=kubectl_kill_mysqld" >> "${EVENT_FILE}"
+  echo "FAILOVER_MYSQLD_KILL_SIGNAL=${signal}" >> "${EVENT_FILE}"
+  echo "FAILOVER_MYSQLD_KILL_CONTAINER=${container}" >> "${EVENT_FILE}"
+  echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
+  echo "FAILOVER_MYSQLD_KILL_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
+  echo "FAILOVER_TARGET_POD=${pod}" >> "${EVENT_FILE}"
+
+  local kubectl=(kubectl --kubeconfig="${kubeconfig}")
+  if [[ -n "${ADVANCED_K8S_CONTEXT:-}" ]]; then
+    kubectl+=(--context="${ADVANCED_K8S_CONTEXT}")
+  fi
+
+  echo "Killing mysqld in primary pod ${pod} (namespace=${ns}, container=${container}, signal=${signal})..." \
+    | tee -a "${TRIGGER_LOG}"
+  echo "Command: kubectl exec -n ${ns} ${pod} -c ${container} -- kill -${signal} \$(pidof mysqld)" \
+    >> "${TRIGGER_LOG}"
+
+  _failover_snapshot_k8s_events "${RESULTS_DIR}" "pre_mysqld_kill"
+  log_failover_do_events "${RESULTS_DIR}" "advanced" "pre_mysqld_kill"
+
+  "${kubectl[@]}" exec -n "${ns}" "${pod}" -c "${container}" -- \
+    sh -c "kill -${signal} \$(pidof mysqld) 2>/dev/null || kill -${signal} 1" \
+    2>&1 | tee -a "${TRIGGER_LOG}"
+
+  echo "mysqld kill issued at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${TRIGGER_LOG}"
+  _failover_snapshot_k8s_events "${RESULTS_DIR}" "post_mysqld_kill"
+  log_failover_do_events "${RESULTS_DIR}" "advanced" "post_mysqld_kill"
+}
+
 prepare_advanced_failover_trigger() {
-  if ! failover_pod_delete_enabled; then
-    record_trigger_skipped "FAILOVER_POD_DELETE=0 (load-only control run)"
+  if ! failover_advanced_trigger_active; then
+    if ! failover_trigger_enabled; then
+      record_trigger_skipped "FAILOVER_TRIGGER_ENABLED=0"
+    else
+      record_trigger_skipped "FAILOVER_POD_DELETE=0 (load-only control run)"
+    fi
     return 0
   fi
 
@@ -373,24 +414,40 @@ refresh_advanced_failover_trigger() {
   pod=$(find_advanced_primary_pod "${FAILOVER_KUBECONFIG}")
   write_failover_prepared_env "${FAILOVER_KUBECONFIG}" "${pod}" "${FAILOVER_K8S_NAMESPACE}" \
     "${FAILOVER_POD_DELETE_FORCE:-1}" "${FAILOVER_POD_DELETE_GRACE_SEC:-0}"
-  echo "Refreshed primary pod for delete: ${pod} at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${TRIGGER_LOG}"
+  echo "Refreshed primary pod for trigger: ${pod} at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${TRIGGER_LOG}"
 }
 
 fire_advanced_failover_trigger() {
-  if ! failover_pod_delete_enabled; then
-    record_trigger_skipped "FAILOVER_POD_DELETE=0 (load-only control run)"
+  if ! failover_advanced_trigger_active; then
+    if ! failover_trigger_enabled; then
+      record_trigger_skipped "FAILOVER_TRIGGER_ENABLED=0"
+    else
+      record_trigger_skipped "FAILOVER_POD_DELETE=0 (load-only control run)"
+    fi
     return 0
   fi
 
   load_failover_prepared_env
 
-  local pod
+  local pod method
   pod=$(find_advanced_primary_pod "${FAILOVER_KUBECONFIG}")
   write_failover_prepared_env "${FAILOVER_KUBECONFIG}" "${pod}" "${FAILOVER_K8S_NAMESPACE}" \
     "${FAILOVER_POD_DELETE_FORCE:-1}" "${FAILOVER_POD_DELETE_GRACE_SEC:-0}"
 
-  _advanced_failover_delete_pod "${FAILOVER_KUBECONFIG}" "${pod}" "${FAILOVER_K8S_NAMESPACE}" \
-    "${FAILOVER_POD_DELETE_FORCE:-1}" "${FAILOVER_POD_DELETE_GRACE_SEC:-0}"
+  method="$(failover_advanced_trigger_method)"
+  case "${method}" in
+    pod_delete)
+      _advanced_failover_delete_pod "${FAILOVER_KUBECONFIG}" "${pod}" "${FAILOVER_K8S_NAMESPACE}" \
+        "${FAILOVER_POD_DELETE_FORCE:-1}" "${FAILOVER_POD_DELETE_GRACE_SEC:-0}"
+      ;;
+    mysqld_kill)
+      _advanced_failover_kill_mysqld "${FAILOVER_KUBECONFIG}" "${pod}" "${FAILOVER_K8S_NAMESPACE}"
+      ;;
+    *)
+      echo "ERROR: Unknown FAILOVER_ADVANCED_TRIGGER_METHOD=${method}" >&2
+      return 1
+      ;;
+  esac
 }
 
 trigger_advanced_failover() {

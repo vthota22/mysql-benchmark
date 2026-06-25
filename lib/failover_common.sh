@@ -33,9 +33,12 @@ failover_defaults() {
   : "${FAILOVER_RUN_TPCC_CHECK:=0}"
   : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011}"
   : "${FAILOVER_TRIGGER_ENABLED:=1}"
+  : "${FAILOVER_ADVANCED_TRIGGER_METHOD:=pod_delete}"
   : "${FAILOVER_POD_DELETE:=${FAILOVER_TRIGGER_ENABLED}}"
   : "${FAILOVER_POD_DELETE_FORCE:=1}"
   : "${FAILOVER_POD_DELETE_GRACE_SEC:=0}"
+  : "${FAILOVER_MYSQLD_KILL_SIGNAL:=9}"
+  : "${ADVANCED_K8S_MYSQL_CONTAINER:=mysql}"
   # Advanced: fetch kubeconfig early; re-resolve primary pod this many seconds before delete
   : "${FAILOVER_TRIGGER_PREPARE_SEC:=5}"
   : "${FAILOVER_SCENARIOS:=mixed write_only}"
@@ -168,6 +171,25 @@ failover_trigger_enabled() {
 failover_pod_delete_enabled() {
   failover_defaults
   [[ "${FAILOVER_POD_DELETE}" == "1" ]]
+}
+
+failover_advanced_trigger_method() {
+  failover_defaults
+  echo "${FAILOVER_ADVANCED_TRIGGER_METHOD}"
+}
+
+# Advanced kubectl-based trigger (pod delete or mysqld kill inside primary pod).
+failover_advanced_trigger_active() {
+  failover_defaults
+  failover_trigger_enabled || return 1
+  case "$(failover_advanced_trigger_method)" in
+    pod_delete) failover_pod_delete_enabled ;;
+    mysqld_kill) return 0 ;;
+    *)
+      echo "ERROR: Unknown FAILOVER_ADVANCED_TRIGGER_METHOD=$(failover_advanced_trigger_method) (use pod_delete or mysqld_kill)" >&2
+      return 1
+      ;;
+  esac
 }
 
 failover_total_runtime_sec() {
@@ -798,7 +820,7 @@ sleep_until_failover_trigger_early() {
   local prep_sec="${FAILOVER_TRIGGER_PREPARE_SEC:-5}"
   local early=$((delay - prep_sec))
   (( early < 0 )) && early=0
-  echo "Waiting ${early}s until final primary resolution (${prep_sec}s before pod delete at second ${delay})..."
+  echo "Waiting ${early}s until final primary resolution (${prep_sec}s before failover trigger at second ${delay})..."
   sleep "${early}"
 }
 
@@ -806,7 +828,7 @@ sleep_until_failover_trigger_early() {
 sleep_until_failover_trigger_final_gap() {
   failover_defaults
   local prep_sec="${FAILOVER_TRIGGER_PREPARE_SEC:-5}"
-  echo "Final ${prep_sec}s before instant pod delete (trigger second)..."
+  echo "Final ${prep_sec}s before instant failover trigger (trigger second)..."
   sleep "${prep_sec}"
 }
 

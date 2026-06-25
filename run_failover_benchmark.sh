@@ -54,7 +54,11 @@ echo "Editions: ${FAILOVER_EDITIONS}"
 echo "Reconnect: mysql-ignore-errors=${FAILOVER_MYSQL_IGNORE_ERRORS}"
 echo "Monitor:   primary=${FAILOVER_MONITOR_PRIMARY:-1} k8s_events=${FAILOVER_COLLECT_K8S_EVENTS:-1}"
 if failover_trigger_enabled; then
-  echo "Trigger:  enabled (FAILOVER_TRIGGER_ENABLED=1, pod delete=${FAILOVER_POD_DELETE})"
+  if [[ "${FAILOVER_EDITIONS}" == *advanced* ]]; then
+    echo "Trigger:  enabled (method=${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}, pod delete=${FAILOVER_POD_DELETE})"
+  else
+    echo "Trigger:  enabled (FAILOVER_TRIGGER_ENABLED=1)"
+  fi
 else
   echo "Trigger:  DISABLED — load-only control run (FAILOVER_TRIGGER_ENABLED=0)"
 fi
@@ -90,7 +94,7 @@ run_failover_scenario() {
     return 1
   fi
 
-  if [[ "${edition}" == "advanced" ]] && failover_pod_delete_enabled && failover_trigger_enabled; then
+  if [[ "${edition}" == "advanced" ]] && failover_advanced_trigger_active; then
     : > "${scenario_dir}/failover_trigger.log"
     echo "--- Preparing failover trigger (kubeconfig, kubectl, primary pod) ---"
     BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${scenario_dir}" prepare \
@@ -98,7 +102,7 @@ run_failover_scenario() {
   fi
 
   echo "--- Baseline load period, then failover trigger ---"
-  if [[ "${edition}" == "advanced" ]] && failover_pod_delete_enabled && failover_trigger_enabled; then
+  if [[ "${edition}" == "advanced" ]] && failover_advanced_trigger_active; then
     sleep_until_failover_trigger_early
   else
     sleep_until_failover_trigger
@@ -109,7 +113,7 @@ run_failover_scenario() {
   else
     echo "--- Failover trigger skipped (FAILOVER_TRIGGER_ENABLED=0) — recording trigger time only ---"
   fi
-  if [[ "${edition}" == "advanced" ]] && failover_pod_delete_enabled && failover_trigger_enabled; then
+  if [[ "${edition}" == "advanced" ]] && failover_advanced_trigger_active; then
     BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${scenario_dir}" refresh \
       2>&1 | tee -a "${scenario_dir}/failover_trigger.log"
     sleep_until_failover_trigger_final_gap
@@ -171,11 +175,21 @@ run_failover_edition() {
     if [[ "${edition}" == "standard" ]]; then
       echo "${FAILOVER_STANDARD_TRIGGER_METHOD:-install_update}"
     else
-      if [[ "${FAILOVER_POD_DELETE_FORCE:-1}" == "1" ]]; then
-        echo "kubectl_delete_pod_force (grace-period=${FAILOVER_POD_DELETE_GRACE_SEC:-0})"
-      else
-        echo "kubectl_delete_pod (grace-period=${FAILOVER_POD_DELETE_GRACE_SEC:-30})"
-      fi
+      case "${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}" in
+        mysqld_kill)
+          echo "kubectl_kill_mysqld (signal=${FAILOVER_MYSQLD_KILL_SIGNAL:-9}, container=${ADVANCED_K8S_MYSQL_CONTAINER:-mysql})"
+          ;;
+        pod_delete)
+          if [[ "${FAILOVER_POD_DELETE_FORCE:-1}" == "1" ]]; then
+            echo "kubectl_delete_pod_force (grace-period=${FAILOVER_POD_DELETE_GRACE_SEC:-0})"
+          else
+            echo "kubectl_delete_pod (grace-period=${FAILOVER_POD_DELETE_GRACE_SEC:-30})"
+          fi
+          ;;
+        *)
+          echo "${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}"
+          ;;
+      esac
     fi
   )"
   echo ""
