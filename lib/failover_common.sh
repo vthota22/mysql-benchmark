@@ -587,6 +587,187 @@ stop_gr_pod_monitor() {
   fi
 }
 
+_failover_snapshot_operator_logs() {
+  local results_dir="${1:?results dir required}"
+  local since_utc="${2:-}"
+
+  [[ "${FAILOVER_COLLECT_OPERATOR_LOGS:-1}" == "1" ]] || return 0
+  [[ -n "${since_utc}" ]] || return 0
+  command -v kubectl >/dev/null 2>&1 || return 0
+
+  local kubeconfig="${results_dir}/kubeconfig"
+  if [[ ! -f "${kubeconfig}" && -n "${ADVANCED_KUBECONFIG_PATH:-}" && -f "${ADVANCED_KUBECONFIG_PATH}" ]]; then
+    kubeconfig="${ADVANCED_KUBECONFIG_PATH}"
+  fi
+  [[ -f "${kubeconfig}" ]] || return 0
+
+  local ns="${ADVANCED_K8S_NAMESPACE:-percona}"
+  local out_file="${results_dir}/operator_failover.log"
+  local -a kubectl=()
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+  local label="app.kubernetes.io/name=percona-server-mysql-operator"
+  local -a operator_pods=()
+
+  while IFS= read -r pod; do
+    [[ -n "${pod}" ]] && operator_pods+=("${pod}")
+  done < <("${kubectl[@]}" get pods -n "${ns}" -l "${label}" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+
+  {
+    echo "=== Operator logs since ${since_utc} @ $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+    if ((${#operator_pods[@]} > 0)); then
+      local pod
+      for pod in "${operator_pods[@]}"; do
+        echo "=== pod/${pod} ==="
+        "${kubectl[@]}" logs -n "${ns}" "${pod}" \
+          --since-time="${since_utc}" --timestamps 2>&1 || true
+        echo ""
+      done
+    else
+      "${kubectl[@]}" logs -n "${ns}" -l "${label}" \
+        --since-time="${since_utc}" --timestamps 2>&1 || true
+    fi
+    echo ""
+  } > "${out_file}"
+
+  if ! grep -qiE 'groupReplicationStatus|Assigning primary label' "${out_file}" 2>/dev/null; then
+    {
+      echo "=== Operator logs (all namespaces) since ${since_utc} ==="
+      "${kubectl[@]}" logs -A -l "${label}" \
+        --since-time="${since_utc}" --timestamps --max-log-requests=10 2>&1 || true
+      echo ""
+    } >> "${out_file}"
+  fi
+}
+
+_failover_snapshot_mysql_gr_logs() {
+  local results_dir="${1:?results dir required}"
+  local since_utc="${2:-}"
+
+  [[ -n "${since_utc}" ]] || return 0
+  command -v kubectl >/dev/null 2>&1 || return 0
+
+  local kubeconfig="${results_dir}/kubeconfig"
+  if [[ ! -f "${kubeconfig}" && -n "${ADVANCED_KUBECONFIG_PATH:-}" && -f "${ADVANCED_KUBECONFIG_PATH}" ]]; then
+    kubeconfig="${ADVANCED_KUBECONFIG_PATH}"
+  fi
+  [[ -f "${kubeconfig}" ]] || return 0
+
+  local ns="${ADVANCED_K8S_NAMESPACE:-percona}"
+  local -a kubectl pod
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+
+  while IFS= read -r pod; do
+    [[ -n "${pod}" ]] || continue
+    {
+      echo "=== MySQL GR logs: ${pod} since ${since_utc} @ $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+      "${kubectl[@]}" logs -n "${ns}" "${pod}" -c mysql \
+        --since-time="${since_utc}" --timestamps 2>&1 || true
+      echo ""
+    } > "${results_dir}/mysql_gr_election_${pod}.log"
+  done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
+}
+
+_failover_parse_gr_election_from_mysql_logs() {
+  local results_dir="${1:?results dir required}"
+  local trigger_utc="${2:?trigger utc required}"
+  local out_env="${results_dir}/gr_election_internal.env"
+
+  python3 - "${trigger_utc}" "${results_dir}" "${out_env}" <<'PY'
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+trigger_utc = sys.argv[1]
+results_dir = Path(sys.argv[2])
+out_env = Path(sys.argv[3])
+trigger = datetime.fromisoformat(trigger_utc.replace("Z", "+00:00"))
+
+ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)")
+working_re = re.compile(r"This server is working as primary member", re.I)
+elected_re = re.compile(r"A new primary with address (\S+) was elected", re.I)
+
+best_ts = None
+best_pod = ""
+
+for log_path in sorted(results_dir.glob("mysql_gr_election*.log")):
+    pod_hint = log_path.name.replace("mysql_gr_election_", "").replace(".log", "")
+    if pod_hint == "mysql_gr_election":
+        pod_hint = ""
+    with log_path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if not (working_re.search(line) or elected_re.search(line)):
+                continue
+            match = ts_re.match(line)
+            if not match:
+                continue
+            ts = datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
+            if ts < trigger:
+                continue
+            elected = elected_re.search(line)
+            pod = pod_hint
+            if elected:
+                pod = elected.group(1).split(".")[0]
+            if best_ts is None or ts < best_ts:
+                best_ts = ts
+                best_pod = pod
+
+if best_ts is None:
+    sys.exit(1)
+
+rel = (best_ts - trigger).total_seconds()
+ms = int(round(rel * 1000))
+election_utc = best_ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{best_ts.microsecond // 1000:03d}Z"
+out_env.write_text(
+    "\n".join(
+        [
+            f"GR_ELECTION_FROM_TRIGGER_SEC={rel:.3f}",
+            f"GR_ELECTION_FROM_TRIGGER_MS={ms}",
+            f"GR_ELECTION_UTC={election_utc}",
+            f"GR_ELECTION_POD={best_pod}",
+            "GR_ELECTION_SOURCE=mysql_pod_logs",
+            "",
+        ]
+    ),
+    encoding="utf-8",
+)
+print(f"Parsed GR election: {rel:.3f}s ({ms} ms) on {best_pod or 'unknown'}")
+PY
+}
+
+_failover_backfill_observability_artifacts() {
+  local results_dir="${1:?results dir required}"
+  local event_file="${results_dir}/failover_event.txt"
+  local trigger_utc=""
+
+  [[ -f "${event_file}" ]] || return 0
+  trigger_utc=$(grep -E '^FAILOVER_TRIGGER_UTC=' "${event_file}" | tail -1 | cut -d= -f2- || true)
+  [[ -n "${trigger_utc}" ]] || return 0
+
+  local operator_log="${results_dir}/operator_failover.log"
+  if [[ ! -s "${operator_log}" ]] \
+    || ! grep -qiE 'groupReplicationStatus|Assigning primary label' "${operator_log}" 2>/dev/null; then
+    echo "--- Backfilling operator_failover.log since ${trigger_utc} ---"
+    _failover_snapshot_operator_logs "${results_dir}" "${trigger_utc}"
+  fi
+
+  if [[ ! -f "${results_dir}/gr_pod_monitor.tsv" ]]; then
+    local have_mysql_logs=0
+    for _f in "${results_dir}"/mysql_gr_election*.log; do
+      [[ -f "${_f}" ]] && have_mysql_logs=1 && break
+    done
+    if [[ "${have_mysql_logs}" -eq 0 ]]; then
+      echo "--- Backfilling mysql GR pod logs since ${trigger_utc} ---"
+      _failover_snapshot_mysql_gr_logs "${results_dir}" "${trigger_utc}"
+    fi
+    if _failover_parse_gr_election_from_mysql_logs "${results_dir}" "${trigger_utc}"; then
+      :
+    else
+      echo "WARNING: could not parse GR election from mysql pod logs" >&2
+    fi
+  fi
+}
+
 _failover_snapshot_k8s_events() {
   local results_dir="${1:?results dir required}"
   local label="${2:?label required}"
@@ -1571,12 +1752,26 @@ write_failover_promotion_breakdown() {
   primary_before=$(analyze_primary_change "${monitor}" "" 2>/dev/null \
     | grep '^PRIMARY_BEFORE=' | cut -d= -f2- || echo "N/A")
 
+  local gr_election_override="-1"
+  local gr_election_override_pod=""
+  local gr_election_source=""
+  if [[ ! -f "${gr_monitor}" && -f "${results_dir}/gr_election_internal.env" ]]; then
+    # shellcheck disable=SC1090
+    source "${results_dir}/gr_election_internal.env" 2>/dev/null || true
+    gr_election_override="${GR_ELECTION_FROM_TRIGGER_SEC:--1}"
+    gr_election_override_pod="${GR_ELECTION_POD:-}"
+    gr_election_source="${GR_ELECTION_SOURCE:-mysql_pod_logs}"
+  fi
+
   awk -v trigger="${trigger_second}" \
       -v edition="${edition}" \
       -v monitor="${monitor}" \
       -v gr_monitor="${gr_monitor}" \
       -v monitor_offset="${monitor_offset}" \
       -v primary_before="${primary_before}" \
+      -v gr_election_override="${gr_election_override}" \
+      -v gr_election_override_pod="${gr_election_override_pod}" \
+      -v gr_election_source="${gr_election_source}" \
       -v txt_out="${txt_out}" \
       -v csv_out="${csv_out}" \
       -f - <<'AWK'
@@ -1671,6 +1866,12 @@ function scan_gr_pods(    line, f, sysbench_sec, rel, pod, role, state) {
   }
   close(gr_monitor)
 }
+function apply_gr_election_override() {
+  if (gr_election_override < 0) return
+  gr_pod_primary = gr_election_override + 0
+  if (gr_election_override_pod != "")
+    gr_pod_primary_name = gr_election_override_pod
+}
 function max_rel(a, b) {
   if (a < 0) return b
   if (b < 0) return a
@@ -1692,6 +1893,7 @@ BEGIN {
 
   scan_ha_monitor()
   scan_gr_pods()
+  apply_gr_election_override()
 
   promote_total = phase_duration(write_ok, ttd)
   vip_outage = phase_duration(vip_connect, ttd)
@@ -1715,7 +1917,7 @@ BEGIN {
   emit_csv_row("failure_detection_ttd", "trigger", ttd, 0,
     "First connect failure on client VIP (connect_ok=0)")
   emit_csv_row("gr_election_internal", "trigger", gr_pod_primary, phase_duration(gr_pod_primary, ttd),
-    "First GR PRIMARY+ONLINE on any mysql pod (direct kubectl exec, bypasses VIP)")
+    (gr_election_source != "" ? "GR PRIMARY elected (" gr_election_source ")" : "First GR PRIMARY+ONLINE on any mysql pod (direct kubectl exec, bypasses VIP)"))
   emit_csv_row("promote_gr_election_after_ttd", "ttd", gr_pod_primary, promote_gr_wait,
     "Wait for GR PRIMARY after TTD (0 if GR elected before client detected failure)")
   emit_csv_row("promote_ha_routing_to_primary", "ttd", write_ok, promote_ha_route,
@@ -2351,6 +2553,8 @@ reanalyze_failover_scenario() {
       "${FAILOVER_RECOVERY_THRESHOLD}" "${FAILOVER_RECOVERY_STABLE_SEC}" \
       "${FAILOVER_OUTAGE_TPS_RATIO}" "${FAILOVER_OBSERVE_SEC}" > "${parsed_file}"
   fi
+
+  _failover_backfill_observability_artifacts "${scenario_dir}"
 
   write_failover_kpi "${scenario_dir}"
   write_failover_extended_metrics "${scenario_dir}"

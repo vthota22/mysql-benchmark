@@ -128,6 +128,9 @@ run_failover_scenario() {
   sleep "${FAILOVER_OBSERVE_SEC}"
 
   _failover_snapshot_k8s_events "${scenario_dir}" "post_observe"
+  trigger_utc=$(grep -E '^FAILOVER_TRIGGER_UTC=' "${scenario_dir}/failover_event.txt" 2>/dev/null \
+    | tail -1 | cut -d= -f2- || true)
+  _failover_snapshot_operator_logs "${scenario_dir}" "${trigger_utc}"
   log_failover_do_events "${scenario_dir}" "${edition}" "post_observe"
 
   echo "--- Stopping load ---"

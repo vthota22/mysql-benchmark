@@ -9,7 +9,10 @@ import html
 import json
 import os
 import re
+import subprocess
 import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 HAS_MPL = False
@@ -42,13 +45,6 @@ METRIC_HELP = {
     "total_failover": (
         "Total downtime from failover trigger until the new primary is promoted and accepting "
         "writes (GR PRIMARY + write probe OK). Equals detection lag plus promotion time."
-    ),
-    "recovery": (
-        "Seconds from trigger until TPS stays at or above 90% baseline for 30 consecutive seconds (RTO)."
-    ),
-    "data_loss": (
-        "TPC-C consistency check after failover (warehouse/district/order invariants). "
-        "PASSED means no detected data loss; SKIPPED if FAILOVER_RUN_TPCC_CHECK=0."
     ),
 }
 
@@ -1045,8 +1041,6 @@ def _metrics_summary_html(
     detect = kpi.get("failure_detection_sec") or extended.get("failure_detect_sec", "N/A")
     promote = kpi.get("primary_election_sec") or extended.get("promote_sec", "N/A")
     total_failover = kpi.get("total_failover_sec") or extended.get("total_failover_sec", "N/A")
-    recovery = kpi.get("app_recovery_sec") or parsed.get("RTO_SEC") or extended.get("rto_sec", "N/A")
-    data_loss = kpi.get("data_loss") or extended.get("tpcc_check", "N/A")
 
     before = primary.get("PRIMARY_BEFORE") or extended.get("primary_before", "N/A")
     after = primary.get("PRIMARY_AFTER") or extended.get("primary_after", "N/A")
@@ -1073,20 +1067,7 @@ def _metrics_summary_html(
                 f"promotion {_format_duration_sec(promote)}"
             ),
         ),
-        _metric_row(
-            "Time for application recovery",
-            _format_duration_sec(recovery),
-            METRIC_HELP["recovery"],
-            sub=f"Interval after promotion: {_phase_gap_sec(recovery, total_failover)}",
-        ),
     ]
-    rows.append(
-        _metric_row(
-            "Data loss (if any)",
-            str(data_loss),
-            METRIC_HELP["data_loss"],
-        )
-    )
 
     return (
         '<table class="metrics">'
@@ -1118,6 +1099,319 @@ def _breakdown_cell_duration(raw: str) -> str:
     if raw in {"0", "0.0", "0.00", "0.000"}:
         return "0 s"
     return _format_duration_sec(raw)
+
+
+OPERATOR_LOG_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)")
+OPERATOR_POLL_PATTERNS = (
+    re.compile(r"not all members are online", re.I),
+    re.compile(r"only \d+/\d+ members are online", re.I),
+    re.compile(r"member is not online", re.I),
+)
+OPERATOR_LABEL_PATTERN = re.compile(r"assigning primary label", re.I)
+
+
+@dataclass(frozen=True)
+class PromoteSplitRow:
+    phase: str
+    duration_sec: float
+    notes: str
+
+
+DB_CONSENSUS_TITLE = "Database consensus promotion"
+DB_CONSENSUS_DEFINITION = (
+    "Time for MySQL nodes to detect the failure and elect a new primary node. "
+    "Nothing else can happen until the database agrees who is in charge."
+)
+HA_CONVERGENCE_TITLE = "HAProxy convergence"
+HA_CONVERGENCE_DEFINITION = (
+    "Time for HAProxy to probe the new primary and update the routing pool. "
+    "Traffic cannot resume until the proxy sees the new primary is ready."
+)
+PROMOTION_BREAKDOWN_TITLE = "Time to promote new primary and accept writes breakdown"
+
+
+def _parse_utc_timestamp(raw: str) -> datetime | None:
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _resolve_kubeconfig(scenario_dir: Path, bench: dict[str, str]) -> Path | None:
+    local = scenario_dir / "kubeconfig"
+    if local.exists():
+        return local
+    configured = bench.get("ADVANCED_KUBECONFIG_PATH", "").strip()
+    if configured:
+        path = Path(configured)
+        if path.exists():
+            return path
+    return None
+
+
+def _read_operator_log_text(scenario_dir: Path, trigger_utc: str, bench: dict[str, str]) -> str:
+    log_path = scenario_dir / "operator_failover.log"
+    if log_path.exists():
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+        if OPERATOR_LOG_TS_RE.search(text):
+            return text
+
+    kubeconfig = _resolve_kubeconfig(scenario_dir, bench)
+    if not kubeconfig or not trigger_utc:
+        return log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+
+    ns = bench.get("ADVANCED_K8S_NAMESPACE", "percona")
+    context = bench.get("ADVANCED_K8S_CONTEXT", "").strip()
+    label = "app.kubernetes.io/name=percona-server-mysql-operator"
+    kubectl = ["kubectl", f"--kubeconfig={kubeconfig}"]
+    if context:
+        kubectl.extend(["--context", context])
+
+    for args in (
+        ["logs", "-n", ns, "-l", label, f"--since-time={trigger_utc}", "--timestamps"],
+        ["logs", "-A", "-l", label, f"--since-time={trigger_utc}", "--timestamps", "--max-log-requests=5"],
+    ):
+        try:
+            proc = subprocess.run(
+                [*kubectl, *args],
+                capture_output=True,
+                text=True,
+                timeout=45,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if proc.stdout.strip():
+            return proc.stdout
+    return log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+
+
+def _parse_operator_log_events(log_text: str, trigger_utc: str) -> dict[str, float]:
+    trigger = _parse_utc_timestamp(trigger_utc)
+    if not trigger or not log_text:
+        return {}
+
+    poll_ts: datetime | None = None
+    label_ts: datetime | None = None
+    for line in log_text.splitlines():
+        match = OPERATOR_LOG_TS_RE.match(line)
+        if not match:
+            continue
+        ts = _parse_utc_timestamp(match.group(1))
+        if ts is None or ts < trigger:
+            continue
+        if poll_ts is None and any(pattern.search(line) for pattern in OPERATOR_POLL_PATTERNS):
+            poll_ts = ts
+        if label_ts is None and OPERATOR_LABEL_PATTERN.search(line):
+            label_ts = ts
+
+    events: dict[str, float] = {}
+    if poll_ts is not None:
+        events["poll_from_trigger"] = (poll_ts - trigger).total_seconds()
+    if label_ts is not None:
+        events["label_from_trigger"] = (label_ts - trigger).total_seconds()
+    return events
+
+
+def _gr_election_after_ttd(by_phase: dict[str, dict[str, str]], ttd_sec: float, scenario_dir: Path | None = None) -> tuple[float, str]:
+    gr_after = _parse_metric_sec(by_phase.get("promote_gr_election_after_ttd", {}).get("duration_from_ttd_sec"))
+    if gr_after is not None:
+        source = by_phase.get("gr_election_internal", {}).get("description", "")
+        note = "From gr_pod_monitor.tsv"
+        if "mysql_pod_logs" in source:
+            note = "From mysql pod GR logs (sub-second)"
+        elif "gr_pod_monitor" in source:
+            note = "From gr_pod_monitor.tsv"
+        return max(0.0, gr_after), note
+
+    gr_internal = _parse_metric_sec(by_phase.get("gr_election_internal", {}).get("time_from_trigger_sec"))
+    if gr_internal is not None and gr_internal > ttd_sec:
+        source = by_phase.get("gr_election_internal", {}).get("description", "")
+        note = "From gr_pod_monitor.tsv"
+        if "mysql_pod_logs" in source:
+            note = "From mysql pod GR logs (sub-second)"
+        return gr_internal - ttd_sec, note
+
+    if scenario_dir is not None:
+        env_path = scenario_dir / "gr_election_internal.env"
+        if env_path.exists():
+            env = load_metadata(env_path)
+            rel = _parse_metric_sec(env.get("GR_ELECTION_FROM_TRIGGER_SEC"))
+            if rel is not None:
+                after = max(0.0, rel - ttd_sec)
+                ms = env.get("GR_ELECTION_FROM_TRIGGER_MS", "")
+                note = "From mysql pod GR logs"
+                if ms:
+                    note = f"From mysql pod GR logs ({int(ms):,} ms from trigger)"
+                return after, note
+
+    return 0.0, "GR election timing not collected"
+
+
+def compute_promote_window_split(scenario_dir: Path) -> tuple[float | None, list[PromoteSplitRow], str]:
+    breakdown_rows = load_promotion_breakdown(scenario_dir / "failover_promotion_breakdown.csv")
+    if not breakdown_rows:
+        return None, [], "Re-run analysis or ./reanalyze_failover.sh to populate promotion metrics."
+
+    by_phase = {row.get("phase", ""): row for row in breakdown_rows}
+    promote_total = _parse_metric_sec(by_phase.get("promote_total", {}).get("duration_from_ttd_sec"))
+    if promote_total is None:
+        kpi = load_kpi(scenario_dir / "failover_kpi.csv")
+        promote_total = _parse_metric_sec(kpi.get("primary_election_sec"))
+    if promote_total is None:
+        return None, [], "Promote window not detected in this run."
+
+    ttd_sec = _parse_metric_sec(by_phase.get("failure_detection_ttd", {}).get("time_from_trigger_sec")) or 0.0
+    db_consensus, _db_source = _gr_election_after_ttd(by_phase, ttd_sec, scenario_dir)
+    db_from_csv = _parse_metric_sec(by_phase.get("promote_gr_election_after_ttd", {}).get("duration_from_ttd_sec"))
+    if db_from_csv is not None:
+        db_consensus = max(0.0, db_from_csv)
+
+    ha_convergence = max(0.0, promote_total - db_consensus)
+
+    meta = load_metadata(scenario_dir / "failover_timeseries_meta.txt")
+    bench = load_benchmark_config(scenario_dir, meta)
+    event = load_metadata(scenario_dir / "failover_event.txt")
+    trigger_utc = (
+        event.get("FAILOVER_TRIGGER_UTC")
+        or event.get("FAILOVER_POD_DELETE_UTC")
+        or event.get("FAILOVER_MYSQLD_KILL_UTC")
+        or ""
+    )
+
+    has_gr_pod_monitor = (scenario_dir / "gr_pod_monitor.tsv").exists()
+    has_mysql_gr_logs = bool(list(scenario_dir.glob("mysql_gr_election*.log"))) or (
+        scenario_dir / "gr_election_internal.env"
+    ).exists()
+    operator_events = _parse_operator_log_events(
+        _read_operator_log_text(scenario_dir, trigger_utc, bench), trigger_utc
+    )
+    has_operator_logs = bool(operator_events)
+
+    source_lines = [
+        (
+            "Database consensus: "
+            + (
+                "gr_pod_monitor.tsv (kubectl exec GR role poll on each mysql pod during the run). "
+                if has_gr_pod_monitor
+                else (
+                    "mysql pod GR logs (group_replication plugin; mysql_gr_election_*.log). "
+                    if has_mysql_gr_logs
+                    else "not collected (enable FAILOVER_GR_POD_MONITOR=1 or reanalyze with kubectl). "
+                )
+            )
+        ),
+        (
+            "HAProxy convergence: client VIP primary monitor — residual from internal GR ready "
+            "to write probe OK on MYSQL_HOST."
+        ),
+    ]
+    if has_operator_logs:
+        source_lines.append(
+            "Operator logs (operator_failover.log) corroborate label timing only; "
+            "HAProxy container logs are not collected."
+        )
+    else:
+        source_lines.append("HAProxy container logs are not collected by this benchmark.")
+    source_lines.append("1 s monitor grid quantizes sub-second steps.")
+    footnote = " ".join(source_lines)
+
+    rows = [
+        PromoteSplitRow(DB_CONSENSUS_TITLE, db_consensus, DB_CONSENSUS_DEFINITION),
+        PromoteSplitRow(HA_CONVERGENCE_TITLE, ha_convergence, HA_CONVERGENCE_DEFINITION),
+    ]
+    return promote_total, rows, footnote
+
+
+def _mysqld_kill_no_failover_callout(scenario_dir: Path) -> str:
+    """Note when mysqld_kill did not cause GR failover (same pod throughout)."""
+    event = load_metadata(scenario_dir / "failover_event.txt")
+    primary = load_metadata(scenario_dir / "primary_change.env")
+    kpi = load_kpi(scenario_dir / "failover_kpi.csv")
+
+    method = " ".join(
+        (
+            event.get("FAILOVER_METHOD", ""),
+            event.get("FAILOVER_ADVANCED_TRIGGER_METHOD", ""),
+        )
+    ).lower()
+    if "mysqld" not in method and "kill" not in method:
+        return ""
+    if primary.get("PRIMARY_CHANGED", "").lower() not in {"no", "0", "false"}:
+        return ""
+
+    detect = _parse_metric_sec(kpi.get("failure_detection_sec"))
+    promote = _parse_metric_sec(kpi.get("primary_election_sec"))
+    pod = primary.get("PRIMARY_BEFORE", primary.get("PRIMARY_AFTER", "N/A"))
+    if detect is None or promote is None or detect < 5:
+        return ""
+
+    return f"""
+      <p class="muted" style="margin:0 0 0.75rem;padding:0.6rem 0.75rem;border-left:3px solid #60a5fa;background:rgba(96,165,250,0.06);">
+        <strong>mysqld_kill without GR failover:</strong> VIP stayed on
+        <code>{html.escape(pod)}</code> for {html.escape(_format_duration_sec(detect))} after kill
+        (no primary change). The long detection time reflects continued VIP connectivity while
+        mysqld restarted in-place, not operator promotion delay. After a brief connect blip,
+        recovery took {html.escape(_format_duration_sec(promote))}.
+      </p>
+    """
+
+
+def _promote_window_split_html(scenario_dir: Path) -> str:
+    promote_total, rows, footnote = compute_promote_window_split(scenario_dir)
+    if promote_total is None or not rows:
+        return f'<p class="muted">{html.escape(footnote)}</p>'
+
+    callout = _mysqld_kill_no_failover_callout(scenario_dir)
+    body_rows: list[str] = []
+    accounted = 0.0
+    for row in rows:
+        accounted += row.duration_sec
+        pct = (row.duration_sec / promote_total * 100.0) if promote_total > 0 else 0.0
+        body_rows.append(
+            "<tr>"
+            f'<td class="phase-name-cell"><div class="metric-title">{html.escape(row.phase)}</div>'
+            f'<div class="metric-help">{html.escape(row.notes)}</div></td>'
+            f'<td class="num">{html.escape(_format_duration_sec(row.duration_sec))}</td>'
+            f'<td class="num">~{pct:.0f}%</td>'
+            "</tr>"
+        )
+
+    total_pct = (accounted / promote_total * 100.0) if promote_total > 0 else 100.0
+    body_rows.append(
+        '<tr class="row-total">'
+        '<td class="phase-name-cell"><div class="metric-title">Time to promote new primary (total)</div>'
+        '<div class="metric-help">First connect failure on client VIP → write probe OK '
+        "(same as <em>Time to promote new primary</em> in Failover metrics)</div></td>"
+        f'<td class="num">{html.escape(_format_duration_sec(promote_total))}</td>'
+        f'<td class="num">~{total_pct:.0f}%</td>'
+        "</tr>"
+    )
+
+    window_label = _format_duration_sec(promote_total)
+    return f"""
+      {callout}
+      <p class="muted" style="margin:0 0 0.75rem">
+        Breakdown of the <strong>{html.escape(window_label)}</strong> window from first client connect
+        failure to write probe OK on the VIP.
+      </p>
+      <table class="metrics promotion-breakdown">
+        <thead>
+          <tr>
+            <th>Phase</th>
+            <th>Duration</th>
+            <th>% of window</th>
+          </tr>
+        </thead>
+        <tbody>{''.join(body_rows)}</tbody>
+      </table>
+      <p class="muted" style="margin:0.75rem 0 0;font-size:0.85rem"><strong>Data sources:</strong> {html.escape(footnote)}</p>
+    """
 
 
 # Ordered phases for the HTML promotion breakdown table.
@@ -1512,8 +1806,8 @@ def generate_html_report(
         {_metrics_summary_html(kpi, extended, primary, parsed)}
       </div>
       <div class="card">
-        <h2>Time to promote — phase breakdown</h2>
-        {_promotion_breakdown_html(edition_dir)}
+        <h2>{html.escape(PROMOTION_BREAKDOWN_TITLE)}</h2>
+        {_promote_window_split_html(edition_dir)}
       </div>
       <div class="card">
         <h2>Errors &amp; reconnects</h2>
@@ -1641,7 +1935,7 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
                 metrics_html = _metrics_summary_html(
                     bundle["kpi"], bundle["extended"], bundle["primary"], bundle["parsed"]
                 )
-                breakdown_html = _promotion_breakdown_html(Path(bundle["dir"]))
+                split_html = _promote_window_split_html(Path(bundle["dir"]))
                 monitor_html = _monitor_trigger_table_html(Path(bundle["dir"]), bundle)
                 compare_html = _before_after_throughput_table_html(bundle)
                 chart_payload[key] = bundle["chart_data"]
@@ -1658,7 +1952,7 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
                     f'<div class="card"><h2>Primary transition at trigger</h2>{monitor_html}</div>'
                     f'<div class="card"><h2>Metrics before vs after failover</h2>{compare_html}</div>'
                     f'<div class="card"><h2>Failover metrics</h2>{metrics_html}</div>'
-                    f'<div class="card"><h2>Time to promote — phase breakdown</h2>{breakdown_html}</div>'
+                    f'<div class="card"><h2>{html.escape(PROMOTION_BREAKDOWN_TITLE)}</h2>{split_html}</div>'
                     f'<div class="card"><h2>Errors &amp; reconnects</h2><div class="chart-wrap">'
                     f'<canvas id="errors_{panel_id}"></canvas></div></div>'
                     f"</div></div></div>"
