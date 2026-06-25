@@ -115,7 +115,39 @@ ensure_database_exists() {
   mysql_admin -e "CREATE DATABASE IF NOT EXISTS \`${MYSQL_DB}\`;"
 }
 
+tpcc_tables_exist() {
+  local tables="${TPCC_TABLES:-10}"
+  local expected=$((tables * 9))
+  local found
+  found="$(mysql_admin -N -e "
+    SELECT COUNT(*)
+    FROM information_schema.tables
+    WHERE table_schema = '${MYSQL_DB}'
+      AND table_name REGEXP '^(warehouse|district|customer|orders|new_orders|order_line|stock|item|history)[0-9]+\$'
+  ")"
+  if [[ "${found}" -ge "${expected}" ]]; then
+    return 0
+  fi
+  log_phase "1_INIT" "found ${found}/${expected} TPC-C tables in ${MYSQL_DB}"
+  return 1
+}
+
+verify_tpcc_tables() {
+  if [[ "${SKIP_TPCC_CHECK:-0}" == "1" ]]; then
+    log_phase "1_INIT" "SKIP_TPCC_CHECK=1 — verifying TPC-C table names only (no consistency check)"
+    tpcc_tables_exist
+    return $?
+  fi
+
+  log_phase "1_INIT" "running sysbench tpcc check (threads=${TPCC_CHECK_THREADS})"
+  run_tpcc check
+}
+
 tpcc_tables_ready() {
+  if [[ "${SKIP_TPCC_CHECK:-0}" == "1" ]]; then
+    tpcc_tables_exist
+    return $?
+  fi
   if run_tpcc check >/dev/null 2>&1; then
     return 0
   fi

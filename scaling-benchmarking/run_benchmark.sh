@@ -69,9 +69,8 @@ phase1_init_database() {
     log_phase "1_INIT" "SKIP_PREPARE=1 — ensuring database exists, checking TPC-C tables"
     ensure_database_exists
 
-    log_phase "1_INIT" "running sysbench tpcc check (threads=${TPCC_CHECK_THREADS})"
-    if ! run_tpcc check | tee -a "${RUN_LOG}"; then
-      log_phase "1_INIT" "ERROR: TPC-C check failed"
+    if ! verify_tpcc_tables | tee -a "${RUN_LOG}"; then
+      log_phase "1_INIT" "ERROR: TPC-C table verification failed"
       return 1
     fi
 
