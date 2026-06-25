@@ -40,7 +40,8 @@ METRIC_HELP = {
         "and accepting writes: GR PRIMARY role (Advanced) and write probe INSERT succeeds (write_ok=1)."
     ),
     "total_failover": (
-        "Seconds from failover trigger until promotion completes (detection lag + promotion time)."
+        "Total downtime from failover trigger until the new primary is promoted and accepting "
+        "writes (GR PRIMARY + write probe OK). Equals detection lag plus promotion time."
     ),
     "recovery": (
         "Seconds from trigger until TPS stays at or above 90% baseline for 30 consecutive seconds (RTO)."
@@ -1060,9 +1061,15 @@ def _metrics_summary_html(
             "Time to promote new primary",
             _format_duration_sec(promote),
             METRIC_HELP["promote"],
+            sub=f"Primary: {before} → {after} ({changed})",
+        ),
+        _metric_row(
+            "Total failover time (downtime)",
+            _format_duration_sec(total_failover),
+            METRIC_HELP["total_failover"],
             sub=(
-                f"Total from trigger: {_format_duration_sec(total_failover)} · "
-                f"Primary: {before} → {after} ({changed})"
+                f"From trigger · detection {_format_duration_sec(detect)} + "
+                f"promotion {_format_duration_sec(promote)}"
             ),
         ),
         _metric_row(

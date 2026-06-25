@@ -1773,7 +1773,7 @@ END {
   else
     print "Time to promote primary:  NOT_DETECTED (monitor off or no promotion signal seen)"
   if (promote_sec >= 0)
-    printf "Total failover time:      %.3f s (%.0f ms · from trigger to promotion)\n", promote_sec, promote_sec * 1000
+    printf "Total failover time:      %.3f s (%.0f ms · downtime from trigger to promotion)\n", promote_sec, promote_sec * 1000
   else
     print "Total failover time:      NOT_DETECTED"
   if (rto >= 0)
