@@ -130,6 +130,10 @@ echo "--- Patching sysbench-tpcc for failover (safe ROLLBACK on reconnect) ---"
 "${SCRIPT_DIR}/scripts/patch_tpcc_failover.sh" "${TPCC_DIR}"
 
 echo ""
+echo "--- Patching sysbench-tpcc prepare (COMMIT after bulk inserts for HA MySQL) ---"
+"${SCRIPT_DIR}/scripts/patch_tpcc_prepare_commit.sh" "${TPCC_DIR}"
+
+echo ""
 install_doctl
 
 echo ""

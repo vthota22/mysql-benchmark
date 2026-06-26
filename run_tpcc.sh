@@ -40,6 +40,10 @@ if [[ ! -f "${TPCC_DIR}/tpcc.lua" ]]; then
   exit 1
 fi
 
+if [[ "${COMMAND}" == "prepare" && -f "${SCRIPT_DIR}/scripts/patch_tpcc_prepare_commit.sh" ]]; then
+  bash "${SCRIPT_DIR}/scripts/patch_tpcc_prepare_commit.sh" "${TPCC_DIR}"
+fi
+
 # sysbench-tpcc uses require("tpcc_common") — must run from repo dir (Lua cwd)
 # sysbench 1.0.x SSL — needs client-key.pem + client-cert.pem in cwd
 link_tpcc_ssl() {
