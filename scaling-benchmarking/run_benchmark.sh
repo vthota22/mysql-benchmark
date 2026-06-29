@@ -52,8 +52,6 @@ export SCALE_TARGET_SIZE="${SCALE_TARGET_SIZE:-}"
 export SCALE_NUM_NODES="${SCALE_NUM_NODES:-}"
 export SCALE_STORAGE_SIZE_MIB="${SCALE_STORAGE_SIZE_MIB:-}"
 
-exec > >(tee -a "${FULL_LOG}") 2>&1
-
 on_exit() {
   local rc=$?
   if [[ "${rc}" -ne 0 ]]; then
@@ -61,6 +59,24 @@ on_exit() {
   fi
 }
 trap on_exit EXIT
+
+print_startup_banner() {
+  echo "=== scaling-benchmarking: TPC-C under scale ==="
+  echo "Config:   ${CONFIG}"
+  echo "Engine:   ${ENGINE}"
+  echo "Run dir:  ${RUN_DIR}"
+  echo "Sysbench: $("${BENCH_ROOT}/which_sysbench.sh")"
+  echo "Host:     ${MYSQL_HOST}:${MYSQL_PORT}/${MYSQL_DB}"
+  if scaling_enabled; then
+    echo "Scaling:  trigger at +${SCALE_TRIGGER_DELAY}s -> ${SCALE_TARGET_SIZE}"
+  else
+    echo "Scaling:  disabled (SKIP_SCALING=1)"
+  fi
+  echo ""
+}
+
+preflight_checks
+print_startup_banner
 
 phase1_init_database() {
   mysql_connectivity_check || return 1
@@ -275,6 +291,9 @@ main() {
   # Guard against env vars like phase2= breaking phaseN_* function names.
   unset phase1 phase2 phase3 phase4 2>/dev/null || true
 
+  # Redirect stdout/stderr after the startup banner so setup errors stay visible.
+  exec > >(tee -a "${FULL_LOG}") 2>&1
+
   phase1_init_database
   if scaling_enabled; then
     do_api_auth_check
@@ -287,18 +306,5 @@ main() {
 
   log_phase "DONE" "benchmark complete"
 }
-
-echo "=== scaling-benchmarking: TPC-C under scale ==="
-echo "Config:   ${CONFIG}"
-echo "Engine:   ${ENGINE}"
-echo "Run dir:  ${RUN_DIR}"
-echo "Sysbench: $("${BENCH_ROOT}/which_sysbench.sh")"
-echo "Host:     ${MYSQL_HOST}:${MYSQL_PORT}/${MYSQL_DB}"
-if scaling_enabled; then
-  echo "Scaling:  trigger at +${SCALE_TRIGGER_DELAY}s -> ${SCALE_TARGET_SIZE}"
-else
-  echo "Scaling:  disabled (SKIP_SCALING=1)"
-fi
-echo ""
 
 main "$@"

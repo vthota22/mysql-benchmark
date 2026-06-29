@@ -91,9 +91,45 @@ setup_paths() {
   root="$(scaling_root)"
   export BENCH_ROOT="$(bench_root)"
   export SCALING_ROOT="${root}"
+  if [[ ! -f "${BENCH_ROOT}/sysbench_mysql_opts.sh" ]]; then
+    echo "ERROR: benchmark repo root not found at BENCH_ROOT=${BENCH_ROOT}" >&2
+    echo "Missing: ${BENCH_ROOT}/sysbench_mysql_opts.sh" >&2
+    echo "Clone the full mysql-benchmark repo (not just scaling-benchmarking/) and run:" >&2
+    echo "  cd ${BENCH_ROOT} && ./setup_benchmark.sh" >&2
+    exit 1
+  fi
   export PATH="${BENCH_ROOT}/sysbench-1.1/bin:${PATH}"
   # shellcheck source=/dev/null
   source "${BENCH_ROOT}/sysbench_mysql_opts.sh"
+}
+
+preflight_checks() {
+  local sysbench tpcc
+  sysbench="$("${BENCH_ROOT}/which_sysbench.sh")"
+  if [[ ! -x "${sysbench}" ]]; then
+    echo "ERROR: sysbench not executable: ${sysbench}" >&2
+    echo "Run from repo root: ./setup_benchmark.sh" >&2
+    exit 1
+  fi
+
+  tpcc="$(tpcc_dir)"
+  if [[ ! -f "${tpcc}/tpcc.lua" ]]; then
+    echo "ERROR: Missing ${tpcc}/tpcc.lua" >&2
+    echo "Run from repo root: ./setup_benchmark.sh" >&2
+    exit 1
+  fi
+
+  if ! command -v mysql >/dev/null 2>&1; then
+    echo "ERROR: mysql client not found in PATH" >&2
+    echo "Install with: apt-get install -y mysql-client" >&2
+    exit 1
+  fi
+
+  if scaling_enabled && ! command -v doctl >/dev/null 2>&1; then
+    echo "ERROR: doctl not found in PATH (required when scaling is enabled)" >&2
+    echo "Run from repo root: ./setup_benchmark.sh" >&2
+    exit 1
+  fi
 }
 
 mysql_admin() {
