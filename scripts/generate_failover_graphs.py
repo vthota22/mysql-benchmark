@@ -39,12 +39,9 @@ METRIC_HELP = {
         "connect failure (connect_ok=0), including timeouts when the monitor cannot connect."
     ),
     "promote": (
-        "Seconds from the first connect failure until the new primary is fully promoted "
-        "and accepting writes: GR PRIMARY role (Advanced) and write probe INSERT succeeds (write_ok=1)."
-    ),
-    "total_failover": (
-        "Total downtime from failover trigger until the new primary is promoted and accepting "
-        "writes (GR PRIMARY + write probe OK). Equals detection lag plus promotion time."
+        "Total client DB downtime: seconds from the first connect failure until the new "
+        "primary is promoted and accepting writes (GR PRIMARY role and write probe INSERT "
+        "succeeds with write_ok=1)."
     ),
 }
 
@@ -943,8 +940,8 @@ def _parse_extended_metrics(path: Path) -> dict[str, str]:
         return {}
     text = path.read_text(encoding="utf-8", errors="replace")
     patterns = {
-        "failure_detect_sec": r"Time to detect failure:\s+([\d.]+)\s+s\b",
-        "promote_sec": r"Time to promote primary:\s+([\d.]+)\s+s\b",
+        "failure_detect_sec": r"Time to detect (?:first )?failure:\s+([\d.]+)\s+s\b",
+        "promote_sec": r"Time to promote (?:new )?primary:\s+([\d.]+)\s+s\b",
         "total_failover_sec": r"Total failover time:\s+([\d.]+)\s+s\b",
         "rto_sec": r"Application recovery RTO:\s+([\d.]+)\s+s\b",
         "primary_before": r"Primary before:\s+(\S+)",
@@ -1040,7 +1037,6 @@ def _metrics_summary_html(
 
     detect = kpi.get("failure_detection_sec") or extended.get("failure_detect_sec", "N/A")
     promote = kpi.get("primary_election_sec") or extended.get("promote_sec", "N/A")
-    total_failover = kpi.get("total_failover_sec") or extended.get("total_failover_sec", "N/A")
 
     before = primary.get("PRIMARY_BEFORE") or extended.get("primary_before", "N/A")
     after = primary.get("PRIMARY_AFTER") or extended.get("primary_after", "N/A")
@@ -1048,7 +1044,7 @@ def _metrics_summary_html(
 
     rows = [
         _metric_row(
-            "Time to detect failure",
+            "Time to detect first failure",
             _format_duration_sec(detect),
             METRIC_HELP["detect"],
         ),
@@ -1057,15 +1053,6 @@ def _metrics_summary_html(
             _format_duration_sec(promote),
             METRIC_HELP["promote"],
             sub=f"Primary: {before} → {after} ({changed})",
-        ),
-        _metric_row(
-            "Total failover time (downtime)",
-            _format_duration_sec(total_failover),
-            METRIC_HELP["total_failover"],
-            sub=(
-                f"From trigger · detection {_format_duration_sec(detect)} + "
-                f"promotion {_format_duration_sec(promote)}"
-            ),
         ),
     ]
 
@@ -1806,10 +1793,6 @@ def generate_html_report(
         {_metrics_summary_html(kpi, extended, primary, parsed)}
       </div>
       <div class="card">
-        <h2>{html.escape(PROMOTION_BREAKDOWN_TITLE)}</h2>
-        {_promote_window_split_html(edition_dir)}
-      </div>
-      <div class="card">
         <h2>Errors &amp; reconnects</h2>
         <div class="chart-wrap"><canvas id="errorsChart"></canvas></div>
       </div>
@@ -1935,7 +1918,6 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
                 metrics_html = _metrics_summary_html(
                     bundle["kpi"], bundle["extended"], bundle["primary"], bundle["parsed"]
                 )
-                split_html = _promote_window_split_html(Path(bundle["dir"]))
                 monitor_html = _monitor_trigger_table_html(Path(bundle["dir"]), bundle)
                 compare_html = _before_after_throughput_table_html(bundle)
                 chart_payload[key] = bundle["chart_data"]
@@ -1952,7 +1934,6 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
                     f'<div class="card"><h2>Primary transition at trigger</h2>{monitor_html}</div>'
                     f'<div class="card"><h2>Metrics before vs after failover</h2>{compare_html}</div>'
                     f'<div class="card"><h2>Failover metrics</h2>{metrics_html}</div>'
-                    f'<div class="card"><h2>{html.escape(PROMOTION_BREAKDOWN_TITLE)}</h2>{split_html}</div>'
                     f'<div class="card"><h2>Errors &amp; reconnects</h2><div class="chart-wrap">'
                     f'<canvas id="errors_{panel_id}"></canvas></div></div>'
                     f"</div></div></div>"
