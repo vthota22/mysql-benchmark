@@ -7,7 +7,7 @@
 # Actions (Advanced pod delete; harness uses prepare → refresh → fire):
 #   prepare  — fetch kubeconfig, validate kubectl, resolve primary pod (during baseline)
 #   refresh  — re-resolve primary pod shortly before trigger second
-#   fire     — instant kubectl delete using prepared kubeconfig (at trigger second)
+#   fire     — kubectl delete/kill using kubeconfig + target pod from refresh (no re-resolve)
 #   (omit)   — one-shot: prepare + delete immediately (manual / legacy)
 #
 # Requires benchmark.conf (via BENCHMARK_CONF) and edition-specific settings.
@@ -425,10 +425,8 @@ fire_advanced_failover_trigger() {
 
   load_failover_prepared_env
 
-  local pod method
-  pod=$(find_advanced_primary_pod "${FAILOVER_KUBECONFIG}")
-  write_failover_prepared_env "${FAILOVER_KUBECONFIG}" "${pod}" "${FAILOVER_K8S_NAMESPACE}" \
-    "${FAILOVER_POD_DELETE_FORCE:-1}" "${FAILOVER_POD_DELETE_GRACE_SEC:-0}"
+  local pod="${FAILOVER_TARGET_POD}" method
+  echo "Using primary pod from refresh: ${pod} at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${TRIGGER_LOG}"
 
   method="$(failover_advanced_trigger_method)"
   case "${method}" in
