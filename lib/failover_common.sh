@@ -2373,13 +2373,17 @@ END {
   print ""
   print "--- Timing ---"
   if (failure_detect >= 0)
-    printf "Time to detect first failure: %.3f s (%.0f ms · from trigger, first connect failure connect_ok=0)\n", failure_detect, failure_detect * 1000
+    printf "Time to detect failure:   %.3f s (%.0f ms · from trigger, first connect failure connect_ok=0)\n", failure_detect, failure_detect * 1000
   else
-    print "Time to detect first failure: NOT_DETECTED"
+    print "Time to detect failure:   NOT_DETECTED"
   if (promote_after_detect >= 0)
-    printf "Time to promote new primary:  %.3f s (%.0f ms · from first connect failure, total DB downtime until GR PRIMARY + write probe OK)\n", promote_after_detect, promote_after_detect * 1000
+    printf "Time to promote primary:  %.3f s (%.0f ms · from first connect failure, GR PRIMARY + write probe OK)\n", promote_after_detect, promote_after_detect * 1000
   else
-    print "Time to promote new primary:  NOT_DETECTED (monitor off or no promotion signal seen)"
+    print "Time to promote primary:  NOT_DETECTED (monitor off or no promotion signal seen)"
+  if (promote_sec >= 0)
+    printf "Total failover time:      %.3f s (%.0f ms · downtime from trigger to promotion)\n", promote_sec, promote_sec * 1000
+  else
+    print "Total failover time:      NOT_DETECTED"
   if (rto >= 0)
     printf "Application recovery RTO: %.3f s (%.0f ms · %.0f%% baseline for %ds)\n", rto, rto * 1000, recovery_pct * 100, stable
   else

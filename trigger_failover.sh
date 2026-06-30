@@ -303,8 +303,6 @@ _advanced_failover_delete_pod() {
   echo "FAILOVER_METHOD=${delete_method}" >> "${EVENT_FILE}"
   echo "FAILOVER_POD_DELETE_FORCE=${delete_force}" >> "${EVENT_FILE}"
   echo "FAILOVER_POD_DELETE_GRACE_SEC=${delete_grace}" >> "${EVENT_FILE}"
-  echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
-  echo "FAILOVER_POD_DELETE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
   echo "FAILOVER_TARGET_POD=${pod}" >> "${EVENT_FILE}"
 
   local kubectl=(kubectl --kubeconfig="${kubeconfig}")
@@ -325,8 +323,8 @@ _advanced_failover_delete_pod() {
       | tee -a "${TRIGGER_LOG}"
   fi
 
-  _failover_snapshot_k8s_events "${RESULTS_DIR}" "pre_delete"
-  log_failover_do_events "${RESULTS_DIR}" "advanced" "pre_delete"
+  echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
+  echo "FAILOVER_POD_DELETE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
 
   "${kubectl[@]}" "${delete_args[@]}" \
     2>&1 | tee -a "${TRIGGER_LOG}"
@@ -346,8 +344,6 @@ _advanced_failover_kill_mysqld() {
   echo "FAILOVER_METHOD=kubectl_kill_mysqld" >> "${EVENT_FILE}"
   echo "FAILOVER_MYSQLD_KILL_SIGNAL=${signal}" >> "${EVENT_FILE}"
   echo "FAILOVER_MYSQLD_KILL_CONTAINER=${container}" >> "${EVENT_FILE}"
-  echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
-  echo "FAILOVER_MYSQLD_KILL_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
   echo "FAILOVER_TARGET_POD=${pod}" >> "${EVENT_FILE}"
 
   local kubectl=(kubectl --kubeconfig="${kubeconfig}")
@@ -360,8 +356,8 @@ _advanced_failover_kill_mysqld() {
   echo "Command: kubectl exec -n ${ns} ${pod} -c ${container} -- kill -${signal} \$(pidof mysqld)" \
     >> "${TRIGGER_LOG}"
 
-  _failover_snapshot_k8s_events "${RESULTS_DIR}" "pre_mysqld_kill"
-  log_failover_do_events "${RESULTS_DIR}" "advanced" "pre_mysqld_kill"
+  echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
+  echo "FAILOVER_MYSQLD_KILL_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
 
   "${kubectl[@]}" exec -n "${ns}" "${pod}" -c "${container}" -- \
     sh -c "kill -${signal} \$(pidof mysqld) 2>/dev/null || kill -${signal} 1" \
