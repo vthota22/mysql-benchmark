@@ -1,4 +1,4 @@
-# backup-benchmarking — sysbench TPC-C under load while measuring backup impact
+# backup-benchmarking — sysbench TPC-C under load while profiling backups
 # Copy and edit:
 #   cp benchmark.conf.example benchmark.conf
 
@@ -18,33 +18,70 @@ CLUSTER_SLUG="gd-4vcpu-16gb"
 CLUSTER_NUM_NODES=1
 CLUSTER_STORAGE_SIZE_GIB=200
 
-# --- DigitalOcean API ---
-DO_API_TOKEN=""
-DO_API_URL="https://api.digitalocean.com"
-
 # --- Sysbench TPC-C ---
 TPCC_SCALE=10
 TPCC_TABLES=10
 TPCC_THREADS=16
+# Parallelism for prepare/cleanup (default 16, independent of TPCC_THREADS).
 TPCC_PREP_THREADS=16
+# Parallelism for tpcc check when SKIP_PREPARE=1 (defaults to TPCC_PREP_THREADS).
 TPCC_CHECK_THREADS=
 TPCC_WARMUP_SEC=0
 TPCC_REPORT_INTERVAL=1
 TPCC_FORCE_PK=1
 TPCC_TRX_LEVEL=RR
+# Latency percentile reported by sysbench (default 99 = p99). Set to 95 for p95.
+TPCC_PERCENTILE=99
 
 # Survive backup-related transient errors and TPC-C lock contention.
 TPCC_IGNORE_ERRORS="1290,1836,1053,2013,2006,2055,2011,3100,1205,1213,1020"
 
 # 1 = skip prepare when TPC-C tables already exist; 0 = drop DB and reload dataset
+# When SKIP_PREPARE=1, phase 1 runs tpcc check with TPCC_CHECK_THREADS (or TPCC_PREP_THREADS);
+# the run phase still uses TPCC_THREADS below.
 SKIP_PREPARE=0
+# 1 = with SKIP_PREPARE=1, only verify table names exist (skip slow per-warehouse consistency check)
+SKIP_TPCC_CHECK=0
 
-# Total TPC-C run duration (seconds). Backups are monitored throughout.
+# Total TPC-C run duration (seconds). Backup profiling runs for the same duration.
 TPCC_MAX_TIME=3600
 
-# --- Backup polling ---
-# How often to poll the list-backups API (seconds).
-BACKUP_POLL_INTERVAL_SEC=300
+# --- Kubernetes access ---
+# Required for backup profiling and backup schedule patching.
+KUBECONFIG_PATH=""
+KUBE_NAMESPACE=""
+# Pod name for backup detection. Leave empty to auto-detect (tries mysql-0, percona-0, etc).
+KUBE_POD=""
+
+# --- Backup schedule patching (optional) ---
+# Patch the PXC CR backup schedule before starting the workload.
+# Leave BOTH schedules empty to skip patching entirely.
+
+# Full backup cron schedule (e.g., "0 14 * * *" for daily at 2PM UTC).
+BACKUP_FULL_SCHEDULE=""
+# Number of full backups to retain.
+BACKUP_FULL_KEEP=7
+
+# Incremental backup cron schedule (e.g., "0 */4 * * *" for every 4 hours).
+# Set to a never-fire value like "0 0 31 2 *" to effectively disable incremental backups.
+BACKUP_INCREMENTAL_SCHEDULE=""
+# Number of incremental backups to retain.
+BACKUP_INCREMENTAL_KEEP=7
+
+# Storage name for backups (must match a storageName defined in the PXC CR).
+BACKUP_STORAGE_NAME="s3-storage"
+# Percona CR type: "ps" (PerconaServerMySQL) or "pxc" (PerconaXtraDBCluster).
+# Leave empty to auto-detect.
+BACKUP_CR_TYPE=""
+# Percona CR name. Leave empty to auto-detect the first CR in the namespace.
+BACKUP_CR_NAME=""
+
+# --- Backup profiling (optional) ---
+# Set SKIP_BACKUP_PROFILING=1 to run TPC-C only (no K8s backup detection).
+SKIP_BACKUP_PROFILING=0
+# How often to poll MySQL status / pod resources during backup profiling (seconds).
+BACKUP_PROFILE_POLL_INTERVAL=10
 
 # --- Output ---
+# Each run creates results/run_YYYYMMDD_HHMMSS_<engine>/ with all logs, CSVs, and a copy of benchmark.conf.
 RESULTS_DIR="results"
