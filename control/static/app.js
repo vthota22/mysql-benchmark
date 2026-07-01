@@ -7,24 +7,10 @@ const remoteConfPath = document.getElementById("remote-conf-path");
 const btnSave = document.getElementById("btn-save");
 const btnStart = document.getElementById("btn-start");
 const btnRefresh = document.getElementById("btn-refresh");
+const currentReportLinks = document.getElementById("current-report-links");
 
 let schemaFields = [];
 let pollTimer = null;
-
-async function api(path, options = {}) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok && !data.error) {
-    throw new Error(`${res.status} ${res.statusText}`);
-  }
-  if (data.error) {
-    throw new Error(data.error);
-  }
-  return data;
-}
 
 function showMessage(text, kind = "ok") {
   actionMessage.hidden = false;
@@ -128,6 +114,58 @@ function collectValues() {
   return values;
 }
 
+function renderCurrentReports(status) {
+  const reports = status.reports || [];
+  const primary = status.primary_report || (status.report_url ? { view_url: status.report_url, label: "Combined report" } : null);
+  const runsLink = `<a href="/runs">Previous runs</a>`;
+  const pending = status.running && !primary?.view_url;
+
+  if (!reports.length && !primary && !pending) {
+    currentReportLinks.hidden = false;
+    if (status.completed && status.results_dir) {
+      currentReportLinks.innerHTML =
+        `<strong>Reports:</strong> ` +
+        `<span class="muted">No HTML on droplet (graph generation was off).</span> ` +
+        `<button type="button" class="btn-generate inline" data-results-dir="${status.results_dir}">Generate report</button>` +
+        ` · ${runsLink}`;
+      const btn = currentReportLinks.querySelector(".btn-generate");
+      btn?.addEventListener("click", async () => {
+        btn.disabled = true;
+        btn.textContent = "Generating…";
+        try {
+          await generateRunReport(status.results_dir, btn);
+          await refreshStatus();
+        } catch (err) {
+          showMessage(err.message, "err");
+          btn.disabled = false;
+          btn.textContent = "Generate report";
+        }
+      });
+      return;
+    }
+    currentReportLinks.innerHTML = `<strong>Reports:</strong> ${runsLink}`;
+    return;
+  }
+
+  currentReportLinks.hidden = false;
+  const parts = [];
+
+  if (primary?.view_url) {
+    parts.push(reportLinkHtml(primary, primary.label || "View report"));
+  }
+
+  for (const report of reports) {
+    if (primary && report.path === primary.path) continue;
+    parts.push(reportLinkHtml(report));
+  }
+
+  currentReportLinks.innerHTML =
+    `<strong>Reports:</strong> ` +
+    (parts.length ? parts.join(" · ") : "") +
+    (pending ? `${parts.length ? " · " : ""}<span class="muted">Report available when the run finishes</span>` : "") +
+    ` · ${runsLink}`;
+}
+
 function renderRunStatus(status, config) {
   const running = !!status.running;
   const badge = running
@@ -144,6 +182,7 @@ function renderRunStatus(status, config) {
   ].filter(Boolean);
 
   runSummary.innerHTML = lines.map((line) => `<div>${line}</div>`).join("");
+  renderCurrentReports(status);
   btnStart.disabled = running;
 }
 
@@ -174,9 +213,7 @@ async function refreshStatus() {
 }
 
 async function loadInitial() {
-  const health = await api("/api/health");
-  connectionStatus.textContent = health.message;
-  connectionStatus.style.color = health.ok ? "var(--ok)" : "var(--err)";
+  await loadConnectionStatus(connectionStatus);
 
   const schema = await api("/api/schema");
   schemaFields = schema.fields;

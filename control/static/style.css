@@ -160,6 +160,122 @@ button:disabled {
   word-break: break-word;
 }
 
+.report-links {
+  margin: 0.75rem 0 0.25rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.report-links a,
+.runs-list a,
+.top-nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.report-links a:hover,
+.runs-list a:hover,
+.top-nav a:hover {
+  text-decoration: underline;
+}
+
+.top-nav {
+  margin-bottom: 0.75rem;
+  font-size: 0.92rem;
+}
+
+.section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
+.section-head .muted {
+  margin: 0;
+  flex: 1 1 240px;
+}
+
+.runs-list .run-block {
+  border-top: 1px solid var(--border);
+  padding: 0.85rem 0;
+}
+
+.runs-list .run-block:first-child {
+  border-top: none;
+  padding-top: 0;
+}
+
+.runs-list .run-title {
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+}
+
+.runs-list .run-meta {
+  font-size: 0.85rem;
+  color: var(--muted);
+  margin-bottom: 0.35rem;
+}
+
+.runs-list .run-primary {
+  margin: 0.35rem 0 0.5rem;
+  font-size: 0.92rem;
+}
+
+.runs-list ul {
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+.runs-list li {
+  margin-bottom: 0.25rem;
+}
+
+.badge.active-run {
+  background: rgba(59, 130, 246, 0.2);
+  color: var(--accent);
+  margin-left: 0.35rem;
+}
+
+.badge.latest-run {
+  background: rgba(59, 130, 246, 0.15);
+  color: var(--accent);
+  margin-left: 0.35rem;
+}
+
+.badge.completed {
+  background: rgba(34, 197, 94, 0.15);
+  color: var(--ok);
+  margin-left: 0.35rem;
+}
+
+.btn-generate {
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: var(--accent);
+  border-radius: 6px;
+  padding: 0.35rem 0.65rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+}
+
+.btn-generate.inline {
+  display: inline;
+  vertical-align: baseline;
+}
+
+.btn-generate:hover {
+  background: rgba(59, 130, 246, 0.12);
+}
+
+.btn-generate:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 @media (max-width: 640px) {
   .field { grid-template-columns: 1fr; }
   .field .help { grid-column: 1; }

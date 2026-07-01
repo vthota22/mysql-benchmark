@@ -8,7 +8,7 @@ LOCK_FILE="${REPO_ROOT}/results/.failover_run.lock"
 CONFIG="${BENCHMARK_CONF:-${REPO_ROOT}/benchmark.conf}"
 
 _usage() {
-  echo "Usage: $0 {status|start|log [lines]}" >&2
+  echo "Usage: $0 {status|start|log [lines]|list [limit]}" >&2
   exit 1
 }
 
@@ -76,12 +76,16 @@ _cmd_status() {
     results_dir="$(_resolve_results_dir "")"
   fi
 
-  local log_path="" report_path=""
+  local log_path="" report_path="" completed=0
   if [[ -n "${results_dir}" ]]; then
     log_path="${results_dir}/full_run.log"
     report_path="${results_dir}/advanced/graphs/failover_report.html"
     [[ -f "${REPO_ROOT}/${log_path}" ]] || log_path=""
     [[ -f "${REPO_ROOT}/${report_path}" ]] || report_path=""
+    if [[ -f "${REPO_ROOT}/${results_dir}/full_run.log" ]] \
+        && grep -q "=== Failover benchmark complete ===" "${REPO_ROOT}/${results_dir}/full_run.log" 2>/dev/null; then
+      completed=1
+    fi
   fi
 
   printf 'running=%s\n' "${running}"
@@ -90,6 +94,7 @@ _cmd_status() {
   printf 'started_utc=%s\n' "${started}"
   printf 'log_path=%s\n' "${log_path}"
   printf 'report_path=%s\n' "${report_path}"
+  printf 'completed=%s\n' "${completed}"
 }
 
 _cmd_start() {
@@ -144,9 +149,32 @@ _cmd_log() {
   tail -n "${lines}" "${log_file}"
 }
 
+_cmd_list() {
+  local limit="${1:-25}"
+  limit=$((limit < 1 ? 1 : limit))
+  limit=$((limit > 100 ? 100 : limit))
+
+  cd "${REPO_ROOT}"
+  ls -1dt results/failover_* 2>/dev/null | head -n "${limit}" | while IFS= read -r d; do
+    [[ -n "${d}" ]] || continue
+    printf 'RUN|%s\n' "${d}"
+    local completed=0
+    if [[ -f "${REPO_ROOT}/${d}/full_run.log" ]] \
+        && grep -q "=== Failover benchmark complete ===" "${REPO_ROOT}/${d}/full_run.log" 2>/dev/null; then
+      completed=1
+    fi
+    printf 'STATE|%s|%s\n' "${d}" "${completed}"
+    find "${d}" -name failover_report.html 2>/dev/null | sort | while IFS= read -r f; do
+      ts=$(stat -c %Y "${f}" 2>/dev/null || echo 0)
+      printf 'REPORT|%s|%s|%s\n' "${d}" "${f}" "${ts}"
+    done
+  done
+}
+
 case "${1:-}" in
   status) _cmd_status ;;
   start) _cmd_start ;;
   log) _cmd_log "${2:-100}" ;;
+  list) _cmd_list "${2:-25}" ;;
   *) _usage ;;
 esac

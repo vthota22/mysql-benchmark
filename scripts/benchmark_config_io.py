@@ -7,6 +7,35 @@ from dataclasses import dataclass
 
 _ASSIGNMENT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
 
+# Keys where surrounding quotes must not be stored (space-separated tokens for bash word-split).
+_TOKEN_LIST_KEYS = frozenset(
+    {
+        "FAILOVER_EDITIONS",
+        "FAILOVER_SCENARIOS",
+        "FAILOVER_THREAD_MATRIX",
+    }
+)
+
+_NUMERIC_KEYS = frozenset(
+    {
+        "FAILOVER_THREADS",
+        "FAILOVER_WARMUP_SEC",
+        "FAILOVER_BASELINE_SEC",
+        "FAILOVER_OBSERVE_SEC",
+        "FAILOVER_TRIGGER_SECOND",
+        "FAILOVER_REPORT_INTERVAL",
+        "FAILOVER_THREAD_DELAY_SEC",
+        "FAILOVER_SCENARIO_DELAY_SEC",
+        "FAILOVER_POD_DELETE_GRACE_SEC",
+        "FAILOVER_MYSQLD_KILL_SIGNAL",
+        "FAILOVER_TRIGGER_PREPARE_SEC",
+        "FAILOVER_MONITOR_INTERVAL",
+        "FAILOVER_MONITOR_CONNECT_TIMEOUT",
+        "FAILOVER_MONITOR_OP_TIMEOUT",
+        "FAILOVER_RECOVERY_STABLE_SEC",
+    }
+)
+
 
 @dataclass(frozen=True)
 class ParsedConfig:
@@ -22,6 +51,55 @@ def _unquote(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] == "'":
         return value[1:-1]
     return value
+
+
+def _parse_quoted_token(raw: str, quote: str) -> tuple[str, str]:
+    i = 1
+    while i < len(raw):
+        if raw[i] == "\\" and i + 1 < len(raw):
+            i += 2
+            continue
+        if raw[i] == quote:
+            return raw[: i + 1], raw[i + 1 :]
+        i += 1
+    return raw, ""
+
+
+def _split_value_and_comment(raw: str) -> tuple[str, str]:
+    """Split an assignment RHS into shell value text and trailing inline comment."""
+    raw = raw.rstrip()
+    if not raw:
+        return "", ""
+
+    if raw[0] in "\"'":
+        quote = raw[0]
+        value_token, rest = _parse_quoted_token(raw, quote)
+        rest = rest.lstrip()
+        if rest.startswith("#"):
+            return value_token, rest
+        return value_token, ""
+
+    for index, char in enumerate(raw):
+        if char == "#":
+            return raw[:index].rstrip(), raw[index:]
+    return raw, ""
+
+
+def parse_shell_value(raw: str) -> str:
+    """Parse a shell assignment RHS the way bash would (ignore inline comments)."""
+    value_token, _comment = _split_value_and_comment(raw)
+    if not value_token:
+        return ""
+    return _unquote(value_token.strip())
+
+
+def normalize_failover_value(key: str, value: str) -> str:
+    """Normalize values written by the control UI so bash/sysbench see clean tokens."""
+    cleaned = parse_shell_value(value)
+    if key in _TOKEN_LIST_KEYS or key in _NUMERIC_KEYS:
+        while len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in "\"'":
+            cleaned = cleaned[1:-1].strip()
+    return cleaned.strip()
 
 
 def format_value(value: str) -> str:
@@ -42,7 +120,7 @@ def parse_config(text: str) -> ParsedConfig:
             continue
         match = _ASSIGNMENT_RE.match(stripped)
         if match:
-            values[match.group(1)] = _unquote(match.group(2))
+            values[match.group(1)] = parse_shell_value(match.group(2))
     return ParsedConfig(lines=lines, values=values)
 
 
@@ -53,7 +131,7 @@ def get_keys(config: ParsedConfig, keys: list[str]) -> dict[str, str]:
 def merge_keys(text: str, updates: dict[str, str], *, insert_after: str | None = None) -> str:
     """Replace or append KEY=value assignments; preserve comments and unrelated lines."""
     parsed = parse_config(text)
-    remaining = dict(updates)
+    remaining = {key: normalize_failover_value(key, value) for key, value in updates.items()}
     out: list[str] = []
 
     for line in parsed.lines:
@@ -72,8 +150,10 @@ def merge_keys(text: str, updates: dict[str, str], *, insert_after: str | None =
         value = remaining.pop(key)
         if value == "" and key not in parsed.values:
             continue
+        _value_token, comment = _split_value_and_comment(match.group(2))
         indent = line[: len(line) - len(line.lstrip())]
-        out.append(f"{indent}{key}={format_value(value)}")
+        suffix = f" {comment.lstrip()}" if comment.strip() else ""
+        out.append(f"{indent}{key}={format_value(value)}{suffix}")
 
     if remaining:
         insert_at = len(out)

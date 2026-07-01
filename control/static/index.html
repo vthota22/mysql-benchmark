@@ -8,6 +8,9 @@
 </head>
 <body>
   <header>
+    <nav class="top-nav">
+      <a href="/runs">Previous runs →</a>
+    </nav>
     <h1>Failover benchmark control</h1>
     <p id="connection-status" class="muted">Checking droplet connection…</p>
   </header>
@@ -16,6 +19,7 @@
     <section class="card" id="run-panel">
       <h2>Run</h2>
       <div id="run-summary" class="run-summary muted">Loading status…</div>
+      <div id="current-report-links" class="report-links" hidden></div>
       <div class="actions">
         <button type="button" id="btn-save">Save config to droplet</button>
         <button type="button" id="btn-start" class="primary">Start failover benchmark</button>
@@ -36,6 +40,7 @@
     </section>
   </main>
 
+  <script src="/static/common.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

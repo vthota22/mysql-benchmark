@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Previous runs — Failover benchmark</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <nav class="top-nav">
+      <a href="/">← Control panel</a>
+    </nav>
+    <h1>Previous runs</h1>
+    <p id="connection-status" class="muted">Checking droplet connection…</p>
+  </header>
+
+  <main>
+    <section class="card">
+      <div class="section-head">
+        <p class="muted">Failover runs on the droplet. Reports are fetched over SSH and cached locally when opened.</p>
+        <button type="button" id="btn-refresh-runs">Refresh</button>
+      </div>
+      <div id="runs-list" class="runs-list muted">Loading…</div>
+    </section>
+  </main>
+
+  <script src="/static/common.js"></script>
+  <script src="/static/runs.js"></script>
+</body>
+</html>

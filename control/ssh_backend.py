@@ -145,3 +145,9 @@ class SshBackend:
                 key, value = line.split("=", 1)
                 data[key.strip()] = value.strip()
         return data
+
+    def scp_download(self, remote_path: str, local_path: Path) -> None:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        target = f"{self.config.user}@{self.config.host}:{remote_path}"
+        cmd = self._base_scp() + [target, str(local_path)]
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
