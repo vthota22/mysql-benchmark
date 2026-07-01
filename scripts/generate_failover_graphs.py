@@ -42,10 +42,6 @@ METRIC_HELP = {
         "Seconds from the first connect failure until the new primary is fully promoted "
         "and accepting writes: GR PRIMARY role (Advanced) and write probe INSERT succeeds (write_ok=1)."
     ),
-    "total_failover": (
-        "Total downtime from failover trigger until the new primary is promoted and accepting "
-        "writes (GR PRIMARY + write probe OK). Equals detection lag plus promotion time."
-    ),
 }
 
 
@@ -1040,7 +1036,6 @@ def _metrics_summary_html(
 
     detect = kpi.get("failure_detection_sec") or extended.get("failure_detect_sec", "N/A")
     promote = kpi.get("primary_election_sec") or extended.get("promote_sec", "N/A")
-    total_failover = kpi.get("total_failover_sec") or extended.get("total_failover_sec", "N/A")
 
     before = primary.get("PRIMARY_BEFORE") or extended.get("primary_before", "N/A")
     after = primary.get("PRIMARY_AFTER") or extended.get("primary_after", "N/A")
@@ -1057,15 +1052,6 @@ def _metrics_summary_html(
             _format_duration_sec(promote),
             METRIC_HELP["promote"],
             sub=f"Primary: {before} → {after} ({changed})",
-        ),
-        _metric_row(
-            "Total failover time (downtime)",
-            _format_duration_sec(total_failover),
-            METRIC_HELP["total_failover"],
-            sub=(
-                f"From trigger · detection {_format_duration_sec(detect)} + "
-                f"promotion {_format_duration_sec(promote)}"
-            ),
         ),
     ]
 
@@ -1613,6 +1599,51 @@ def _promotion_breakdown_html(scenario_dir: Path) -> str:
     """
 
 
+CHARTJS_ZOOM_CDN = """  <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.min.js"></script>"""
+
+CHART_ZOOM_CSS = """    .chart-hint-global { color: var(--muted); font-size: 0.8rem; margin: 0 0 1rem; }"""
+
+CHART_ZOOM_HINT = (
+    "Scroll or pinch to zoom · drag to select a time range · Shift+drag to pan · double-click a chart to reset"
+)
+
+CHART_ZOOM_JS = """
+    function chartZoomPlugin() {
+      return {
+        zoom: {
+          pan: {
+            enabled: true,
+            mode: "x",
+            modifierKey: "shift",
+          },
+          zoom: {
+            wheel: { enabled: true, speed: 0.1 },
+            pinch: { enabled: true },
+            drag: {
+              enabled: true,
+              backgroundColor: "rgba(56,189,248,0.12)",
+              borderColor: "rgba(56,189,248,0.45)",
+              borderWidth: 1,
+            },
+            mode: "x",
+          },
+          limits: {
+            x: { min: "original", max: "original" },
+          },
+        },
+      };
+    }
+
+    document.addEventListener("dblclick", (e) => {
+      const canvas = e.target.closest(".chart-wrap canvas");
+      if (!canvas) return;
+      const chart = Chart.getChart(canvas);
+      if (chart) chart.resetZoom();
+    });
+"""
+
+
 def generate_html_report(
     edition_dir: Path,
     rows: list[dict[str, float]],
@@ -1694,6 +1725,7 @@ def generate_html_report(
   <title>Failover report — {html.escape(edition)} / {html.escape(scenario)}</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+{CHARTJS_ZOOM_CDN}
   <style>
     :root {{
       --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --muted: #94a3b8;
@@ -1707,6 +1739,7 @@ def generate_html_report(
     }}
     h1 {{ font-size: 1.5rem; margin: 0 0 0.25rem; }}
     .subtitle {{ color: var(--muted); margin-bottom: 1.5rem; }}
+{CHART_ZOOM_CSS}
     .grid {{ display: grid; gap: 1rem; grid-template-columns: 1fr; align-items: stretch; }}
     @media (min-width: 960px) {{
       .grid {{ grid-template-columns: 360px 1fr; }}
@@ -1785,6 +1818,7 @@ def generate_html_report(
       {"<div class=\"card\"><h2>PNG exports</h2><ul>" + png_links + "</ul></div>" if png_links else ""}
     </div>
     <div class="main-column">
+      <p class="chart-hint-global">{html.escape(CHART_ZOOM_HINT)}</p>
       <div class="card">
         <h2>TPS &amp; QPS</h2>
         <div class="chart-wrap"><canvas id="tpsQpsChart"></canvas></div>
@@ -1841,6 +1875,7 @@ def generate_html_report(
         y: {{ title: {{ display: true, text: yTitle }}, beginAtZero: true }}
       }};
     }}
+{CHART_ZOOM_JS}
 
     new Chart(document.getElementById("tpsQpsChart"), {{
       type: "line",
@@ -1853,7 +1888,7 @@ def generate_html_report(
       }},
       options: {{
         responsive: true, maintainAspectRatio: false, interaction: {{ mode: "index", intersect: false }},
-        plugins: triggerAnnotations(),
+        plugins: Object.assign({{}}, triggerAnnotations(), chartZoomPlugin()),
         scales: {{
           x: {{ title: {{ display: true, text: "Elapsed time (s)" }} }},
           y: {{ type: "linear", position: "left", title: {{ display: true, text: "TPS" }}, beginAtZero: true }},
@@ -1873,7 +1908,7 @@ def generate_html_report(
       }},
       options: {{
         responsive: true, maintainAspectRatio: false, interaction: {{ mode: "index", intersect: false }},
-        plugins: triggerAnnotations(), scales: baseScales("Rate (/s)")
+        plugins: Object.assign({{}}, triggerAnnotations(), chartZoomPlugin()), scales: baseScales("Rate (/s)")
       }}
     }});
 
@@ -1887,7 +1922,7 @@ def generate_html_report(
       }},
       options: {{
         responsive: true, maintainAspectRatio: false, interaction: {{ mode: "index", intersect: false }},
-        plugins: triggerAnnotations(), scales: baseScales("Latency p95 (ms)")
+        plugins: Object.assign({{}}, triggerAnnotations(), chartZoomPlugin()), scales: baseScales("Latency p95 (ms)")
       }}
     }});
   </script>
@@ -1912,66 +1947,75 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
             bundles[key] = bundle
             edition = bundle["edition"]
 
-    default_threads = next((t for t in thread_counts if any(f"{t}:{s}" in bundles for s in scenario_list)), thread_counts[0])
-    default_scenario = next(
-        (s for s in scenario_list if f"{default_threads}:{s}" in bundles),
-        scenario_list[0],
-    )
+    active_thread_counts = sorted({int(key.split(":", 1)[0]) for key in bundles})
+    active_scenarios = sorted({key.split(":", 1)[1] for key in bundles})
+    if not active_thread_counts or not active_scenarios:
+        active_thread_counts = thread_counts
+        active_scenarios = scenario_list
+
+    default_threads = active_thread_counts[0]
+    default_scenario = active_scenarios[0]
 
     panels: list[str] = []
     chart_payload: dict[str, dict] = {}
-    for threads in thread_counts:
-        for scenario in scenario_list:
-            key = f"{threads}:{scenario}"
-            panel_id = f"panel_t{threads}_{scenario}"
-            hidden = "" if (threads == default_threads and scenario == default_scenario) else ' style="display:none"'
-            bundle = bundles.get(key)
-            if bundle:
-                meta_html = _meta_table_html(_meta_rows_for_bundle(bundle))
-                metrics_html = _metrics_summary_html(
-                    bundle["kpi"], bundle["extended"], bundle["primary"], bundle["parsed"]
-                )
-                monitor_html = _monitor_trigger_table_html(Path(bundle["dir"]), bundle)
-                compare_html = _before_after_throughput_table_html(bundle)
-                chart_payload[key] = bundle["chart_data"]
-                panels.append(
-                    f'<div class="run-panel" id="{panel_id}" data-threads="{threads}" '
-                    f'data-scenario="{html.escape(scenario)}"{hidden}>'
-                    f'<div class="grid"><div class="sidebar">'
-                    f'<div class="card sidebar-meta"><h2>Run metadata</h2><table><tbody>{meta_html}</tbody></table></div>'
-                    f"</div><div class=\"main-column\">"
-                    f'<div class="card"><h2>TPS &amp; QPS</h2><div class="chart-wrap">'
-                    f'<canvas id="tpsQps_{panel_id}"></canvas></div></div>'
-                    f'<div class="card"><h2>Latency p95 (ms)</h2><div class="chart-wrap">'
-                    f'<canvas id="latency_{panel_id}"></canvas></div></div>'
-                    f'<div class="card"><h2>Primary transition at trigger</h2>{monitor_html}</div>'
-                    f'<div class="card"><h2>Metrics before vs after failover</h2>{compare_html}</div>'
-                    f'<div class="card"><h2>Failover metrics</h2>{metrics_html}</div>'
-                    f'<div class="card"><h2>Errors &amp; reconnects</h2><div class="chart-wrap">'
-                    f'<canvas id="errors_{panel_id}"></canvas></div></div>'
-                    f"</div></div></div>"
-                )
-            else:
-                panels.append(
-                    f'<div class="run-panel run-panel-empty" id="{panel_id}" data-threads="{threads}" '
-                    f'data-scenario="{html.escape(scenario)}"{hidden}>'
-                    f'<div class="card empty-state">'
-                    f"<h2>No data</h2>"
-                    f"<p>No failover results for <strong>{threads} threads</strong> · "
-                    f"<strong>{html.escape(scenario)}</strong> in this run.</p>"
-                    f"</div></div>"
-                )
+    for key in sorted(bundles):
+        threads_s, scenario = key.split(":", 1)
+        threads = int(threads_s)
+        panel_id = f"panel_t{threads}_{scenario}"
+        hidden = "" if (threads == default_threads and scenario == default_scenario) else ' style="display:none"'
+        bundle = bundles[key]
+        meta_html = _meta_table_html(_meta_rows_for_bundle(bundle))
+        metrics_html = _metrics_summary_html(
+            bundle["kpi"], bundle["extended"], bundle["primary"], bundle["parsed"]
+        )
+        monitor_html = _monitor_trigger_table_html(Path(bundle["dir"]), bundle)
+        compare_html = _before_after_throughput_table_html(bundle)
+        chart_payload[key] = bundle["chart_data"]
+        panels.append(
+            f'<div class="run-panel" id="{panel_id}" data-threads="{threads}" '
+            f'data-scenario="{html.escape(scenario)}"{hidden}>'
+            f'<div class="grid"><div class="sidebar">'
+            f'<div class="card sidebar-meta"><h2>Run metadata</h2><table><tbody>{meta_html}</tbody></table></div>'
+            f"</div><div class=\"main-column\">"
+            f'<div class="card"><h2>TPS &amp; QPS</h2><div class="chart-wrap">'
+            f'<canvas id="tpsQps_{panel_id}"></canvas></div></div>'
+            f'<div class="card"><h2>Latency p95 (ms)</h2><div class="chart-wrap">'
+            f'<canvas id="latency_{panel_id}"></canvas></div></div>'
+            f'<div class="card"><h2>Primary transition at trigger</h2>{monitor_html}</div>'
+            f'<div class="card"><h2>Metrics before vs after failover</h2>{compare_html}</div>'
+            f'<div class="card"><h2>Failover metrics</h2>{metrics_html}</div>'
+            f'<div class="card"><h2>Errors &amp; reconnects</h2><div class="chart-wrap">'
+            f'<canvas id="errors_{panel_id}"></canvas></div></div>'
+            f"</div></div></div>"
+        )
 
     thread_buttons = "".join(
         f'<button type="button" class="toggle-btn{" active" if t == default_threads else ""}" '
         f'data-threads="{t}">{t} threads</button>'
-        for t in thread_counts
+        for t in active_thread_counts
     )
     scenario_buttons = "".join(
         f'<button type="button" class="toggle-btn scenario-btn{" active" if s == default_scenario else ""}" '
         f'data-scenario="{html.escape(s)}">{html.escape(s)}</button>'
-        for s in scenario_list
+        for s in active_scenarios
     )
+    thread_toolbar = (
+        f'<div class="toolbar"><span class="toolbar-label">Threads:</span>{thread_buttons}</div>'
+        if len(active_thread_counts) > 1
+        else ""
+    )
+    scenario_toolbar = (
+        f'<div class="toolbar"><span class="toolbar-label">Scenario:</span>{scenario_buttons}</div>'
+        if len(active_scenarios) > 1
+        else ""
+    )
+    if len(active_thread_counts) > 1:
+        subtitle = f"{html.escape(edition)} · thread sweep · select load threads and scenario below"
+    elif len(active_scenarios) > 1:
+        subtitle = f"{html.escape(edition)} · select scenario below"
+    else:
+        scenario_label = html.escape(active_scenarios[0])
+        subtitle = f"{html.escape(edition)} · {scenario_label}"
 
     out_path = edition_dir / "graphs" / "failover_report.html"
     out_path.parent.mkdir(exist_ok=True)
@@ -1984,6 +2028,7 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
   <title>Failover report — {html.escape(edition)} (thread comparison)</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+{CHARTJS_ZOOM_CDN}
   <style>
     :root {{
       --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --muted: #94a3b8;
@@ -1997,6 +2042,7 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
     }}
     h1 {{ font-size: 1.5rem; margin: 0 0 0.25rem; }}
     .subtitle {{ color: var(--muted); margin-bottom: 1rem; }}
+{CHART_ZOOM_CSS}
     .toolbar {{ display: flex; flex-wrap: wrap; gap: 0.5rem; margin-bottom: 1rem; align-items: center; }}
     .toolbar-label {{ color: var(--muted); font-size: 0.85rem; margin-right: 0.25rem; }}
     .toggle-btn {{
@@ -2069,16 +2115,12 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
 </head>
 <body>
   <h1>Failover benchmark report</h1>
-  <p class="subtitle">{html.escape(edition)} · thread sweep · select load threads and scenario below</p>
+  <p class="subtitle">{subtitle}</p>
 
-  <div class="toolbar">
-    <span class="toolbar-label">Threads:</span>
-    {thread_buttons}
-  </div>
-  <div class="toolbar">
-    <span class="toolbar-label">Scenario:</span>
-    {scenario_buttons}
-  </div>
+  {thread_toolbar}
+  {scenario_toolbar}
+
+  <p class="chart-hint-global">{html.escape(CHART_ZOOM_HINT)}</p>
 
   {''.join(panels)}
 
@@ -2124,6 +2166,7 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
         y: {{ title: {{ display: true, text: yTitle }}, beginAtZero: true }}
       }};
     }}
+{CHART_ZOOM_JS}
 
     function renderCharts(threads, scenario) {{
       const key = runKey(threads, scenario);
@@ -2142,7 +2185,7 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
         }},
         options: {{
           responsive: true, maintainAspectRatio: false, interaction: {{ mode: "index", intersect: false }},
-          plugins: triggerAnnotations(DATA),
+          plugins: Object.assign({{}}, triggerAnnotations(DATA), chartZoomPlugin()),
           scales: {{
             x: {{ title: {{ display: true, text: "Elapsed time (s)" }} }},
             y: {{ type: "linear", position: "left", title: {{ display: true, text: "TPS" }}, beginAtZero: true }},
@@ -2161,7 +2204,7 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
         }},
         options: {{
           responsive: true, maintainAspectRatio: false, interaction: {{ mode: "index", intersect: false }},
-          plugins: triggerAnnotations(DATA), scales: baseScales("Rate (/s)")
+          plugins: Object.assign({{}}, triggerAnnotations(DATA), chartZoomPlugin()), scales: baseScales("Rate (/s)")
         }}
       }});
       charts.lat = new Chart(document.getElementById("latency_" + panelId), {{
@@ -2174,7 +2217,7 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
         }},
         options: {{
           responsive: true, maintainAspectRatio: false, interaction: {{ mode: "index", intersect: false }},
-          plugins: triggerAnnotations(DATA), scales: baseScales("Latency p95 (ms)")
+          plugins: Object.assign({{}}, triggerAnnotations(DATA), chartZoomPlugin()), scales: baseScales("Latency p95 (ms)")
         }}
       }});
     }}

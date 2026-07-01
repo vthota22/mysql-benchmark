@@ -128,7 +128,7 @@ write_failover_benchmark_config() {
     echo "FAILOVER_THREADS=${load_threads}"
     echo "TPCC_SCALE=${scale}"
     echo "TPCC_TABLES=${tables}"
-    echo "TPCC_THREADS=${prep_threads}"
+    echo "TPCC_THREADS=${load_threads}"
     echo "PREP_THREADS=${prep_threads}"
     echo "FAILOVER_THREAD_MATRIX=${FAILOVER_THREAD_MATRIX:-}"
     echo "FAILOVER_SCENARIOS=${FAILOVER_SCENARIOS:-mixed write_only}"
@@ -890,7 +890,7 @@ run_tpcc_failover_load() {
   echo "FAILOVER_THREADS=${FAILOVER_THREADS}" >> "${results_dir}/sysbench_timing.txt"
   echo "TPCC_SCALE=${TPCC_SCALE:-100}" >> "${results_dir}/sysbench_timing.txt"
   echo "TPCC_TABLES=${TPCC_TABLES:-10}" >> "${results_dir}/sysbench_timing.txt"
-  echo "TPCC_THREADS=${PREP_THREADS:-16}" >> "${results_dir}/sysbench_timing.txt"
+  echo "TPCC_THREADS=${FAILOVER_THREADS}" >> "${results_dir}/sysbench_timing.txt"
   echo "PREP_THREADS=${PREP_THREADS:-16}" >> "${results_dir}/sysbench_timing.txt"
 
   : > "${log_file}"

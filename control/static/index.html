@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Failover benchmark control</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>Failover benchmark control</h1>
+    <p id="connection-status" class="muted">Checking droplet connection…</p>
+  </header>
+
+  <main>
+    <section class="card" id="run-panel">
+      <h2>Run</h2>
+      <div id="run-summary" class="run-summary muted">Loading status…</div>
+      <div class="actions">
+        <button type="button" id="btn-save">Save config to droplet</button>
+        <button type="button" id="btn-start" class="primary">Start failover benchmark</button>
+        <button type="button" id="btn-refresh">Refresh status</button>
+      </div>
+      <p id="action-message" class="message" hidden></p>
+    </section>
+
+    <section class="card">
+      <h2>Failover settings</h2>
+      <p class="muted">Edits are saved to <code id="remote-conf-path">benchmark.conf</code> on the droplet (backup as <code>.bak</code>).</p>
+      <form id="config-form"></form>
+    </section>
+
+    <section class="card">
+      <h2>Run log</h2>
+      <pre id="run-log" class="log">No log yet.</pre>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

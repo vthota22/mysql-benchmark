@@ -1,0 +1,22 @@
+# Local control UI — copy to control.local.conf (gitignored) and fill in your droplet.
+#
+#   cp control.local.conf.example control.local.conf
+#
+# Then from your laptop:
+#   python3 control_ui.py
+#   open http://127.0.0.1:8765
+
+DROPLET_HOST=your-droplet-ip-or-hostname
+DROPLET_USER=root
+DROPLET_SSH_PORT=22
+# Optional if not using default ssh agent / ~/.ssh/config
+# DROPLET_SSH_KEY=~/.ssh/id_rsa
+
+# Path to this repo on the droplet (where run_failover_benchmark.sh lives)
+REMOTE_REPO=/root/mysql-benchmark
+
+# benchmark.conf path relative to REMOTE_REPO
+REMOTE_BENCHMARK_CONF=benchmark.conf
+
+# Local UI bind (override on CLI: python3 control_ui.py --port 8765)
+# CONTROL_PORT=8765
