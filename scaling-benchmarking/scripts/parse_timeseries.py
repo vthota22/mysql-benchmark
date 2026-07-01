@@ -16,7 +16,7 @@ INTERVAL_RE = re.compile(
     r"^(?:\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z\]\s+)?"
     r"\[\s*(\d+)s\s*\]\s+thds:\s+(\d+)\s+tps:\s+([\d.]+)\s+qps:\s+([\d.]+)\s+"
     r"\(r/w/o:\s+([\d.]+)/([\d.]+)/([\d.]+)\)\s+"
-    r"lat \(ms,95%\):\s+([\d.]+)\s+err/s\s+([\d.]+)\s+reconn/s:\s+([\d.]+)"
+    r"lat \(ms,(\d+)%\):\s+([\d.]+)\s+err/s\s+([\d.]+)\s+reconn/s:\s+([\d.]+)"
 )
 
 ENV_LINE_RE = re.compile(r"^([A-Z_]+)=(.*)$")
@@ -31,9 +31,10 @@ class Interval:
     qps_read: float
     qps_write: float
     qps_other: float
-    lat_p95: float
+    lat_pct: float
     err_per_sec: float
     reconn_per_sec: float
+    percentile: int = 99
     phase: str = ""
     wall_clock_utc: str = ""
 
@@ -187,9 +188,10 @@ def parse_intervals(path: Path) -> list[Interval]:
                 qps_read=float(match.group(5)),
                 qps_write=float(match.group(6)),
                 qps_other=float(match.group(7)),
-                lat_p95=float(match.group(8)),
-                err_per_sec=float(match.group(9)),
-                reconn_per_sec=float(match.group(10)),
+                lat_pct=float(match.group(9)),
+                err_per_sec=float(match.group(10)),
+                reconn_per_sec=float(match.group(11)),
+                percentile=int(match.group(8)),
             )
         )
     return rows
@@ -208,7 +210,8 @@ def write_timeseries_csv(intervals: list[Interval], out_path: Path) -> None:
             "qps_read",
             "qps_write",
             "qps_other",
-            "lat_p95",
+            "lat_pct",
+            "percentile",
             "err_per_sec",
             "reconn_per_sec",
         ])
@@ -223,7 +226,8 @@ def write_timeseries_csv(intervals: list[Interval], out_path: Path) -> None:
                 row.qps_read,
                 row.qps_write,
                 row.qps_other,
-                row.lat_p95,
+                row.lat_pct,
+                row.percentile,
                 row.err_per_sec,
                 row.reconn_per_sec,
             ])

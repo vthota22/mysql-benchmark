@@ -66,9 +66,10 @@ class MetricRow:
     qps_read: float
     qps_write: float
     qps_other: float
-    lat_p95: float
+    lat_pct: float
     err_per_sec: float
     reconn_per_sec: float
+    percentile: int = 99
 
 
 @dataclass
@@ -162,6 +163,8 @@ def load_metrics(path: Path) -> list[MetricRow]:
     with path.open(encoding="utf-8", errors="replace", newline="") as handle:
         reader = csv.DictReader(handle)
         for raw in reader:
+            lat_val = float(raw.get("lat_pct") or raw.get("lat_p95", 0))
+            pct = int(raw["percentile"]) if "percentile" in raw else 95
             rows.append(
                 MetricRow(
                     wall_clock_utc=raw["wall_clock_utc"],
@@ -173,9 +176,10 @@ def load_metrics(path: Path) -> list[MetricRow]:
                     qps_read=float(raw["qps_read"]),
                     qps_write=float(raw["qps_write"]),
                     qps_other=float(raw["qps_other"]),
-                    lat_p95=float(raw["lat_p95"]),
+                    lat_pct=lat_val,
                     err_per_sec=float(raw["err_per_sec"]),
                     reconn_per_sec=float(raw["reconn_per_sec"]),
+                    percentile=pct,
                 )
             )
     return rows
@@ -381,20 +385,27 @@ def add_scale_markers(
         )
 
 
+def _detect_percentile(metrics: list[MetricRow]) -> int:
+    if metrics:
+        return metrics[0].percentile
+    return 99
+
+
 def build_metrics_figure(
     metrics: list[MetricRow], timing: dict[str, str], run_dir: Path
 ) -> go.Figure:
+    pct = _detect_percentile(metrics)
     fig = make_subplots(
         rows=4,
         cols=1,
         shared_xaxes=True,
         vertical_spacing=0.06,
-        subplot_titles=("TPS", "QPS", "Latency p95 (ms)", "Errors & reconnects / sec"),
+        subplot_titles=("TPS", "QPS", f"Latency p{pct} (ms)", "Errors & reconnects / sec"),
     )
 
     add_phase_traces(fig, metrics, "tps", row=1, col=1)
     add_phase_traces(fig, metrics, "qps", row=2, col=1)
-    add_phase_traces(fig, metrics, "lat_p95", row=3, col=1)
+    add_phase_traces(fig, metrics, "lat_pct", row=3, col=1)
     add_phase_traces(fig, metrics, "err_per_sec", row=4, col=1)
     add_phase_traces(fig, metrics, "reconn_per_sec", row=4, col=1)
 
@@ -413,9 +424,13 @@ def build_metrics_figure(
 
 def phase_summary_pivoted(metrics: list[MetricRow]) -> str:
     """Render phase summary as a pivoted table: phases as columns, metrics as rows."""
+    pct = _detect_percentile(metrics)
     phases = ("pre_scaling", "during_scaling", "post_scaling")
     phase_labels = ("Pre-scaling", "During scaling", "Post-scaling")
     stats: dict[str, dict[str, str]] = {}
+
+    avg_lat_key = f"Avg p{pct} latency (ms)"
+    max_lat_key = f"Max latency p{pct} (ms)"
 
     for phase in phases:
         rows = [m for m in metrics if m.phase == phase]
@@ -423,15 +438,15 @@ def phase_summary_pivoted(metrics: list[MetricRow]) -> str:
             stats[phase] = {
                 "Samples": str(len(rows)),
                 "Avg TPS": f"{sum(m.tps for m in rows) / len(rows):.2f}",
-                "Avg p95 latency (ms)": f"{sum(m.lat_p95 for m in rows) / len(rows):.2f}",
+                avg_lat_key: f"{sum(m.lat_pct for m in rows) / len(rows):.2f}",
                 "Max errors/s": f"{max(m.err_per_sec for m in rows):.2f}",
                 "Avg QPS": f"{sum(m.qps for m in rows) / len(rows):.2f}",
-                "Max latency p95 (ms)": f"{max(m.lat_p95 for m in rows):.2f}",
+                max_lat_key: f"{max(m.lat_pct for m in rows):.2f}",
             }
         else:
             stats[phase] = {k: "N/A" for k in (
-                "Samples", "Avg TPS", "Avg p95 latency (ms)",
-                "Max errors/s", "Avg QPS", "Max latency p95 (ms)",
+                "Samples", "Avg TPS", avg_lat_key,
+                "Max errors/s", "Avg QPS", max_lat_key,
             )}
 
     header = "<tr><th>Metric</th>" + "".join(
@@ -439,8 +454,8 @@ def phase_summary_pivoted(metrics: list[MetricRow]) -> str:
     ) + "</tr>"
 
     metric_keys = [
-        "Samples", "Avg TPS", "Avg p95 latency (ms)",
-        "Max errors/s", "Avg QPS", "Max latency p95 (ms)",
+        "Samples", "Avg TPS", avg_lat_key,
+        "Max errors/s", "Avg QPS", max_lat_key,
     ]
     body_rows = ""
     for key in metric_keys:

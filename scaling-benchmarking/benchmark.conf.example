@@ -24,6 +24,8 @@ TPCC_WARMUP_SEC=30
 TPCC_REPORT_INTERVAL=1
 TPCC_FORCE_PK=1
 TPCC_TRX_LEVEL=RR
+# Latency percentile reported by sysbench (default 99 = p99). Set to 95 for p95.
+TPCC_PERCENTILE=99
 
 # Survive resize/failover and TPC-C lock contention without FATAL thread exit (run phase only).
 # Resize/failover: 1290/1836=read-only, 1053=shutdown, 2006/2013/2055/2011=connection loss, 3100=repl hook

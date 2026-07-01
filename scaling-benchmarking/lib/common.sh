@@ -275,6 +275,7 @@ run_tpcc() {
         --time="${run_time}" \
         --warmup-time="${TPCC_WARMUP_SEC:-0}" \
         --report-interval="${TPCC_REPORT_INTERVAL:-1}" \
+        --percentile="${TPCC_PERCENTILE:-99}" \
         --mysql-ignore-errors="${ignore_errors}" \
         --db-ps-mode=disable \
         run
