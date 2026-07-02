@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Quick TPC-C try-run: fire a workload against the cluster and see how it performs.
-# No scaling, no database init — just connect, run, and print results.
+# No scaling, no database init, no saved results — just connect, run, and print output.
 #
 # Usage:
 #   ./try_run.sh <threads> <duration_seconds>
@@ -43,7 +43,6 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG="${BENCHMARK_CONF:-${SCRIPT_DIR}/benchmark.conf}"
-TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
 # shellcheck source=scaling-benchmarking/lib/common.sh
 source "${SCRIPT_DIR}/lib/common.sh"
@@ -51,13 +50,24 @@ source "${SCRIPT_DIR}/lib/common.sh"
 setup_paths
 load_config "${CONFIG}"
 
-# Only need DB connection vars, not scaling config.
 : "${ENGINE:?Set ENGINE in benchmark.conf (standard or advanced)}"
-: "${MYSQL_HOST:?Set MYSQL_HOST in benchmark.conf}"
-: "${MYSQL_PORT:?Set MYSQL_PORT in benchmark.conf}"
-: "${MYSQL_USER:?Set MYSQL_USER in benchmark.conf}"
-: "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in benchmark.conf}"
 : "${MYSQL_DB:?Set MYSQL_DB in benchmark.conf}"
+
+export DO_API_TOKEN="${DO_API_TOKEN:-}"
+export DO_API_URL="${DO_API_URL:-}"
+export CLUSTER_ID="${CLUSTER_ID:-}"
+
+# Auto-fetch connection details from doctl if not set
+if [[ -z "${MYSQL_HOST:-}" || -z "${MYSQL_PORT:-}" || -z "${MYSQL_USER:-}" || -z "${MYSQL_PASSWORD:-}" ]]; then
+  if [[ -n "${CLUSTER_ID:-}" && -n "${DO_API_TOKEN:-}" ]]; then
+    fetch_cluster_details
+  fi
+fi
+
+: "${MYSQL_HOST:?Set MYSQL_HOST in benchmark.conf or provide CLUSTER_ID + DO_API_TOKEN}"
+: "${MYSQL_PORT:?Set MYSQL_PORT in benchmark.conf or provide CLUSTER_ID + DO_API_TOKEN}"
+: "${MYSQL_USER:?Set MYSQL_USER in benchmark.conf or provide CLUSTER_ID + DO_API_TOKEN}"
+: "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in benchmark.conf or provide CLUSTER_ID + DO_API_TOKEN}"
 
 export ENGINE MYSQL_HOST MYSQL_PORT MYSQL_USER MYSQL_PASSWORD MYSQL_DB
 
@@ -72,13 +82,6 @@ export TPCC_PERCENTILE="${TPCC_PERCENTILE:-99}"
 export TPCC_MAX_TIME="${DURATION}"
 export TPCC_IGNORE_ERRORS="${TPCC_IGNORE_ERRORS:-1290,1836,1053,2013,2006,2055,2011,3100,1205,1213,1020}"
 
-RESULTS_BASE="${SCRIPT_DIR}/${RESULTS_DIR:-results}"
-RUN_DIR="${RESULTS_BASE}/tryrun_${TIMESTAMP}_${ENGINE}_${THREADS}t_${DURATION}s"
-mkdir -p "${RUN_DIR}"
-
-RUN_LOG="${RUN_DIR}/tpcc_run.log"
-FULL_LOG="${RUN_DIR}/benchmark.log"
-
 preflight_checks
 
 echo "=== TPC-C try-run ==="
@@ -89,11 +92,8 @@ echo "Threads:  ${THREADS}"
 echo "Duration: ${DURATION}s"
 echo "Warmup:   ${TPCC_WARMUP_SEC}s"
 echo "Tables:   ${TPCC_TABLES}  Scale: ${TPCC_SCALE}"
-echo "Run dir:  ${RUN_DIR}"
 echo "Sysbench: $("${BENCH_ROOT}/which_sysbench.sh")"
 echo ""
-
-exec > >(tee -a "${FULL_LOG}") 2>&1
 
 # Connectivity check
 mysql_connectivity_check || { echo "ERROR: cannot connect to MySQL — aborting" >&2; exit 1; }
@@ -107,10 +107,8 @@ fi
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] TPC-C tables verified — starting workload"
 echo ""
 
-: > "${RUN_LOG}"
-
-run_tpcc run 2>&1 | tee -a "${RUN_LOG}"
-tpcc_rc=${PIPESTATUS[0]}
+run_tpcc run 2>&1
+tpcc_rc=$?
 
 echo ""
 if [[ "${tpcc_rc}" -eq 0 ]]; then
@@ -118,7 +116,5 @@ if [[ "${tpcc_rc}" -eq 0 ]]; then
 else
   echo "=== try-run finished with errors (rc=${tpcc_rc}) ==="
 fi
-echo "Run log: ${RUN_LOG}"
-echo "Full log: ${FULL_LOG}"
 
 exit "${tpcc_rc}"

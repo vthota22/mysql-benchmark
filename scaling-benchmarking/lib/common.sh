@@ -61,6 +61,175 @@ scaling_enabled() {
   [[ "${SKIP_SCALING:-0}" != "1" ]]
 }
 
+k8s_monitor_enabled() {
+  [[ -n "${K8S_KUBECONFIG:-}" && -f "${K8S_KUBECONFIG:-/nonexistent}" ]]
+}
+
+gib_to_mib() {
+  local gib="${1:?GiB value required}"
+  echo $(( gib * 1024 ))
+}
+
+# Extract vCPU count from a DO slug (e.g. "gd-8vcpu-32gb" -> 8).
+slug_vcpu() {
+  local slug="${1:-}" match
+  match="$(echo "${slug}" | grep -oE '[0-9]+vcpu' | grep -oE '[0-9]+')" || true
+  echo "${match:-0}"
+}
+
+# Extract memory GB from a DO slug (e.g. "gd-8vcpu-32gb" -> 32).
+slug_mem_gb() {
+  local slug="${1:-}" match
+  match="$(echo "${slug}" | grep -oE '[0-9]+gb' | grep -oE '[0-9]+')" || true
+  echo "${match:-0}"
+}
+
+# Compare initial vs target state and print a human-readable scaling description.
+# Output: one or more lines like "vertical_scale_up (4vcpu/16gb -> 8vcpu/32gb)"
+# Sets SCALE_TYPES (comma-separated) for programmatic use.
+determine_scale_type() {
+  SCALE_TYPES=""
+  SCALE_DESCRIPTION=""
+
+  if ! scaling_enabled; then
+    SCALE_TYPES="none"
+    SCALE_DESCRIPTION="scaling disabled"
+    return
+  fi
+
+  local parts=()
+
+  # Vertical: compare slugs
+  if [[ -n "${INITIAL_SIZE:-}" && -n "${SCALE_TARGET_SIZE:-}" ]]; then
+    if [[ "${INITIAL_SIZE}" != "${SCALE_TARGET_SIZE}" ]]; then
+      local init_cpu init_mem target_cpu target_mem
+      init_cpu="$(slug_vcpu "${INITIAL_SIZE}")"
+      init_mem="$(slug_mem_gb "${INITIAL_SIZE}")"
+      target_cpu="$(slug_vcpu "${SCALE_TARGET_SIZE}")"
+      target_mem="$(slug_mem_gb "${SCALE_TARGET_SIZE}")"
+
+      if (( target_cpu > init_cpu || target_mem > init_mem )); then
+        parts+=("vertical_scale_up (${INITIAL_SIZE} -> ${SCALE_TARGET_SIZE})")
+      elif (( target_cpu < init_cpu || target_mem < init_mem )); then
+        parts+=("vertical_scale_down (${INITIAL_SIZE} -> ${SCALE_TARGET_SIZE})")
+      else
+        parts+=("vertical_change (${INITIAL_SIZE} -> ${SCALE_TARGET_SIZE})")
+      fi
+    fi
+  fi
+
+  # Horizontal: compare node counts
+  if [[ -n "${INITIAL_NUM_NODES:-}" && -n "${SCALE_NUM_NODES:-}" ]]; then
+    if (( SCALE_NUM_NODES > INITIAL_NUM_NODES )); then
+      parts+=("horizontal_scale_up (${INITIAL_NUM_NODES} -> ${SCALE_NUM_NODES} nodes)")
+    elif (( SCALE_NUM_NODES < INITIAL_NUM_NODES )); then
+      parts+=("horizontal_scale_down (${INITIAL_NUM_NODES} -> ${SCALE_NUM_NODES} nodes)")
+    fi
+  fi
+
+  # Storage: compare storage GiB
+  if [[ -n "${INITIAL_STORAGE_SIZE_GIB:-}" && -n "${SCALE_STORAGE_SIZE_GIB:-}" ]]; then
+    if (( SCALE_STORAGE_SIZE_GIB > INITIAL_STORAGE_SIZE_GIB )); then
+      parts+=("storage_scale_up (${INITIAL_STORAGE_SIZE_GIB} -> ${SCALE_STORAGE_SIZE_GIB} GiB)")
+    elif (( SCALE_STORAGE_SIZE_GIB < INITIAL_STORAGE_SIZE_GIB )); then
+      parts+=("storage_scale_down (${INITIAL_STORAGE_SIZE_GIB} -> ${SCALE_STORAGE_SIZE_GIB} GiB)")
+    fi
+  fi
+
+  if [[ ${#parts[@]} -eq 0 ]]; then
+    SCALE_TYPES="unknown"
+    SCALE_DESCRIPTION="scaling target matches initial state or initial state unknown"
+    return
+  fi
+
+  # Build comma-separated type list and multi-line description
+  local types=()
+  local t
+  for p in "${parts[@]}"; do
+    t="${p%% \(*}"
+    types+=("${t}")
+  done
+  SCALE_TYPES="$(IFS=,; echo "${types[*]}")"
+  SCALE_DESCRIPTION="$(printf '%s\n' "${parts[@]}")"
+}
+
+# Auto-fetch cluster details and connection info from doctl when not set.
+# Requires CLUSTER_ID and DO_API_TOKEN to be set.
+fetch_cluster_details() {
+  if [[ -z "${CLUSTER_ID:-}" || -z "${DO_API_TOKEN:-}" ]]; then
+    return 1
+  fi
+  if ! command -v doctl >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local needs_cluster=0 needs_conn=0
+  if [[ -z "${INITIAL_SIZE:-}" || -z "${INITIAL_NUM_NODES:-}" || -z "${INITIAL_STORAGE_SIZE_GIB:-}" ]]; then
+    needs_cluster=1
+  fi
+  if [[ -z "${MYSQL_HOST:-}" || -z "${MYSQL_PORT:-}" || -z "${MYSQL_USER:-}" || -z "${MYSQL_PASSWORD:-}" ]]; then
+    needs_conn=1
+  fi
+
+  if [[ "${needs_cluster}" -eq 0 && "${needs_conn}" -eq 0 ]]; then
+    return 0
+  fi
+
+  log_phase "0_FETCH" "auto-fetching cluster details from doctl (cluster=${CLUSTER_ID})"
+
+  if [[ "${needs_cluster}" -eq 1 ]]; then
+    local cluster_info
+    cluster_info="$(run_doctl databases get "${CLUSTER_ID}" \
+      --format Size,NumNodes,StorageMib --no-header 2>/dev/null)" || {
+      log_phase "0_FETCH" "WARNING: failed to fetch cluster info from doctl"
+      return 1
+    }
+    local fetched_size fetched_nodes fetched_storage_mib
+    read -r fetched_size fetched_nodes fetched_storage_mib <<< "${cluster_info}"
+
+    if [[ -z "${INITIAL_SIZE:-}" && -n "${fetched_size}" ]]; then
+      INITIAL_SIZE="${fetched_size}"
+      log_phase "0_FETCH" "INITIAL_SIZE=${INITIAL_SIZE} (from doctl)"
+    fi
+    if [[ -z "${INITIAL_NUM_NODES:-}" && -n "${fetched_nodes}" ]]; then
+      INITIAL_NUM_NODES="${fetched_nodes}"
+      log_phase "0_FETCH" "INITIAL_NUM_NODES=${INITIAL_NUM_NODES} (from doctl)"
+    fi
+    if [[ -z "${INITIAL_STORAGE_SIZE_GIB:-}" && -n "${fetched_storage_mib}" ]]; then
+      INITIAL_STORAGE_SIZE_GIB=$(( fetched_storage_mib / 1024 ))
+      log_phase "0_FETCH" "INITIAL_STORAGE_SIZE_GIB=${INITIAL_STORAGE_SIZE_GIB} (from doctl, ${fetched_storage_mib} MiB)"
+    fi
+  fi
+
+  if [[ "${needs_conn}" -eq 1 ]]; then
+    local conn_info
+    conn_info="$(run_doctl databases connection "${CLUSTER_ID}" \
+      --format Host,Port,User,Password --no-header 2>/dev/null)" || {
+      log_phase "0_FETCH" "WARNING: failed to fetch connection info from doctl"
+      return 1
+    }
+    local fetched_host fetched_port fetched_user fetched_pass
+    read -r fetched_host fetched_port fetched_user fetched_pass <<< "${conn_info}"
+
+    if [[ -z "${MYSQL_HOST:-}" && -n "${fetched_host}" ]]; then
+      MYSQL_HOST="${fetched_host}"
+      log_phase "0_FETCH" "MYSQL_HOST=${MYSQL_HOST} (from doctl)"
+    fi
+    if [[ -z "${MYSQL_PORT:-}" && -n "${fetched_port}" ]]; then
+      MYSQL_PORT="${fetched_port}"
+      log_phase "0_FETCH" "MYSQL_PORT=${MYSQL_PORT} (from doctl)"
+    fi
+    if [[ -z "${MYSQL_USER:-}" && -n "${fetched_user}" ]]; then
+      MYSQL_USER="${fetched_user}"
+      log_phase "0_FETCH" "MYSQL_USER=${MYSQL_USER} (from doctl)"
+    fi
+    if [[ -z "${MYSQL_PASSWORD:-}" && -n "${fetched_pass}" ]]; then
+      MYSQL_PASSWORD="${fetched_pass}"
+      log_phase "0_FETCH" "MYSQL_PASSWORD=****** (from doctl)"
+    fi
+  fi
+}
+
 require_config() {
   : "${ENGINE:?Set ENGINE in benchmark.conf (standard or advanced)}"
   case "${ENGINE}" in
@@ -70,20 +239,92 @@ require_config() {
       exit 1
       ;;
   esac
-  : "${MYSQL_HOST:?Set MYSQL_HOST in benchmark.conf}"
-  : "${MYSQL_PORT:?Set MYSQL_PORT in benchmark.conf}"
-  : "${MYSQL_USER:?Set MYSQL_USER in benchmark.conf}"
-  : "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in benchmark.conf}"
+  : "${CLUSTER_ID:?Set CLUSTER_ID in benchmark.conf}"
   : "${MYSQL_DB:?Set MYSQL_DB in benchmark.conf}"
+
+  # Convert GIB -> MIB for storage (used by doctl resize API)
+  if [[ -n "${SCALE_STORAGE_SIZE_GIB:-}" ]]; then
+    SCALE_STORAGE_SIZE_MIB="$(gib_to_mib "${SCALE_STORAGE_SIZE_GIB}")"
+  fi
+
+  # Auto-fetch connection + initial state from doctl when not manually set
+  if [[ -n "${DO_API_TOKEN:-}" ]]; then
+    fetch_cluster_details
+  fi
+
+  : "${MYSQL_HOST:?Set MYSQL_HOST in benchmark.conf or provide DO_API_TOKEN to auto-fetch}"
+  : "${MYSQL_PORT:?Set MYSQL_PORT in benchmark.conf or provide DO_API_TOKEN to auto-fetch}"
+  : "${MYSQL_USER:?Set MYSQL_USER in benchmark.conf or provide DO_API_TOKEN to auto-fetch}"
+  : "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in benchmark.conf or provide DO_API_TOKEN to auto-fetch}"
 
   if ! scaling_enabled; then
     return 0
   fi
 
   : "${SCALE_TRIGGER_DELAY:?Set SCALE_TRIGGER_DELAY in benchmark.conf}"
-  : "${CLUSTER_ID:?Set CLUSTER_ID in benchmark.conf}"
   : "${SCALE_TARGET_SIZE:?Set SCALE_TARGET_SIZE in benchmark.conf}"
   : "${DO_API_TOKEN:?Set DO_API_TOKEN in benchmark.conf}"
+}
+
+# ── K8s pod monitoring (observation only — scaling still uses doctl) ─────────
+
+k8s_monitor_pid_file() {
+  echo "${RUN_DIR:-.}/.k8s_monitor.pid"
+}
+
+start_k8s_monitor() {
+  local output_dir="${1:?output directory required}"
+  local poll_sec="${K8S_MONITOR_POLL_SEC:-5}"
+
+  export KUBECONFIG="${K8S_KUBECONFIG}"
+  export K8S_NAMESPACE="${K8S_NAMESPACE:-mysql}"
+  export PXC_CLUSTER_NAME="${PXC_CLUSTER_NAME:-}"
+  export PXC_MYSQL_ROOT_USER="${PXC_MYSQL_ROOT_USER:-root}"
+  export PXC_MYSQL_ROOT_PASSWORD="${PXC_MYSQL_ROOT_PASSWORD:-}"
+  export PXC_MYSQL_ROOT_SECRET="${PXC_MYSQL_ROOT_SECRET:-}"
+
+  local monitor_script="${SCRIPT_DIR:-$(scaling_root)}/scripts/k8s_scaling_monitor.sh"
+  if [[ ! -x "${monitor_script}" ]]; then
+    log_phase "K8S_MONITOR" "ERROR: monitor script not found: ${monitor_script}"
+    return 1
+  fi
+
+  log_phase "K8S_MONITOR" "starting background monitor (poll=${poll_sec}s)"
+  bash "${monitor_script}" "${output_dir}" "${poll_sec}" &
+  local pid=$!
+  echo "${pid}" > "$(k8s_monitor_pid_file)"
+  log_phase "K8S_MONITOR" "started (pid=${pid})"
+}
+
+stop_k8s_monitor() {
+  local pid_file
+  pid_file="$(k8s_monitor_pid_file)"
+  if [[ ! -f "${pid_file}" ]]; then
+    return 0
+  fi
+  local pid
+  pid="$(cat "${pid_file}")"
+  if kill -0 "${pid}" 2>/dev/null; then
+    log_phase "K8S_MONITOR" "stopping monitor (pid=${pid})"
+    kill -TERM "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+    log_phase "K8S_MONITOR" "monitor stopped"
+  fi
+  rm -f "${pid_file}"
+}
+
+parse_k8s_monitor_data() {
+  local monitor_dir="${1:?monitor output directory required}"
+  local parse_script="${SCRIPT_DIR:-$(scaling_root)}/scripts/parse_k8s_events.py"
+
+  if [[ ! -f "${parse_script}" ]]; then
+    log_phase "K8S_PARSE" "ERROR: parse script not found: ${parse_script}"
+    return 1
+  fi
+
+  log_phase "K8S_PARSE" "parsing k8s monitor data"
+  python3 "${parse_script}" "${monitor_dir}"
+  log_phase "K8S_PARSE" "parse complete"
 }
 
 setup_paths() {

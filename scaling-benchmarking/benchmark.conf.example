@@ -3,13 +3,18 @@
 #   cp benchmark.conf.example benchmark.conf
 
 # MySQL engine edition for this run (standard or advanced).
-ENGINE="standard"
+ENGINE="advanced"
+
+# --- Cluster ID ---
+# Required. Used for scaling trigger and to auto-fetch connection details + initial state.
+CLUSTER_ID="your-cluster-uuid"
 
 # --- MySQL connection ---
-MYSQL_HOST="your-cluster.db.ondigitalocean.com"
-MYSQL_PORT=25060
-MYSQL_USER="doadmin"
-MYSQL_PASSWORD="CHANGE_ME"
+# Leave these empty to auto-fetch from doctl using CLUSTER_ID + DO_API_TOKEN.
+MYSQL_HOST=""
+MYSQL_PORT=""
+MYSQL_USER=""
+MYSQL_PASSWORD=""
 MYSQL_DB="sbtest_tpcc"
 
 # --- Sysbench TPC-C ---
@@ -45,29 +50,62 @@ TPCC_MAX_TIME=3600
 # 1 = run TPC-C only (no cluster resize, no DO API auth); 0 = trigger scaling mid-run
 SKIP_SCALING=0
 
+# --- Initial cluster state (pre-scaling baseline) ---
+# Recorded in logs/CSVs for before-vs-after comparison.
+# Leave empty to auto-fetch from doctl using CLUSTER_ID + DO_API_TOKEN.
+INITIAL_SIZE=""
+INITIAL_NUM_NODES=""
+INITIAL_STORAGE_SIZE_GIB=""
+
+# --- DO API ---
+# Create DO_API_TOKEN at https://cloud.digitalocean.com/account/api/tokens (read+write).
+# Verify: doctl -u https://api.digitalocean.com -t "$DO_API_TOKEN" databases get "$CLUSTER_ID"
+DO_API_TOKEN=""
+DO_API_URL="https://api.digitalocean.com"
+
 # --- Scaling trigger ---
-# Ignored when SKIP_SCALING=1 (CLUSTER_ID, SCALE_TARGET_SIZE, DO_API_TOKEN not required).
+# Ignored when SKIP_SCALING=1 (SCALE_TARGET_SIZE, DO_API_TOKEN not required).
 # Seconds after TPC-C run starts (including warmup) before cluster resize fires.
 SCALE_TRIGGER_DELAY=180
 
-# Cluster resize — always uses production API (not stage2 / internal doctl).
-# Create DO_API_TOKEN at https://cloud.digitalocean.com/account/api/tokens (read+write).
-# Verify before running:
-#   doctl -u https://api.digitalocean.com -t "$DO_API_TOKEN" databases get "$CLUSTER_ID"
-# SCALE_TARGET_SIZE must be a valid slug for your engine (e.g. gd-8vcpu-32gb for MySQL).
-# Poll waits until status=online and size slug match; also checks num_nodes / storage only when non-empty below.
-# Leave SCALE_NUM_NODES empty to keep current node count (passed to API unchanged, not polled).
-# Leave SCALE_STORAGE_SIZE_MIB empty to skip storage resize (not passed, not polled).
-# Validate slugs: doctl -u https://api.digitalocean.com -t "$DO_API_TOKEN" databases options slugs --engine mysql
-CLUSTER_ID="your-cluster-uuid"
+# SCALE_TARGET_SIZE must be a valid slug (e.g. gd-8vcpu-32gb for MySQL).
+# Validate slugs: doctl -u "$DO_API_URL" -t "$DO_API_TOKEN" databases options slugs --engine mysql
+# Leave SCALE_NUM_NODES empty to keep current node count.
+# Leave SCALE_STORAGE_SIZE_GIB empty to skip storage resize.
 SCALE_TARGET_SIZE="gd-8vcpu-32gb"
-SCALE_NUM_NODES=
-SCALE_STORAGE_SIZE_MIB=
+SCALE_NUM_NODES=""
+SCALE_STORAGE_SIZE_GIB=""
 SCALE_POLL_INTERVAL_SEC=10
 SCALE_POLL_TIMEOUT_SEC=1800
 
-DO_API_TOKEN=
-DO_API_URL="https://api.digitalocean.com"
+# ===========================================================================
+# --- K8s pod monitoring (optional, observation only) ---
+# When K8S_KUBECONFIG is set, a background monitor tracks MySQL pod state,
+# replication status (Group Replication or Galera), primary failover,
+# K8s events, and node changes throughout the entire TPC-C run.
+# Supports both Percona Server for MySQL (ps) and Percona XtraDB Cluster (pxc).
+# The CRD type is auto-detected. Scaling is still triggered via doctl above.
+# Leave K8S_KUBECONFIG empty to disable pod monitoring.
+# ===========================================================================
+
+# Path to kubeconfig for the Percona MySQL cluster.
+K8S_KUBECONFIG=""
+
+# Kubernetes namespace where the MySQL cluster runs.
+K8S_NAMESPACE="mysql"
+
+# Cluster CR name (auto-detected from namespace if empty).
+# Works with both PerconaServerMySQL (ps) and PerconaXtraDBCluster (pxc).
+PXC_CLUSTER_NAME=""
+
+# MySQL root credentials inside the MySQL pods (for replication status queries).
+# If empty, the monitor reads from the cluster secrets (<cluster>-secrets).
+PXC_MYSQL_ROOT_USER="root"
+PXC_MYSQL_ROOT_PASSWORD=""
+PXC_MYSQL_ROOT_SECRET=""
+
+# Monitor poll interval (seconds).
+K8S_MONITOR_POLL_SEC=5
 
 # --- Output ---
 # Each run creates results/run_YYYYMMDD_HHMMSS_<engine>/ with all logs, CSVs, and a copy of benchmark.conf.

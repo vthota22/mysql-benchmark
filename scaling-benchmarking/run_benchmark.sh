@@ -51,10 +51,23 @@ export DO_API_URL="${DO_API_URL:-}"
 export CLUSTER_ID="${CLUSTER_ID:-}"
 export SCALE_TARGET_SIZE="${SCALE_TARGET_SIZE:-}"
 export SCALE_NUM_NODES="${SCALE_NUM_NODES:-}"
+export SCALE_STORAGE_SIZE_GIB="${SCALE_STORAGE_SIZE_GIB:-}"
 export SCALE_STORAGE_SIZE_MIB="${SCALE_STORAGE_SIZE_MIB:-}"
+export INITIAL_SIZE="${INITIAL_SIZE:-}"
+export INITIAL_NUM_NODES="${INITIAL_NUM_NODES:-}"
+export INITIAL_STORAGE_SIZE_GIB="${INITIAL_STORAGE_SIZE_GIB:-}"
+
+# K8s pod monitoring (observation — does not affect scaling trigger)
+export K8S_KUBECONFIG="${K8S_KUBECONFIG:-}"
+export K8S_NAMESPACE="${K8S_NAMESPACE:-mysql}"
+export PXC_CLUSTER_NAME="${PXC_CLUSTER_NAME:-}"
+export K8S_MONITOR_POLL_SEC="${K8S_MONITOR_POLL_SEC:-5}"
+
+K8S_MONITOR_DIR="${RUN_DIR}/k8s_monitor"
 
 on_exit() {
   local rc=$?
+  stop_k8s_monitor 2>/dev/null || true
   if [[ "${rc}" -ne 0 ]]; then
     log_phase "ERROR" "benchmark exited with status ${rc}"
   fi
@@ -62,16 +75,37 @@ on_exit() {
 trap on_exit EXIT
 
 print_startup_banner() {
+  determine_scale_type
+
   echo "=== scaling-benchmarking: TPC-C under scale ==="
   echo "Config:   ${CONFIG}"
   echo "Engine:   ${ENGINE}"
   echo "Run dir:  ${RUN_DIR}"
   echo "Sysbench: $("${BENCH_ROOT}/which_sysbench.sh")"
+  echo "Cluster:  ${CLUSTER_ID}"
   echo "Host:     ${MYSQL_HOST}:${MYSQL_PORT}/${MYSQL_DB}"
+  if [[ -n "${INITIAL_SIZE:-}" ]]; then
+    local initial_info="size=${INITIAL_SIZE} nodes=${INITIAL_NUM_NODES:-?}"
+    if [[ -n "${INITIAL_STORAGE_SIZE_GIB:-}" ]]; then
+      initial_info="${initial_info} storage=${INITIAL_STORAGE_SIZE_GIB}GiB"
+    fi
+    echo "Initial:  ${initial_info}"
+  fi
   if scaling_enabled; then
-    echo "Scaling:  trigger at +${SCALE_TRIGGER_DELAY}s -> ${SCALE_TARGET_SIZE}"
+    local scale_info="trigger at +${SCALE_TRIGGER_DELAY}s -> ${SCALE_TARGET_SIZE}"
+    if [[ -n "${SCALE_NUM_NODES:-}" ]]; then
+      scale_info="${scale_info} nodes=${SCALE_NUM_NODES}"
+    fi
+    if [[ -n "${SCALE_STORAGE_SIZE_GIB:-}" ]]; then
+      scale_info="${scale_info} storage=${SCALE_STORAGE_SIZE_GIB}GiB"
+    fi
+    echo "Scaling:  ${scale_info}"
+    echo "Type:     ${SCALE_DESCRIPTION}"
   else
     echo "Scaling:  disabled (SKIP_SCALING=1)"
+  fi
+  if k8s_monitor_enabled; then
+    echo "K8s mon:  ns=${K8S_NAMESPACE} pxc=${PXC_CLUSTER_NAME:-auto} poll=${K8S_MONITOR_POLL_SEC}s"
   fi
   echo ""
 }
@@ -128,6 +162,7 @@ run_scale_workflow() {
   fi
   if scale_storage_size_requested; then
     target_storage_mib="${SCALE_STORAGE_SIZE_MIB}"
+    echo "SCALE_TARGET_STORAGE_SIZE_GIB=${SCALE_STORAGE_SIZE_GIB:-}" >> "${SCALE_TIMING_FILE}"
     echo "SCALE_TARGET_STORAGE_SIZE_MIB=${target_storage_mib}" >> "${SCALE_TIMING_FILE}"
   fi
 
@@ -211,7 +246,18 @@ phase2_run_with_scaling() {
   {
     echo "ENGINE=${ENGINE}"
     echo "RUN_START_EPOCH=${run_start_epoch}"
+    echo "CLUSTER_ID=${CLUSTER_ID}"
+    [[ -n "${INITIAL_SIZE:-}" ]] && echo "INITIAL_SIZE=${INITIAL_SIZE}"
+    [[ -n "${INITIAL_NUM_NODES:-}" ]] && echo "INITIAL_NUM_NODES=${INITIAL_NUM_NODES}"
+    [[ -n "${INITIAL_STORAGE_SIZE_GIB:-}" ]] && echo "INITIAL_STORAGE_SIZE_GIB=${INITIAL_STORAGE_SIZE_GIB}"
+    [[ -n "${SCALE_TYPES:-}" ]] && echo "SCALE_TYPES=${SCALE_TYPES}"
+    [[ -n "${SCALE_DESCRIPTION:-}" ]] && echo "SCALE_DESCRIPTION=${SCALE_DESCRIPTION}"
   } >> "${SCALE_TIMING_FILE}"
+
+  # Start K8s pod monitor in background (observation only — independent of scaling)
+  if k8s_monitor_enabled; then
+    start_k8s_monitor "${K8S_MONITOR_DIR}"
+  fi
 
   local scale_pid=""
   if scaling_enabled; then
@@ -285,6 +331,14 @@ phase4_parse_metrics() {
 
   log_phase "4_PARSE" "timeseries:   ${TIMESERIES_CSV}"
   log_phase "4_PARSE" "scale events: ${SCALE_EVENTS_CSV}"
+
+  # Parse K8s pod monitor data if monitor was running
+  if k8s_monitor_enabled && [[ -d "${K8S_MONITOR_DIR}" ]]; then
+    stop_k8s_monitor
+    parse_k8s_monitor_data "${K8S_MONITOR_DIR}"
+    log_phase "4_PARSE" "k8s analysis: ${K8S_MONITOR_DIR}/k8s_analysis_summary.txt"
+  fi
+
   echo "${RUN_DIR}" > "${RESULTS_BASE}/LATEST.txt"
 }
 
@@ -300,6 +354,15 @@ main() {
     do_api_auth_check
   else
     log_phase "0_DO_API" "SKIP_SCALING=1 — skipping DO API auth"
+  fi
+  if k8s_monitor_enabled; then
+    log_phase "0_K8S" "verifying kubectl connectivity for pod monitoring"
+    if kubectl --kubeconfig="${K8S_KUBECONFIG}" cluster-info >/dev/null 2>&1; then
+      log_phase "0_K8S" "kubectl connectivity OK"
+    else
+      log_phase "0_K8S" "WARNING: cannot reach K8s cluster — pod monitoring disabled"
+      K8S_KUBECONFIG=""
+    fi
   fi
   phase2_run_with_scaling
   phase3_finalize_logs
