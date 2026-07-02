@@ -89,10 +89,11 @@ SCALE_POLL_TIMEOUT_SEC=1800
 # ===========================================================================
 
 # Path to kubeconfig for the Percona MySQL cluster.
+# /root/mysql-benchmark/scaling-benchmarking/kubeconfig/{FILE_NAME}
 K8S_KUBECONFIG=""
 
 # Kubernetes namespace where the MySQL cluster runs.
-K8S_NAMESPACE="mysql"
+K8S_NAMESPACE="percona"
 
 # Cluster CR name (auto-detected from namespace if empty).
 # Works with both PerconaServerMySQL (ps) and PerconaXtraDBCluster (pxc).
