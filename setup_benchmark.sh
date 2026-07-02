@@ -137,6 +137,28 @@ echo ""
 install_doctl
 
 echo ""
+echo "--- Installing kubectl (for K8s pod monitoring) ---"
+if command -v kubectl >/dev/null 2>&1; then
+  echo "kubectl already installed: $(kubectl version --client --short 2>/dev/null || kubectl version --client 2>&1 | head -1)"
+else
+  case "${OS}" in
+    ubuntu|debian|linux)
+      KUBE_ARCH="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+      curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${KUBE_ARCH}/kubectl"
+      sudo install -m 755 /tmp/kubectl /usr/local/bin/kubectl
+      rm -f /tmp/kubectl
+      ;;
+    macos)
+      brew install kubectl
+      ;;
+    *)
+      echo "WARNING: skipping kubectl install on unknown OS '${OS}'"
+      ;;
+  esac
+  command -v kubectl >/dev/null 2>&1 && echo "kubectl installed: $(kubectl version --client 2>&1 | head -1)" || echo "WARNING: kubectl install failed (K8s monitoring will be disabled)"
+fi
+
+echo ""
 echo "--- Verification ---"
 export PATH="${PREFIX}/bin:${PATH}"
 sysbench --version
@@ -144,6 +166,7 @@ echo ""
 sysbench --help 2>&1 | grep -E 'mysql-ssl|mysql-host' | head -5 || true
 echo ""
 command -v doctl >/dev/null 2>&1 && doctl version || echo "doctl: not installed"
+command -v kubectl >/dev/null 2>&1 && echo "kubectl: $(kubectl version --client 2>&1 | head -1)" || echo "kubectl: not installed (K8s monitoring disabled)"
 echo ""
 ls -la "${TPCC_DIR}/tpcc.lua"
 
