@@ -46,6 +46,9 @@ failover_defaults() {
   # Space-separated load thread counts; when set, runs each under edition/t<N>/<scenario>/
   : "${FAILOVER_THREAD_MATRIX:=}"
   : "${FAILOVER_THREAD_DELAY_SEC:=120}"
+  # Repeat full failover scenario loop N times (results under edition/iter<N>/); single combined report at end
+  : "${FAILOVER_ITERATIONS:=1}"
+  : "${FAILOVER_ITERATION_DELAY_SEC:=120}"
   # Advanced HAProxy: check inter N ms (N = interval_sec * 1000); Percona operator script default inter 10000 rise 1 fall 2
   : "${HAPROXY_HEALTH_CHECK_INTERVAL_SEC:=10}"
   : "${HAPROXY_HEALTH_CHECK_RISE:=1}"
@@ -2640,6 +2643,31 @@ write_failover_comparison() {
           [[ -f "${scenario_dir}/failover_kpi.csv" ]] || continue
           found_scenario=1
           _append_failover_scenario_results "${edition}" "${threads_label}/${scenario}" "${scenario_dir}"
+        done
+        continue
+      fi
+
+      if [[ "${sub_name}" =~ ^iter[0-9]+$ ]]; then
+        local iter_label="${sub_name}"
+        for inner_dir in "${sub_dir}"/*/; do
+          [[ -d "${inner_dir}" ]] || continue
+          local inner_name
+          inner_name=$(basename "${inner_dir}")
+          if [[ "${inner_name}" =~ ^t[0-9]+$ ]]; then
+            for scenario_dir in "${inner_dir}"/*/; do
+              [[ -d "${scenario_dir}" ]] || continue
+              scenario=$(basename "${scenario_dir}")
+              [[ -f "${scenario_dir}/failover_kpi.csv" ]] || continue
+              found_scenario=1
+              _append_failover_scenario_results "${edition}" "${iter_label}/${inner_name}/${scenario}" "${scenario_dir}"
+            done
+            continue
+          fi
+          scenario_dir="${inner_dir}"
+          scenario="${inner_name}"
+          [[ -f "${scenario_dir}/failover_kpi.csv" ]] || continue
+          found_scenario=1
+          _append_failover_scenario_results "${edition}" "${iter_label}/${scenario}" "${scenario_dir}"
         done
         continue
       fi

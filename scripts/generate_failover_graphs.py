@@ -153,6 +153,7 @@ def enrich_cluster_metadata(cfg: dict[str, str], edition: str) -> None:
 
 
 THREAD_DIR_RE = re.compile(r"^t(\d+)$")
+ITER_DIR_RE = re.compile(r"^iter(\d+)$")
 EDITION_NAMES = {"advanced", "standard"}
 DEFAULT_THREAD_MATRIX = (4, 8, 16, 32)
 DEFAULT_SCENARIOS = ("mixed", "write_only")
@@ -349,6 +350,75 @@ def discover_thread_runs(edition_dir: Path) -> dict[int, dict[str, Path]]:
             runs.setdefault(threads, {})[child.name] = child
 
     return runs
+
+
+def discover_iteration_runs(edition_dir: Path) -> dict[int, dict[str, Path]]:
+    """Map iteration number -> scenario label -> results dir (edition/iter<N>/...)."""
+    runs: dict[int, dict[str, Path]] = {}
+    if not edition_dir.is_dir():
+        return runs
+
+    for child in sorted(edition_dir.iterdir()):
+        if not child.is_dir() or child.name == "graphs":
+            continue
+        match = ITER_DIR_RE.match(child.name)
+        if not match:
+            continue
+        iteration = int(match.group(1))
+        for inner in sorted(child.iterdir()):
+            if not inner.is_dir() or inner.name == "graphs":
+                continue
+            thread_match = THREAD_DIR_RE.match(inner.name)
+            if thread_match:
+                for scenario_dir in sorted(inner.iterdir()):
+                    if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
+                        label = f"{inner.name}/{scenario_dir.name}"
+                        runs.setdefault(iteration, {})[label] = scenario_dir
+                continue
+            if (inner / "failover_timeseries.csv").exists():
+                runs.setdefault(iteration, {})[inner.name] = inner
+
+    return runs
+
+
+def _iteration_kpi_comparison_html(iter_runs: dict[int, dict[str, Path]]) -> str:
+    """Summary table: failure detection and promote election across iterations."""
+    scenario_names: list[str] = []
+    seen: set[str] = set()
+    for scenarios in iter_runs.values():
+        for name in sorted(scenarios):
+            if name not in seen:
+                seen.add(name)
+                scenario_names.append(name)
+    if not scenario_names:
+        return ""
+
+    blocks: list[str] = []
+    for scenario in scenario_names:
+        header = "".join(f"<th>Iteration {n}</th>" for n in sorted(iter_runs))
+        detect_cells: list[str] = []
+        promote_cells: list[str] = []
+        for iteration in sorted(iter_runs):
+            scenario_dir = iter_runs[iteration].get(scenario)
+            if not scenario_dir:
+                detect_cells.append("<td>—</td>")
+                promote_cells.append("<td>—</td>")
+                continue
+            kpi = load_kpi(scenario_dir / "failover_kpi.csv")
+            detect = kpi.get("failure_detection_sec", "—") or "—"
+            promote = kpi.get("primary_election_sec", "—") or "—"
+            detect_cells.append(f"<td>{html.escape(str(detect))}</td>")
+            promote_cells.append(f"<td>{html.escape(str(promote))}</td>")
+        blocks.append(
+            f'<div class="card"><h2>KPI comparison — {html.escape(scenario)}</h2>'
+            f'<div class="table-scroll"><table class="throughput-compare">'
+            f"<thead><tr><th>Metric</th>{header}</tr></thead>"
+            f"<tbody>"
+            f'<tr><th scope="row">Time to detect failure (s)</th>{"".join(detect_cells)}</tr>'
+            f'<tr><th scope="row">Time to promote — election (s)</th>{"".join(promote_cells)}</tr>'
+            f"</tbody></table></div></div>"
+        )
+    return "".join(blocks)
 
 
 def _baseline_averages_before_trigger(
@@ -1933,36 +2003,68 @@ def generate_html_report(
     return out_path
 
 
-def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[int, dict[str, Path]]) -> Path:
-    """Single HTML with thread + scenario toggle buttons."""
+def generate_combined_sweep_html_report(
+    edition_dir: Path,
+    sweep_runs: dict[int, dict[str, Path]],
+    *,
+    sweep_kind: str = "threads",
+) -> Path:
+    """Single HTML with sweep + scenario toggle buttons (threads or back-to-back iterations)."""
+    if sweep_kind == "iteration":
+        sweep_attr = "iteration"
+        panel_prefix = "i"
+        toolbar_label = "Iteration:"
+        title_suffix = "iteration comparison"
+        subtitle_sweep = "back-to-back failover iterations"
+
+        def sweep_button_text(value: int) -> str:
+            return f"Iteration {value}"
+    else:
+        sweep_attr = "threads"
+        panel_prefix = "t"
+        toolbar_label = "Threads:"
+        title_suffix = "thread comparison"
+        subtitle_sweep = "thread sweep"
+
+        def sweep_button_text(value: int) -> str:
+            return f"{value} threads"
+
     bundles: dict[str, dict] = {}
-    thread_counts = resolve_thread_matrix(edition_dir, thread_runs)
-    scenario_list = resolve_scenario_list(edition_dir, thread_runs)
+    sweep_values = sorted(sweep_runs.keys())
+    scenario_list = sorted(
+        {
+            scenario
+            for scenarios in sweep_runs.values()
+            for scenario in scenarios
+        }
+    )
     edition = "advanced"
 
-    for threads, scenarios in thread_runs.items():
+    for sweep_id, scenarios in sweep_runs.items():
         for scenario, scenario_dir in sorted(scenarios.items()):
-            key = f"{threads}:{scenario}"
+            key = f"{sweep_id}:{scenario}"
             bundle = load_scenario_bundle(scenario_dir)
             bundles[key] = bundle
             edition = bundle["edition"]
 
-    active_thread_counts = sorted({int(key.split(":", 1)[0]) for key in bundles})
+    active_sweep_values = sorted({int(key.split(":", 1)[0]) for key in bundles})
     active_scenarios = sorted({key.split(":", 1)[1] for key in bundles})
-    if not active_thread_counts or not active_scenarios:
-        active_thread_counts = thread_counts
+    if not active_sweep_values:
+        active_sweep_values = sweep_values
+    if not active_scenarios:
         active_scenarios = scenario_list
 
-    default_threads = active_thread_counts[0]
+    default_sweep = active_sweep_values[0]
     default_scenario = active_scenarios[0]
 
     panels: list[str] = []
     chart_payload: dict[str, dict] = {}
     for key in sorted(bundles):
-        threads_s, scenario = key.split(":", 1)
-        threads = int(threads_s)
-        panel_id = f"panel_t{threads}_{scenario}"
-        hidden = "" if (threads == default_threads and scenario == default_scenario) else ' style="display:none"'
+        sweep_s, scenario = key.split(":", 1)
+        sweep_id = int(sweep_s)
+        scenario_safe = scenario.replace("/", "_")
+        panel_id = f"panel_{panel_prefix}{sweep_id}_{scenario_safe}"
+        hidden = "" if (sweep_id == default_sweep and scenario == default_scenario) else ' style="display:none"'
         bundle = bundles[key]
         meta_html = _meta_table_html(_meta_rows_for_bundle(bundle))
         metrics_html = _metrics_summary_html(
@@ -1972,7 +2074,7 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
         compare_html = _before_after_throughput_table_html(bundle)
         chart_payload[key] = bundle["chart_data"]
         panels.append(
-            f'<div class="run-panel" id="{panel_id}" data-threads="{threads}" '
+            f'<div class="run-panel" id="{panel_id}" data-sweep="{sweep_id}" '
             f'data-scenario="{html.escape(scenario)}"{hidden}>'
             f'<div class="grid"><div class="sidebar">'
             f'<div class="card sidebar-meta"><h2>Run metadata</h2><table><tbody>{meta_html}</tbody></table></div>'
@@ -1989,19 +2091,19 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
             f"</div></div></div>"
         )
 
-    thread_buttons = "".join(
-        f'<button type="button" class="toggle-btn{" active" if t == default_threads else ""}" '
-        f'data-threads="{t}">{t} threads</button>'
-        for t in active_thread_counts
+    sweep_buttons = "".join(
+        f'<button type="button" class="toggle-btn{" active" if value == default_sweep else ""}" '
+        f'data-sweep="{value}">{html.escape(sweep_button_text(value))}</button>'
+        for value in active_sweep_values
     )
     scenario_buttons = "".join(
         f'<button type="button" class="toggle-btn scenario-btn{" active" if s == default_scenario else ""}" '
         f'data-scenario="{html.escape(s)}">{html.escape(s)}</button>'
         for s in active_scenarios
     )
-    thread_toolbar = (
-        f'<div class="toolbar"><span class="toolbar-label">Threads:</span>{thread_buttons}</div>'
-        if len(active_thread_counts) > 1
+    sweep_toolbar = (
+        f'<div class="toolbar"><span class="toolbar-label">{html.escape(toolbar_label)}</span>{sweep_buttons}</div>'
+        if len(active_sweep_values) > 1
         else ""
     )
     scenario_toolbar = (
@@ -2009,13 +2111,17 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
         if len(active_scenarios) > 1
         else ""
     )
-    if len(active_thread_counts) > 1:
-        subtitle = f"{html.escape(edition)} · thread sweep · select load threads and scenario below"
+    if len(active_sweep_values) > 1:
+        subtitle = f"{html.escape(edition)} · {html.escape(subtitle_sweep)} · select run and scenario below"
     elif len(active_scenarios) > 1:
         subtitle = f"{html.escape(edition)} · select scenario below"
     else:
         scenario_label = html.escape(active_scenarios[0])
         subtitle = f"{html.escape(edition)} · {scenario_label}"
+
+    kpi_summary_html = ""
+    if sweep_kind == "iteration":
+        kpi_summary_html = _iteration_kpi_comparison_html(sweep_runs)
 
     out_path = edition_dir / "graphs" / "failover_report.html"
     out_path.parent.mkdir(exist_ok=True)
@@ -2025,7 +2131,7 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Failover report — {html.escape(edition)} (thread comparison)</title>
+  <title>Failover report — {html.escape(edition)} ({html.escape(title_suffix)})</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
 {CHARTJS_ZOOM_CDN}
@@ -2117,7 +2223,8 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
   <h1>Failover benchmark report</h1>
   <p class="subtitle">{subtitle}</p>
 
-  {thread_toolbar}
+  {kpi_summary_html}
+  {sweep_toolbar}
   {scenario_toolbar}
 
   <p class="chart-hint-global">{html.escape(CHART_ZOOM_HINT)}</p>
@@ -2126,15 +2233,15 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
 
   <script>
     const RUNS = {json.dumps(chart_payload)};
-    let activeThreads = {default_threads};
+    let activeSweep = {default_sweep};
     let activeScenario = {json.dumps(default_scenario)};
     let charts = {{}};
 
     Chart.defaults.color = "#94a3b8";
     Chart.defaults.borderColor = "#334155";
 
-    function runKey(threads, scenario) {{
-      return threads + ":" + scenario;
+    function runKey(sweep, scenario) {{
+      return sweep + ":" + scenario;
     }}
 
     function destroyCharts() {{
@@ -2168,12 +2275,16 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
     }}
 {CHART_ZOOM_JS}
 
-    function renderCharts(threads, scenario) {{
-      const key = runKey(threads, scenario);
+    function renderCharts(sweep, scenario) {{
+      const key = runKey(sweep, scenario);
       const DATA = RUNS[key];
       if (!DATA) return;
       destroyCharts();
-      const panelId = "panel_t" + threads + "_" + scenario;
+      const panel = document.querySelector(
+        '.run-panel[data-sweep="' + sweep + '"][data-scenario="' + scenario.replace(/"/g, '\\"') + '"]'
+      );
+      if (!panel) return;
+      const panelId = panel.id;
       charts.tps = new Chart(document.getElementById("tpsQps_" + panelId), {{
         type: "line",
         data: {{
@@ -2222,50 +2333,58 @@ def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[in
       }});
     }}
 
-    function showPanel(threads, scenario) {{
+    function showPanel(sweep, scenario) {{
       document.querySelectorAll(".run-panel").forEach(el => {{
-        const match = String(el.dataset.threads) === String(threads) && el.dataset.scenario === scenario;
+        const match = String(el.dataset.sweep) === String(sweep) && el.dataset.scenario === scenario;
         el.style.display = match ? "" : "none";
       }});
       destroyCharts();
-      if (RUNS[runKey(threads, scenario)]) {{
-        renderCharts(threads, scenario);
+      if (RUNS[runKey(sweep, scenario)]) {{
+        renderCharts(sweep, scenario);
       }}
     }}
 
-    function setActiveButtons(threads, scenario) {{
-      document.querySelectorAll(".toggle-btn[data-threads]").forEach(btn => {{
-        btn.classList.toggle("active", String(btn.dataset.threads) === String(threads));
+    function setActiveButtons(sweep, scenario) {{
+      document.querySelectorAll(".toggle-btn[data-sweep]").forEach(btn => {{
+        btn.classList.toggle("active", String(btn.dataset.sweep) === String(sweep));
       }});
       document.querySelectorAll(".toggle-btn[data-scenario]").forEach(btn => {{
         btn.classList.toggle("active", btn.dataset.scenario === scenario);
       }});
     }}
 
-    document.querySelectorAll(".toggle-btn[data-threads]").forEach(btn => {{
+    document.querySelectorAll(".toggle-btn[data-sweep]").forEach(btn => {{
       btn.addEventListener("click", () => {{
-        activeThreads = btn.dataset.threads;
-        setActiveButtons(activeThreads, activeScenario);
-        showPanel(activeThreads, activeScenario);
+        activeSweep = btn.dataset.sweep;
+        setActiveButtons(activeSweep, activeScenario);
+        showPanel(activeSweep, activeScenario);
       }});
     }});
 
     document.querySelectorAll(".toggle-btn[data-scenario]").forEach(btn => {{
       btn.addEventListener("click", () => {{
         activeScenario = btn.dataset.scenario;
-        setActiveButtons(activeThreads, activeScenario);
-        showPanel(activeThreads, activeScenario);
+        setActiveButtons(activeSweep, activeScenario);
+        showPanel(activeSweep, activeScenario);
       }});
     }});
 
-    setActiveButtons(activeThreads, activeScenario);
-    showPanel(activeThreads, activeScenario);
+    setActiveButtons(activeSweep, activeScenario);
+    showPanel(activeSweep, activeScenario);
   </script>
 </body>
 </html>
 """
     out_path.write_text(page, encoding="utf-8")
     return out_path
+
+
+def generate_combined_thread_html_report(edition_dir: Path, thread_runs: dict[int, dict[str, Path]]) -> Path:
+    return generate_combined_sweep_html_report(edition_dir, thread_runs, sweep_kind="threads")
+
+
+def generate_combined_iteration_html_report(edition_dir: Path, iter_runs: dict[int, dict[str, Path]]) -> Path:
+    return generate_combined_sweep_html_report(edition_dir, iter_runs, sweep_kind="iteration")
 
 
 def generate_png_for_edition(
@@ -2330,7 +2449,15 @@ def generate_for_edition(edition_dir: Path, *, png: bool = True, html: bool = Tr
 
     if html:
         parent_ed = parent_edition_dir(edition_dir)
-        if not (parent_ed and discover_thread_runs(parent_ed)):
+        skip_combined = False
+        if parent_ed:
+            iter_runs = discover_iteration_runs(parent_ed)
+            thread_runs = discover_thread_runs(parent_ed)
+            if iter_runs and len(iter_runs) > 1:
+                skip_combined = True
+            elif thread_runs:
+                skip_combined = True
+        if not skip_combined:
             html_path = generate_html_report(
                 edition_dir, rows, meta, parsed, event, kpi, png_files, extended, primary
             )
@@ -2351,6 +2478,17 @@ def _collect_scenario_dirs(parent: Path) -> list[Path]:
             for scenario_dir in sorted(child.iterdir()):
                 if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
                     found.append(scenario_dir)
+        elif ITER_DIR_RE.match(child.name):
+            for inner in sorted(child.iterdir()):
+                if not inner.is_dir() or inner.name == "graphs":
+                    continue
+                if (inner / "failover_timeseries.csv").exists():
+                    found.append(inner)
+                    continue
+                if THREAD_DIR_RE.match(inner.name):
+                    for scenario_dir in sorted(inner.iterdir()):
+                        if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
+                            found.append(scenario_dir)
     return found
 
 
@@ -2376,6 +2514,9 @@ def discover_edition_dirs(path: Path) -> tuple[list[Path], Path]:
                 if THREAD_DIR_RE.match(child.name):
                     dirs.extend(_collect_scenario_dirs(child))
                     continue
+                if ITER_DIR_RE.match(child.name):
+                    dirs.extend(_collect_scenario_dirs(child))
+                    continue
                 for scenario_dir in sorted(child.iterdir()):
                     if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
                         dirs.append(scenario_dir)
@@ -2394,6 +2535,22 @@ def maybe_generate_combined_reports(results_root: Path, *, do_html: bool) -> Non
             d for d in results_root.iterdir() if d.is_dir() and d.name in EDITION_NAMES
         )
     for edition_dir in edition_dirs:
+        iter_runs = discover_iteration_runs(edition_dir)
+        if iter_runs and len(iter_runs) > 1:
+            out = generate_combined_iteration_html_report(edition_dir, iter_runs)
+            print(f"Wrote {out}")
+            html_content = out.read_text(encoding="utf-8")
+            mirrored: set[Path] = set()
+            for scenarios in iter_runs.values():
+                for scenario_dir in scenarios.values():
+                    if scenario_dir in mirrored:
+                        continue
+                    mirrored.add(scenario_dir)
+                    mirror_out = scenario_dir / "graphs" / "failover_report.html"
+                    mirror_out.parent.mkdir(exist_ok=True)
+                    mirror_out.write_text(html_content, encoding="utf-8")
+                    print(f"Wrote {mirror_out}")
+            continue
         thread_runs = discover_thread_runs(edition_dir)
         if not thread_runs:
             continue

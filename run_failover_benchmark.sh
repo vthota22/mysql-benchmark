@@ -30,6 +30,10 @@ load_benchmark_config "${CONFIG}"
 failover_defaults
 
 mkdir -p "${RESULTS_ROOT}"
+{
+  echo "FAILOVER_ITERATIONS=${FAILOVER_ITERATIONS:-1}"
+  echo "FAILOVER_ITERATION_DELAY_SEC=${FAILOVER_ITERATION_DELAY_SEC:-120}"
+} > "${RESULTS_ROOT}/failover_run_matrix.env"
 exec > >(tee -a "${FULL_LOG}") 2>&1
 
 _per_scenario_runtime_sec() {
@@ -49,6 +53,9 @@ fi
 echo "Timeline: warmup=${FAILOVER_WARMUP_SEC}s + baseline=${FAILOVER_BASELINE_SEC}s + observe=${FAILOVER_OBSERVE_SEC}s"
 echo "          trigger at second $(failover_trigger_second) | total=$(_per_scenario_runtime_sec)s per scenario"
 echo "Scenarios:${FAILOVER_SCENARIOS} (delay between=${FAILOVER_SCENARIO_DELAY_SEC}s)"
+if [[ "${FAILOVER_ITERATIONS:-1}" -gt 1 ]]; then
+  echo "Iterations:${FAILOVER_ITERATIONS} back-to-back (delay between=${FAILOVER_ITERATION_DELAY_SEC}s)"
+fi
 verify_failover_tpcc_profiles || exit 1
 echo "Editions: ${FAILOVER_EDITIONS}"
 echo "Reconnect: mysql-ignore-errors=${FAILOVER_MYSQL_IGNORE_ERRORS}"
@@ -222,6 +229,12 @@ run_failover_edition() {
 
   local scenario_index=0
   local thread_index=0
+  local iterations="${FAILOVER_ITERATIONS:-1}"
+
+  if ! [[ "${iterations}" =~ ^[0-9]+$ ]] || (( iterations < 1 )); then
+    echo "ERROR: FAILOVER_ITERATIONS must be an integer >= 1" >&2
+    return 1
+  fi
 
   _run_scenarios_for_base_dir() {
     local base_dir="${1:?base dir required}"
@@ -239,24 +252,55 @@ run_failover_edition() {
     return 0
   }
 
-  if [[ -n "${FAILOVER_THREAD_MATRIX:-}" ]]; then
-    for threads in ${FAILOVER_THREAD_MATRIX}; do
-      thread_index=$((thread_index + 1))
-      if [[ "${thread_index}" -gt 1 && "${FAILOVER_THREAD_DELAY_SEC:-0}" -gt 0 ]]; then
-        echo "--- Waiting ${FAILOVER_THREAD_DELAY_SEC}s before thread count ${threads} ---"
-        sleep "${FAILOVER_THREAD_DELAY_SEC}"
+  _run_edition_scenarios_under_dir() {
+    local base_dir="${1:?base dir required}"
+    if [[ -n "${FAILOVER_THREAD_MATRIX:-}" ]]; then
+      thread_index=0
+      for threads in ${FAILOVER_THREAD_MATRIX}; do
+        thread_index=$((thread_index + 1))
+        if [[ "${thread_index}" -gt 1 && "${FAILOVER_THREAD_DELAY_SEC:-0}" -gt 0 ]]; then
+          echo "--- Waiting ${FAILOVER_THREAD_DELAY_SEC}s before thread count ${threads} ---"
+          sleep "${FAILOVER_THREAD_DELAY_SEC}"
+        fi
+        export FAILOVER_THREADS="${threads}"
+        local thread_dir="${base_dir}/t${threads}"
+        mkdir -p "${thread_dir}"
+        echo ""
+        echo "======== Thread count: ${threads} (results under ${thread_dir}/) ========"
+        if ! _run_scenarios_for_base_dir "${thread_dir}"; then
+          return 1
+        fi
+      done
+    else
+      if ! _run_scenarios_for_base_dir "${base_dir}"; then
+        return 1
       fi
-      export FAILOVER_THREADS="${threads}"
-      local thread_dir="${edition_dir}/t${threads}"
-      mkdir -p "${thread_dir}"
+    fi
+    return 0
+  }
+
+  if (( iterations > 1 )); then
+    local iter=0
+    for iter in $(seq 1 "${iterations}"); do
+      if (( iter > 1 )) && [[ "${FAILOVER_ITERATION_DELAY_SEC:-0}" -gt 0 ]]; then
+        echo ""
+        echo "--- Waiting ${FAILOVER_ITERATION_DELAY_SEC}s before iteration ${iter}/${iterations} ---"
+        sleep "${FAILOVER_ITERATION_DELAY_SEC}"
+      fi
       echo ""
-      echo "======== Thread count: ${threads} (results under ${thread_dir}/) ========"
-      if ! _run_scenarios_for_base_dir "${thread_dir}"; then
+      echo "======== Failover iteration ${iter}/${iterations} ========"
+      local iter_dir="${edition_dir}/iter${iter}"
+      mkdir -p "${iter_dir}"
+      {
+        echo "FAILOVER_ITERATION=${iter}"
+        echo "FAILOVER_ITERATIONS=${iterations}"
+      } > "${iter_dir}/failover_iteration.env"
+      if ! _run_edition_scenarios_under_dir "${iter_dir}"; then
         return 1
       fi
     done
   else
-    if ! _run_scenarios_for_base_dir "${edition_dir}"; then
+    if ! _run_edition_scenarios_under_dir "${edition_dir}"; then
       return 1
     fi
   fi
