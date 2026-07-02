@@ -13,6 +13,7 @@ class FieldSpec:
     help_text: str = ""
     options: tuple[str, ...] = ()
     section: str = "General"
+    default: str = ""
 
 
 FAILOVER_FIELDS: tuple[FieldSpec, ...] = (
@@ -87,6 +88,52 @@ FAILOVER_FIELDS: tuple[FieldSpec, ...] = (
         "text",
         section="Cluster targets",
     ),
+    FieldSpec(
+        "ADVANCED_PSMYSQL_CR_NAME",
+        "Percona CR name (Advanced)",
+        "text",
+        "PerconaServerMySQL resource name, e.g. benchmark-failover2",
+        section="HAProxy",
+    ),
+    FieldSpec(
+        "HAPROXY_HEALTH_CHECK_INTERVAL_SEC",
+        "HAProxy health check interval (s)",
+        "number",
+        "Backend check inter: 2–10 seconds (Percona default 10 → inter 10000 ms)",
+        section="HAProxy",
+        default="10",
+    ),
+    FieldSpec(
+        "HAPROXY_HEALTH_CHECK_RISE",
+        "HAProxy rise (good checks)",
+        "number",
+        "Consecutive good checks before backend up (Percona default 1)",
+        section="HAProxy",
+        default="1",
+    ),
+    FieldSpec(
+        "HAPROXY_HEALTH_CHECK_FALL",
+        "HAProxy fall (failed checks)",
+        "number",
+        "Consecutive failed checks before backend down (Percona default 2)",
+        section="HAProxy",
+        default="2",
+    ),
+    FieldSpec(
+        "HAPROXY_APPLY_BEFORE_FAILOVER",
+        "Apply HAProxy settings before run",
+        "checkbox",
+        "Patch Percona CR before Advanced failover benchmark starts",
+        section="HAProxy",
+        default="1",
+    ),
+    FieldSpec(
+        "HAPROXY_APPLY_WAIT_SEC",
+        "Wait for HAProxy reconcile (s)",
+        "number",
+        section="HAProxy",
+        default="90",
+    ),
     FieldSpec("FAILOVER_MONITOR_PRIMARY", "Monitor primary topology", "checkbox", section="Monitoring"),
     FieldSpec("FAILOVER_MONITOR_WRITE_PROBE", "Monitor write probe", "checkbox", section="Monitoring"),
     FieldSpec("FAILOVER_MONITOR_INTERVAL", "Monitor poll interval (s)", "number", section="Monitoring"),
@@ -111,6 +158,15 @@ FAILOVER_FIELDS: tuple[FieldSpec, ...] = (
 FAILOVER_KEYS: tuple[str, ...] = tuple(field.key for field in FAILOVER_FIELDS)
 
 INSERT_MARKER = "# --- Failover benchmark ---"
+
+
+def apply_config_defaults(values: dict[str, str]) -> dict[str, str]:
+    """Fill empty keys with UI/schema defaults (e.g. Percona HAProxy defaults)."""
+    out = dict(values)
+    for field in FAILOVER_FIELDS:
+        if field.default and not out.get(field.key, "").strip():
+            out[field.key] = field.default
+    return out
 
 
 def estimate_runtime_sec(values: dict[str, str]) -> int:

@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 LOCK_FILE="${REPO_ROOT}/results/.failover_run.lock"
 CONFIG="${BENCHMARK_CONF:-${REPO_ROOT}/benchmark.conf}"
+COMPLETE_MARKER="=== Failover benchmark complete ==="
 
 _usage() {
   echo "Usage: $0 {status|start|log [lines]|list [limit]}" >&2
@@ -27,17 +28,59 @@ _find_running_pid() {
   pgrep -f "${REPO_ROOT}/run_failover_benchmark.sh" 2>/dev/null | head -1 || true
 }
 
+_run_log_complete() {
+  local results_dir="${1:?results_dir required}"
+  [[ -f "${REPO_ROOT}/${results_dir}/full_run.log" ]] \
+    && grep -q "${COMPLETE_MARKER}" "${REPO_ROOT}/${results_dir}/full_run.log" 2>/dev/null
+}
+
+# Newest results dir whose run has not finished yet (active benchmark).
+_find_incomplete_results_dir() {
+  local d
+  for d in $(ls -1dt "${REPO_ROOT}"/results/failover_* 2>/dev/null); do
+    local rel="${d#${REPO_ROOT}/}"
+    [[ -f "${d}/full_run.log" ]] || continue
+    if ! _run_log_complete "${rel}"; then
+      echo "${rel}"
+      return 0
+    fi
+  done
+}
+
+# Newest results dir by mtime (for idle UI — show last run).
+_find_latest_results_dir() {
+  local latest
+  latest="$(ls -1dt "${REPO_ROOT}"/results/failover_* 2>/dev/null | head -1 || true)"
+  if [[ -n "${latest}" ]]; then
+    echo "${latest#${REPO_ROOT}/}"
+  fi
+}
+
 _resolve_results_dir() {
   local from_lock="${1:-}"
   if [[ -n "${from_lock}" && -d "${REPO_ROOT}/${from_lock}" ]]; then
     echo "${from_lock}"
     return 0
   fi
-  local latest
-  latest="$(ls -td "${REPO_ROOT}"/results/failover_* 2>/dev/null | head -1 || true)"
-  if [[ -n "${latest}" ]]; then
-    echo "${latest#${REPO_ROOT}/}"
-  fi
+  _find_latest_results_dir
+}
+
+# After start: first failover_* directory that did not exist before launch.
+_find_new_results_dir() {
+  local -n _known_ref="${1:?known dirs array name required}"
+  local d existing known
+  for d in $(ls -1dt "${REPO_ROOT}"/results/failover_* 2>/dev/null); do
+    known=0
+    for existing in "${_known_ref[@]:-}"; do
+      if [[ "${d}" == "${existing}" ]]; then
+        known=1
+        break
+      fi
+    done
+    [[ "${known}" -eq 1 ]] && continue
+    echo "${d#${REPO_ROOT}/}"
+    return 0
+  done
 }
 
 _write_lock() {
@@ -49,6 +92,13 @@ RUN_PID=${pid}
 RUN_RESULTS_DIR=${results_dir}
 RUN_STARTED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
+}
+
+_active_results_dir() {
+  local pid="$(_find_running_pid)"
+  if _pid_alive "${pid}"; then
+    _find_incomplete_results_dir
+  fi
 }
 
 _cmd_status() {
@@ -66,14 +116,22 @@ _cmd_status() {
   local running=0
   if _pid_alive "${pid}"; then
     running=1
-    results_dir="$(_resolve_results_dir "${results_dir}")"
-    if [[ -n "${pid}" && -f "${LOCK_FILE}" ]] && ! grep -q "^RUN_PID=${pid}$" "${LOCK_FILE}" 2>/dev/null; then
-      _write_lock "${pid}" "${results_dir}"
+    local active_dir
+    active_dir="$(_find_incomplete_results_dir || true)"
+    if [[ -n "${active_dir}" ]]; then
+      results_dir="${active_dir}"
+    elif [[ -z "${results_dir}" || ! -d "${REPO_ROOT}/${results_dir}" ]]; then
+      results_dir="$(_find_latest_results_dir || true)"
+    fi
+    _write_lock "${pid}" "${results_dir}"
+    if [[ -z "${started}" ]]; then
+      started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     fi
   else
     rm -f "${LOCK_FILE}"
     pid=""
-    results_dir="$(_resolve_results_dir "")"
+    started=""
+    results_dir="$(_find_latest_results_dir || true)"
   fi
 
   local log_path="" report_path="" completed=0
@@ -82,8 +140,7 @@ _cmd_status() {
     report_path="${results_dir}/advanced/graphs/failover_report.html"
     [[ -f "${REPO_ROOT}/${log_path}" ]] || log_path=""
     [[ -f "${REPO_ROOT}/${report_path}" ]] || report_path=""
-    if [[ -f "${REPO_ROOT}/${results_dir}/full_run.log" ]] \
-        && grep -q "=== Failover benchmark complete ===" "${REPO_ROOT}/${results_dir}/full_run.log" 2>/dev/null; then
+    if _run_log_complete "${results_dir}"; then
       completed=1
     fi
   fi
@@ -106,6 +163,11 @@ _cmd_start() {
   fi
   rm -f "${LOCK_FILE}"
 
+  local -a existing_dirs=()
+  while IFS= read -r d; do
+    [[ -n "${d}" ]] && existing_dirs+=("${d}")
+  done < <(ls -1d "${REPO_ROOT}"/results/failover_* 2>/dev/null || true)
+
   cd "${REPO_ROOT}"
   mkdir -p results
   nohup env BENCHMARK_CONF="${CONFIG}" "${REPO_ROOT}/run_failover_benchmark.sh" \
@@ -114,14 +176,17 @@ _cmd_start() {
 
   local results_dir=""
   local attempt
-  for attempt in $(seq 1 45); do
-    results_dir="$(_resolve_results_dir "")"
+  for attempt in $(seq 1 60); do
+    results_dir="$(_find_new_results_dir existing_dirs || true)"
     if [[ -n "${results_dir}" && -f "${REPO_ROOT}/${results_dir}/full_run.log" ]]; then
       break
     fi
     sleep 1
   done
 
+  if [[ -z "${results_dir}" ]]; then
+    results_dir="$(_find_new_results_dir existing_dirs || true)"
+  fi
   if [[ -z "${results_dir}" ]]; then
     results_dir="results/failover_pending"
   fi
@@ -133,10 +198,17 @@ _cmd_start() {
 _cmd_log() {
   local lines="${1:-100}"
   local results_dir=""
-  if _read_lock; then
-    results_dir="${RUN_RESULTS_DIR:-}"
+  local pid="$(_find_running_pid)"
+
+  if _pid_alive "${pid}"; then
+    results_dir="$(_find_incomplete_results_dir || true)"
   fi
-  results_dir="$(_resolve_results_dir "${results_dir}")"
+  if [[ -z "${results_dir}" ]]; then
+    if _read_lock; then
+      results_dir="${RUN_RESULTS_DIR:-}"
+    fi
+    results_dir="$(_resolve_results_dir "${results_dir}")"
+  fi
   if [[ -z "${results_dir}" ]]; then
     echo "No failover run directory found." >&2
     exit 1
@@ -159,8 +231,7 @@ _cmd_list() {
     [[ -n "${d}" ]] || continue
     printf 'RUN|%s\n' "${d}"
     local completed=0
-    if [[ -f "${REPO_ROOT}/${d}/full_run.log" ]] \
-        && grep -q "=== Failover benchmark complete ===" "${REPO_ROOT}/${d}/full_run.log" 2>/dev/null; then
+    if _run_log_complete "${d}"; then
       completed=1
     fi
     printf 'STATE|%s|%s\n' "${d}" "${completed}"

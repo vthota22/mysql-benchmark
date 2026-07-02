@@ -19,6 +19,7 @@ from control.config_schema import (  # noqa: E402
     FAILOVER_FIELDS,
     FAILOVER_KEYS,
     INSERT_MARKER,
+    apply_config_defaults,
     estimate_runtime_sec,
 )
 from control.report_proxy import ReportProxy, pick_primary_report, report_view_url, validate_results_path  # noqa: E402
@@ -37,6 +38,7 @@ def _field_specs_json() -> list[dict]:
             "help": field.help_text,
             "options": list(field.options),
             "section": field.section,
+            "default": field.default,
         }
         for field in FAILOVER_FIELDS
     ]
@@ -53,6 +55,7 @@ class ControlServer:
         text = self.backend.read_file(self.droplet.remote_conf_path)
         parsed = parse_config(text)
         values = get_keys(parsed, list(FAILOVER_KEYS))
+        values = apply_config_defaults(values)
         return {
             "values": values,
             "estimated_runtime_sec": estimate_runtime_sec(values),

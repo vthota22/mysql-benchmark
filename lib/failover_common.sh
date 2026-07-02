@@ -46,6 +46,13 @@ failover_defaults() {
   # Space-separated load thread counts; when set, runs each under edition/t<N>/<scenario>/
   : "${FAILOVER_THREAD_MATRIX:=}"
   : "${FAILOVER_THREAD_DELAY_SEC:=120}"
+  # Advanced HAProxy: check inter N ms (N = interval_sec * 1000); Percona operator script default inter 10000 rise 1 fall 2
+  : "${HAPROXY_HEALTH_CHECK_INTERVAL_SEC:=10}"
+  : "${HAPROXY_HEALTH_CHECK_RISE:=1}"
+  : "${HAPROXY_HEALTH_CHECK_FALL:=2}"
+  : "${HAPROXY_APPLY_BEFORE_FAILOVER:=1}"
+  : "${HAPROXY_APPLY_WAIT_SEC:=90}"
+  : "${ADVANCED_PSMYSQL_CR_NAME:=}"
 }
 
 failover_scenario_trx_profile() {
@@ -585,6 +592,134 @@ stop_gr_pod_monitor() {
   if [[ -f "${results_dir}/gr_pod_monitor_meta.txt" ]]; then
     echo "GR_POD_MONITOR_END_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${results_dir}/gr_pod_monitor_meta.txt"
   fi
+}
+
+_failover_resolve_kubeconfig() {
+  local results_dir="${1:-}"
+  local path=""
+
+  if [[ -n "${results_dir}" && -f "${results_dir}/kubeconfig" ]]; then
+    echo "${results_dir}/kubeconfig"
+    return 0
+  fi
+  if [[ -n "${ADVANCED_KUBECONFIG_PATH:-}" ]]; then
+    path="${ADVANCED_KUBECONFIG_PATH}"
+    [[ "${path}" != /* ]] && path="${BENCH_ROOT}/${path#./}"
+    if [[ -f "${path}" ]]; then
+      echo "${path}"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# Patch PerconaServerMySQL HA_SERVER_OPTIONS (HAProxy backend check inter/rise/fall).
+# Requires ADVANCED_K8S_NAMESPACE, ADVANCED_PSMYSQL_CR_NAME, and a kubeconfig on the droplet.
+apply_haproxy_health_check() {
+  local edition_dir="${1:-}"
+
+  [[ "${HAPROXY_APPLY_BEFORE_FAILOVER:-1}" == "1" ]] || return 0
+
+  local interval_sec="${HAPROXY_HEALTH_CHECK_INTERVAL_SEC:-2}"
+  local rise="${HAPROXY_HEALTH_CHECK_RISE:-1}"
+  local fall="${HAPROXY_HEALTH_CHECK_FALL:-1}"
+  local ns="${ADVANCED_K8S_NAMESPACE:-}"
+  local cr="${ADVANCED_PSMYSQL_CR_NAME:-}"
+  local wait_sec="${HAPROXY_APPLY_WAIT_SEC:-90}"
+  local kubeconfig=""
+
+  if [[ -z "${cr}" || -z "${ns}" ]]; then
+    echo "HAProxy health check: skipped (set ADVANCED_PSMYSQL_CR_NAME and ADVANCED_K8S_NAMESPACE)" >&2
+    return 0
+  fi
+
+  if ! kubeconfig="$(_failover_resolve_kubeconfig "${edition_dir}")"; then
+    echo "HAProxy health check: skipped (no kubeconfig — set ADVANCED_KUBECONFIG_PATH on droplet)" >&2
+    return 0
+  fi
+
+  if ! [[ "${interval_sec}" =~ ^[0-9]+$ ]] || (( interval_sec < 2 || interval_sec > 10 )); then
+    echo "ERROR: HAPROXY_HEALTH_CHECK_INTERVAL_SEC must be an integer 2–10 (seconds)" >&2
+    return 1
+  fi
+
+  command -v kubectl >/dev/null 2>&1 || {
+    echo "ERROR: kubectl not found — cannot apply HAProxy health check" >&2
+    return 1
+  }
+
+  local inter_ms=$((interval_sec * 1000))
+  local server_options="check inter ${inter_ms} rise ${rise} fall ${fall} weight 1"
+  local -a kubectl=()
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+
+  echo "--- HAProxy health check: inter=${interval_sec}s (${inter_ms}ms) rise=${rise} fall=${fall} ---"
+  echo "    CR: ${cr}  namespace: ${ns}"
+  echo "    HA_SERVER_OPTIONS=${server_options}"
+
+  if ! python3 - "${cr}" "${ns}" "${server_options}" "${kubeconfig}" "${ADVANCED_K8S_CONTEXT:-}" <<'PY'
+import json
+import subprocess
+import sys
+
+cr, ns, server_options, kubeconfig, context = sys.argv[1:6]
+base = ["kubectl", f"--kubeconfig={kubeconfig}"]
+if context:
+    base.extend(["--context", context])
+
+def run(cmd):
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+get_cmd = base + ["get", "perconaservermysql", cr, "-n", ns, "-o", "json"]
+doc = json.loads(subprocess.check_output(get_cmd, text=True))
+proxy = doc.setdefault("spec", {}).setdefault("proxy", {}).setdefault("haproxy", {})
+env = proxy.get("env") or []
+updated = False
+for item in env:
+    if item.get("name") == "HA_SERVER_OPTIONS":
+        item["value"] = server_options
+        updated = True
+        break
+if not updated:
+    env.append({"name": "HA_SERVER_OPTIONS", "value": server_options})
+proxy["env"] = env
+
+apply_cmd = base + ["apply", "-f", "-"]
+subprocess.run(apply_cmd, input=json.dumps(doc), check=True, text=True)
+PY
+  then
+    echo "ERROR: failed to patch PerconaServerMySQL ${cr}" >&2
+    return 1
+  fi
+
+  if [[ -n "${edition_dir}" ]]; then
+    mkdir -p "${edition_dir}"
+    {
+      echo "HAPROXY_HEALTH_CHECK_INTERVAL_SEC=${interval_sec}"
+      echo "HAPROXY_CHECK_INTER_MS=${inter_ms}"
+      echo "HA_SERVER_OPTIONS=${server_options}"
+      echo "ADVANCED_PSMYSQL_CR_NAME=${cr}"
+      echo "ADVANCED_K8S_NAMESPACE=${ns}"
+      echo "HAPROXY_APPLY_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "${edition_dir}/haproxy_health.env"
+  fi
+
+  if (( wait_sec > 0 )); then
+    echo "Waiting up to ${wait_sec}s for HAProxy to reconcile..."
+    local deadline=$((SECONDS + wait_sec)) state=""
+    while (( SECONDS < deadline )); do
+      state="$("${kubectl[@]}" get "perconaservermysql" "${cr}" -n "${ns}" \
+        -o jsonpath='{.status.haproxy.state}' 2>/dev/null || true)"
+      if [[ "${state}" == "ready" ]]; then
+        echo "HAProxy state: ready"
+        return 0
+      fi
+      sleep 5
+    done
+    echo "WARNING: HAProxy not ready after ${wait_sec}s (state=${state:-unknown}) — continuing" >&2
+  fi
+
+  return 0
 }
 
 _failover_snapshot_operator_logs() {

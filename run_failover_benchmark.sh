@@ -201,6 +201,12 @@ run_failover_edition() {
     || { echo "Aborting ${edition}: cannot connect"; return 1; }
   echo ""
 
+  if [[ "${edition}" == "advanced" ]]; then
+    apply_haproxy_health_check "${edition_dir}" \
+      || { echo "Aborting ${edition}: HAProxy health check apply failed"; return 1; }
+    echo ""
+  fi
+
   write_failover_benchmark_config "${edition_dir}" "${edition}"
 
   if [[ "${SKIP_PREPARE:-0}" != "1" ]]; then
