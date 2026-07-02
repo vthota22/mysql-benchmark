@@ -359,11 +359,16 @@ main() {
     log_phase "0_DO_API" "SKIP_SCALING=1 — skipping DO API auth"
   fi
   if k8s_monitor_enabled; then
-    log_phase "0_K8S" "verifying kubectl connectivity for pod monitoring"
-    if kubectl --kubeconfig="${K8S_KUBECONFIG}" cluster-info >/dev/null 2>&1; then
+    log_phase "0_K8S" "verifying kubectl connectivity (kubeconfig=${K8S_KUBECONFIG})"
+    local k8s_err
+    if k8s_err="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" cluster-info 2>&1)"; then
       log_phase "0_K8S" "kubectl connectivity OK"
     else
       log_phase "0_K8S" "WARNING: cannot reach K8s cluster — pod monitoring disabled"
+      log_phase "0_K8S" "kubectl error: ${k8s_err}"
+      if ! command -v kubectl >/dev/null 2>&1; then
+        log_phase "0_K8S" "hint: kubectl not found in PATH — install it on this machine"
+      fi
       K8S_KUBECONFIG=""
     fi
   fi
