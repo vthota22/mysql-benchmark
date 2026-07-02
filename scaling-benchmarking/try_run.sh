@@ -57,10 +57,10 @@ export DO_API_TOKEN="${DO_API_TOKEN:-}"
 export DO_API_URL="${DO_API_URL:-}"
 export CLUSTER_ID="${CLUSTER_ID:-}"
 
-# Auto-fetch connection details from doctl if not set
+# Auto-fetch connection details from doctl if not set; save back to config
 if [[ -z "${MYSQL_HOST:-}" || -z "${MYSQL_PORT:-}" || -z "${MYSQL_USER:-}" || -z "${MYSQL_PASSWORD:-}" ]]; then
   if [[ -n "${CLUSTER_ID:-}" && -n "${DO_API_TOKEN:-}" ]]; then
-    fetch_cluster_details
+    fetch_cluster_details "${CONFIG}"
   fi
 fi
 

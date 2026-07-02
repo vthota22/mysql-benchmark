@@ -153,9 +153,54 @@ determine_scale_type() {
   SCALE_DESCRIPTION="$(printf '%s\n' "${parts[@]}")"
 }
 
+# Update a KEY="value" line in a config file. Only replaces the value portion;
+# preserves comments and surrounding lines.
+_update_conf_value() {
+  local file="${1}" key="${2}" value="${3}"
+  if grep -q "^${key}=" "${file}" 2>/dev/null; then
+    local escaped_value
+    escaped_value="$(printf '%s' "${value}" | sed 's/[&/\]/\\&/g')"
+    sed -i.bak "s|^${key}=.*|${key}=\"${escaped_value}\"|" "${file}"
+    rm -f "${file}.bak"
+  fi
+}
+
+# Write auto-fetched values back into the benchmark.conf file so it becomes
+# self-documenting with the actual values used for this cluster.
+_save_fetched_to_conf() {
+  local config_file="${1:?config file required}"
+  shift
+  local -a updated_keys=("$@")
+
+  if [[ ${#updated_keys[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  for key in "${updated_keys[@]}"; do
+    local val=""
+    case "${key}" in
+      MYSQL_HOST)               val="${MYSQL_HOST:-}" ;;
+      MYSQL_PORT)               val="${MYSQL_PORT:-}" ;;
+      MYSQL_USER)               val="${MYSQL_USER:-}" ;;
+      MYSQL_PASSWORD)           val="${MYSQL_PASSWORD:-}" ;;
+      INITIAL_SIZE)             val="${INITIAL_SIZE:-}" ;;
+      INITIAL_NUM_NODES)        val="${INITIAL_NUM_NODES:-}" ;;
+      INITIAL_STORAGE_SIZE_GIB) val="${INITIAL_STORAGE_SIZE_GIB:-}" ;;
+    esac
+    if [[ -n "${val}" ]]; then
+      _update_conf_value "${config_file}" "${key}" "${val}"
+    fi
+  done
+
+  log_phase "0_FETCH" "saved fetched values to ${config_file}"
+}
+
 # Auto-fetch cluster details and connection info from doctl when not set.
 # Requires CLUSTER_ID and DO_API_TOKEN to be set.
+# Pass the config file path as $1 to write fetched values back; omit to skip.
 fetch_cluster_details() {
+  local config_file="${1:-}"
+
   if [[ -z "${CLUSTER_ID:-}" || -z "${DO_API_TOKEN:-}" ]]; then
     return 1
   fi
@@ -177,6 +222,8 @@ fetch_cluster_details() {
 
   log_phase "0_FETCH" "auto-fetching cluster details from doctl (cluster=${CLUSTER_ID})"
 
+  local -a updated_keys=()
+
   if [[ "${needs_cluster}" -eq 1 ]]; then
     local cluster_info
     cluster_info="$(run_doctl databases get "${CLUSTER_ID}" \
@@ -189,14 +236,17 @@ fetch_cluster_details() {
 
     if [[ -z "${INITIAL_SIZE:-}" && -n "${fetched_size}" ]]; then
       INITIAL_SIZE="${fetched_size}"
+      updated_keys+=("INITIAL_SIZE")
       log_phase "0_FETCH" "INITIAL_SIZE=${INITIAL_SIZE} (from doctl)"
     fi
     if [[ -z "${INITIAL_NUM_NODES:-}" && -n "${fetched_nodes}" ]]; then
       INITIAL_NUM_NODES="${fetched_nodes}"
+      updated_keys+=("INITIAL_NUM_NODES")
       log_phase "0_FETCH" "INITIAL_NUM_NODES=${INITIAL_NUM_NODES} (from doctl)"
     fi
     if [[ -z "${INITIAL_STORAGE_SIZE_GIB:-}" && -n "${fetched_storage_mib}" ]]; then
       INITIAL_STORAGE_SIZE_GIB=$(( fetched_storage_mib / 1024 ))
+      updated_keys+=("INITIAL_STORAGE_SIZE_GIB")
       log_phase "0_FETCH" "INITIAL_STORAGE_SIZE_GIB=${INITIAL_STORAGE_SIZE_GIB} (from doctl, ${fetched_storage_mib} MiB)"
     fi
   fi
@@ -213,20 +263,29 @@ fetch_cluster_details() {
 
     if [[ -z "${MYSQL_HOST:-}" && -n "${fetched_host}" ]]; then
       MYSQL_HOST="${fetched_host}"
+      updated_keys+=("MYSQL_HOST")
       log_phase "0_FETCH" "MYSQL_HOST=${MYSQL_HOST} (from doctl)"
     fi
     if [[ -z "${MYSQL_PORT:-}" && -n "${fetched_port}" ]]; then
       MYSQL_PORT="${fetched_port}"
+      updated_keys+=("MYSQL_PORT")
       log_phase "0_FETCH" "MYSQL_PORT=${MYSQL_PORT} (from doctl)"
     fi
     if [[ -z "${MYSQL_USER:-}" && -n "${fetched_user}" ]]; then
       MYSQL_USER="${fetched_user}"
+      updated_keys+=("MYSQL_USER")
       log_phase "0_FETCH" "MYSQL_USER=${MYSQL_USER} (from doctl)"
     fi
     if [[ -z "${MYSQL_PASSWORD:-}" && -n "${fetched_pass}" ]]; then
       MYSQL_PASSWORD="${fetched_pass}"
+      updated_keys+=("MYSQL_PASSWORD")
       log_phase "0_FETCH" "MYSQL_PASSWORD=****** (from doctl)"
     fi
+  fi
+
+  # Write fetched values back to config file
+  if [[ -n "${config_file}" && -f "${config_file}" && ${#updated_keys[@]} -gt 0 ]]; then
+    _save_fetched_to_conf "${config_file}" "${updated_keys[@]}"
   fi
 }
 
@@ -247,9 +306,10 @@ require_config() {
     SCALE_STORAGE_SIZE_MIB="$(gib_to_mib "${SCALE_STORAGE_SIZE_GIB}")"
   fi
 
-  # Auto-fetch connection + initial state from doctl when not manually set
+  # Auto-fetch connection + initial state from doctl when not manually set.
+  # Pass config file path so fetched values are written back to benchmark.conf.
   if [[ -n "${DO_API_TOKEN:-}" ]]; then
-    fetch_cluster_details
+    fetch_cluster_details "${BENCHMARK_CONF_FILE:-}"
   fi
 
   : "${MYSQL_HOST:?Set MYSQL_HOST in benchmark.conf or provide DO_API_TOKEN to auto-fetch}"

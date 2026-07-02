@@ -20,6 +20,7 @@ source "${SCRIPT_DIR}/lib/common.sh"
 
 setup_paths
 load_config "${CONFIG}"
+export BENCHMARK_CONF_FILE="${CONFIG}"
 require_config
 
 RESULTS_BASE="${SCRIPT_DIR}/${RESULTS_DIR:-results}"
