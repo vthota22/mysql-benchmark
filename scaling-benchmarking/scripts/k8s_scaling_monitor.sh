@@ -3,10 +3,11 @@
 #
 # Tracks per poll cycle:
 #   1. GR role: which pod is PRIMARY, which are SECONDARY
-#   2. Pod state: phase (Running/Pending/etc), ready, GR member state (ONLINE/RECOVERING/ERROR)
-#   3. DOKS node binding: which K8s worker node each pod runs on (detects node drain/migration)
+#   2. Pod state: phase, ready, GR member state (ONLINE/RECOVERING/ERROR)
+#   3. DOKS node binding: which K8s worker node + slug each pod runs on
+#   4. gr_detail: error reason when GR state is not ONLINE
 #
-# Outputs a single TSV file (k8s_monitor.tsv) and a human-readable log (k8s_monitor.log).
+# Outputs k8s_monitor.tsv (time-series) and k8s_monitor.log (events).
 #
 # Usage (standalone):
 #   export KUBECONFIG=/path/to/kubeconfig
@@ -40,6 +41,16 @@ MONITOR_LOG="${OUTPUT_DIR}/k8s_monitor.log"
 CACHED_PASSWORD=""
 PREVIOUS_PRIMARY=""
 PREVIOUS_NODE_MAP=""
+PREVIOUS_POD_COUNT=""
+PREVIOUS_PVC_SIZES=""
+NODE_CYCLE=0
+NODES_LOADED=false
+
+# Temporary files for lookups (avoids associative-array + set -u issues)
+GR_TMP="${OUTPUT_DIR}/.gr_members.tsv"
+NODE_TMP="${OUTPUT_DIR}/.node_info.tsv"
+PVC_TMP="${OUTPUT_DIR}/.pvc_info.tsv"
+GR_COUNTS_TMP="${OUTPUT_DIR}/.gr_counts.txt"
 
 log() {
   local ts
@@ -113,20 +124,14 @@ mysql_in_pod() {
     mysql -u"${MYSQL_ROOT_USER}" -p"${password}" --skip-column-names "$@" 2>/dev/null
 }
 
-# ── Build node-name → {slug, cpu, mem_gib} lookup from kubectl get nodes ───
-# Populated once per poll cycle; avoids per-pod kubectl calls.
-declare -A NODE_SLUG_MAP NODE_CPU_MAP NODE_MEM_MAP
-
+# ── Node info cache ────────────────────────────────────────────────────────
+# Writes TSV to NODE_TMP: node_name \t slug \t cpu \t mem_gib
+# Refreshed every 6 cycles (~30s); new nodes trigger an immediate refresh.
 refresh_node_info() {
-  NODE_SLUG_MAP=()
-  NODE_CPU_MAP=()
-  NODE_MEM_MAP=()
-
   local nodes_json
   nodes_json="$(kubectl get nodes -o json 2>/dev/null)" || { log "WARN: failed to get nodes"; return; }
 
-  local node_lines
-  node_lines="$(echo "${nodes_json}" | python3 -c "
+  echo "${nodes_json}" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 for n in data.get('items', []):
@@ -139,25 +144,180 @@ for n in data.get('items', []):
     mem_ki_val = int(''.join(c for c in mem_ki if c.isdigit()) or '0')
     mem_gib = round(mem_ki_val / 1048576, 1)
     print(f'{name}\t{slug}\t{cpu}\t{mem_gib}')
-" 2>/dev/null)" || { log "WARN: node info parsing failed"; return; }
-
-  while IFS=$'\t' read -r n_name n_slug n_cpu n_mem; do
-    [[ -z "${n_name}" ]] && continue
-    NODE_SLUG_MAP["${n_name}"]="${n_slug}"
-    NODE_CPU_MAP["${n_name}"]="${n_cpu}"
-    NODE_MEM_MAP["${n_name}"]="${n_mem}"
-  done <<< "${node_lines}"
+" > "${NODE_TMP}" 2>/dev/null || { log "WARN: node info parsing failed"; return; }
+  NODES_LOADED=true
 }
 
-# ── Single poll: collect pod state + GR role + DOKS node for each mysql pod ─
+maybe_refresh_nodes() {
+  NODE_CYCLE=$((NODE_CYCLE + 1))
+  if (( NODE_CYCLE >= 6 )) || [[ "${NODES_LOADED}" != "true" ]]; then
+    refresh_node_info
+    NODE_CYCLE=0
+  fi
+}
+
+# Lookup from NODE_TMP: given a node name, return "slug \t cpu \t mem_gib"
+node_lookup() {
+  local node_name="${1}"
+  [[ -z "${node_name}" || ! -f "${NODE_TMP}" ]] && { echo "?\t?\t?"; return; }
+  local match
+  match="$(grep "^${node_name}	" "${NODE_TMP}" 2>/dev/null | head -1)" || true
+  if [[ -n "${match}" ]]; then
+    echo "${match}" | cut -f2-
+  else
+    echo "?\t?\t?"
+  fi
+}
+
+# ── PVC info ───────────────────────────────────────────────────────────────
+# Writes TSV to PVC_TMP: pod_name \t requested \t capacity
+# PVC names follow: datadir-<cluster>-mysql-N → pod <cluster>-mysql-N
+refresh_pvc_info() {
+  local pvcs_json
+  pvcs_json="$(kubectl_ns get pvc \
+    -l "app.kubernetes.io/instance=${CLUSTER_NAME}" \
+    -o json 2>/dev/null)" || { log "WARN: failed to get PVCs"; return; }
+
+  echo "${pvcs_json}" | python3 -c "
+import json, sys, re
+data = json.load(sys.stdin)
+for item in data.get('items', []):
+    name = item['metadata']['name']
+    # Extract pod name: 'datadir-cluster-mysql-0' → 'cluster-mysql-0'
+    pod_name = re.sub(r'^datadir-', '', name)
+    req = item.get('spec', {}).get('resources', {}).get('requests', {}).get('storage', '?')
+    cap = item.get('status', {}).get('capacity', {}).get('storage', '?')
+    phase = item.get('status', {}).get('phase', '?')
+    print(f'{pod_name}\t{req}\t{cap}\t{phase}')
+" > "${PVC_TMP}" 2>/dev/null || { log "WARN: PVC parsing failed"; return; }
+
+  # Detect PVC size changes
+  local current_sizes
+  current_sizes="$(sort "${PVC_TMP}" 2>/dev/null)"
+  if [[ -n "${PREVIOUS_PVC_SIZES}" && "${current_sizes}" != "${PREVIOUS_PVC_SIZES}" ]]; then
+    log "PVC CHANGE detected"
+  fi
+  PREVIOUS_PVC_SIZES="${current_sizes}"
+}
+
+# Lookup from PVC_TMP: given a pod name, return "requested \t capacity"
+pvc_lookup() {
+  local pod_name="${1}"
+  [[ -z "${pod_name}" || ! -f "${PVC_TMP}" ]] && { echo "?\t?"; return; }
+  local match
+  match="$(grep "^${pod_name}	" "${PVC_TMP}" 2>/dev/null | head -1)" || true
+  if [[ -n "${match}" ]]; then
+    echo "${match}" | cut -f2-3
+  else
+    echo "?\t?"
+  fi
+}
+
+# ── GR member info via a single query from one reachable pod ───────────────
+# Writes TSV to GR_TMP: short_hostname \t role \t state \t detail
+# One kubectl-exec instead of N.
+refresh_gr_info() {
+  : > "${GR_TMP}"
+
+  local password
+  password="$(get_mysql_password)"
+  [[ -z "${password}" ]] && return
+
+  local running_pods
+  running_pods="$(kubectl_ns get pods \
+    -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=${MYSQL_COMPONENT_LABEL}" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+
+  local gr_raw=""
+  local queried_pod=""
+  while IFS= read -r pod_name; do
+    [[ -z "${pod_name}" ]] && continue
+
+    if [[ "${CR_TYPE}" == "ps" ]]; then
+      gr_raw="$(mysql_in_pod "${pod_name}" "${password}" -e "
+        SELECT
+          SUBSTRING_INDEX(m.MEMBER_HOST, '.', 1) AS short_host,
+          m.MEMBER_ROLE,
+          m.MEMBER_STATE,
+          IFNULL(
+            CASE
+              WHEN m.MEMBER_STATE = 'RECOVERING' THEN 'catching_up'
+              WHEN m.MEMBER_STATE = 'UNREACHABLE' THEN 'connection_lost'
+              WHEN m.MEMBER_STATE = 'ERROR' THEN
+                IFNULL((SELECT CONCAT('applier:', e.LAST_ERROR_MESSAGE)
+                        FROM performance_schema.replication_applier_status_by_worker e
+                        WHERE e.LAST_ERROR_MESSAGE != '' LIMIT 1),
+                       IFNULL((SELECT CONCAT('connection:', c.LAST_ERROR_MESSAGE)
+                               FROM performance_schema.replication_connection_status c
+                               WHERE c.LAST_ERROR_MESSAGE != '' LIMIT 1),
+                              'unknown_error'))
+              ELSE ''
+            END, '')
+        FROM performance_schema.replication_group_members m;
+      " 2>/dev/null)" && { queried_pod="${pod_name}"; break; }
+    else
+      gr_raw="$(mysql_in_pod "${pod_name}" "${password}" -e "
+        SELECT
+          @@hostname,
+          CASE WHEN @@read_only = 0 THEN 'PRIMARY' ELSE 'SECONDARY' END,
+          @@wsrep_local_state_comment,
+          CASE
+            WHEN @@wsrep_local_state_comment != 'Synced' THEN @@wsrep_local_state_comment
+            ELSE ''
+          END;
+      " 2>/dev/null)" && { queried_pod="${pod_name}"; break; }
+    fi
+  done <<< "${running_pods}"
+
+  if [[ -z "${gr_raw}" ]]; then
+    log "WARN: could not query GR from any pod"
+    return
+  fi
+
+  local total=0 online=0
+  echo "${gr_raw}" | while IFS=$'\t' read -r host role state detail; do
+    [[ -z "${host}" ]] && continue
+    detail="$(echo "${detail}" | tr '\t\n\r' '___' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -z "${detail}" ]] && detail="-"
+    printf '%s\t%s\t%s\t%s\n' "${host}" "${role}" "${state}" "${detail}"
+  done > "${GR_TMP}"
+
+  # Count members and online members from GR_TMP
+  if [[ -s "${GR_TMP}" ]]; then
+    total="$(wc -l < "${GR_TMP}" | tr -d ' ')"
+    online="$(grep -c '	ONLINE	\|	Synced	' "${GR_TMP}" 2>/dev/null || echo 0)"
+  fi
+  echo "${total}	${online}" > "${GR_COUNTS_TMP}"
+}
+
+# Lookup from GR_TMP: given a pod name, return "role \t state \t detail"
+gr_lookup() {
+  local pod_name="${1}"
+  [[ -z "${pod_name}" || ! -f "${GR_TMP}" ]] && { echo "?\t?\t"; return; }
+  local match
+  match="$(grep "^${pod_name}	" "${GR_TMP}" 2>/dev/null | head -1)" || true
+  if [[ -n "${match}" ]]; then
+    echo "${match}" | cut -f2-
+  else
+    echo "?\t?\t"
+  fi
+}
+
+# ── Single poll ────────────────────────────────────────────────────────────
 poll_once() {
   local ts
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  local password
-  password="$(get_mysql_password)"
+  maybe_refresh_nodes
+  refresh_gr_info
+  refresh_pvc_info
 
-  refresh_node_info
+  # GR member counts (total / online)
+  local gr_members="?" gr_online="?"
+  if [[ -f "${GR_COUNTS_TMP}" ]]; then
+    gr_members="$(cut -f1 "${GR_COUNTS_TMP}")"
+    gr_online="$(cut -f2 "${GR_COUNTS_TMP}")"
+  fi
 
   local pods_json
   pods_json="$(kubectl_ns get pods \
@@ -176,6 +336,13 @@ for item in data.get('items', []):
     main = next((c for c in cs if c['name'] in ('pxc', 'mysql')), cs[0] if cs else {})
     ready = all(c.get('ready', False) for c in cs) if cs else False
     deleting = 'yes' if meta.get('deletionTimestamp') else 'no'
+    # Container state reason (e.g. CrashLoopBackOff, ContainerCreating)
+    state_info = main.get('state', {})
+    reason = ''
+    for stype in ('waiting', 'terminated'):
+        if stype in state_info:
+            reason = state_info[stype].get('reason', '')
+            break
     print('\t'.join([
         meta['name'],
         status.get('phase', 'Unknown'),
@@ -183,50 +350,60 @@ for item in data.get('items', []):
         spec.get('nodeName', ''),
         str(main.get('restartCount', 0)),
         deleting,
+        reason,
     ]))
 " 2>/dev/null)" || { log "WARN: pod parsing failed"; return; }
 
   local current_node_map=""
 
-  while IFS=$'\t' read -r pod_name phase ready node restarts deleting; do
+  while IFS=$'\t' read -r pod_name phase ready node restarts deleting container_reason; do
     [[ -z "${pod_name}" ]] && continue
 
-    local gr_role="?" gr_state="?"
+    # GR info from cached single-query result
+    local gr_info
+    gr_info="$(gr_lookup "${pod_name}")"
+    local gr_role gr_state gr_detail
+    gr_role="$(echo "${gr_info}" | cut -f1)"
+    gr_state="$(echo "${gr_info}" | cut -f2)"
+    gr_detail="$(echo "${gr_info}" | cut -f3)"
 
-    if [[ "${phase}" == "Running" && -n "${password}" ]]; then
-      local gr_line
-      if [[ "${CR_TYPE}" == "ps" ]]; then
-        gr_line="$(mysql_in_pod "${pod_name}" "${password}" -e "
-          SELECT
-            IFNULL((SELECT MEMBER_ROLE FROM performance_schema.replication_group_members
-                    WHERE MEMBER_HOST LIKE CONCAT(@@hostname, '%') LIMIT 1), 'UNKNOWN'),
-            IFNULL((SELECT MEMBER_STATE FROM performance_schema.replication_group_members
-                    WHERE MEMBER_HOST LIKE CONCAT(@@hostname, '%') LIMIT 1), 'UNKNOWN');
-        ")" || gr_line=""
-      else
-        gr_line="$(mysql_in_pod "${pod_name}" "${password}" -e "
-          SELECT
-            CASE WHEN @@read_only = 0 THEN 'PRIMARY' ELSE 'SECONDARY' END,
-            @@wsrep_local_state_comment;
-        ")" || gr_line=""
-      fi
-
-      if [[ -n "${gr_line}" ]]; then
-        gr_role="$(echo "${gr_line}" | awk '{print $1}')"
-        gr_state="$(echo "${gr_line}" | awk '{print $2}')"
-      fi
+    # If pod is not Running, override gr_detail with container reason
+    if [[ "${phase}" != "Running" && -n "${container_reason}" ]]; then
+      gr_detail="${container_reason}"
     fi
 
-    local node_slug="${NODE_SLUG_MAP[${node}]:-?}"
-    local node_cpu="${NODE_CPU_MAP[${node}]:-?}"
-    local node_mem="${NODE_MEM_MAP[${node}]:-?}"
+    # Node info from cached result
+    local node_info
+    node_info="$(node_lookup "${node}")"
+    local node_slug node_cpu node_mem
+    node_slug="$(echo "${node_info}" | cut -f1)"
+    node_cpu="$(echo "${node_info}" | cut -f2)"
+    node_mem="$(echo "${node_info}" | cut -f3)"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${ts}" "${pod_name}" "${phase}" "${ready}" "${gr_role}" "${gr_state}" \
-      "${node}" "${node_slug}" "${node_cpu}" "${node_mem}" "${restarts}" "${deleting}" \
+    # If node is unknown (new node during scaling), force refresh
+    if [[ "${node_slug}" == "?" && -n "${node}" ]]; then
+      refresh_node_info
+      NODE_CYCLE=0
+      node_info="$(node_lookup "${node}")"
+      node_slug="$(echo "${node_info}" | cut -f1)"
+      node_cpu="$(echo "${node_info}" | cut -f2)"
+      node_mem="$(echo "${node_info}" | cut -f3)"
+    fi
+
+    # PVC info
+    local pvc_info
+    pvc_info="$(pvc_lookup "${pod_name}")"
+    local pvc_req pvc_cap
+    pvc_req="$(echo "${pvc_info}" | cut -f1)"
+    pvc_cap="$(echo "${pvc_info}" | cut -f2)"
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${ts}" "${pod_name}" "${phase}" "${ready}" \
+      "${gr_role}" "${gr_state}" "${gr_detail}" "${gr_members}" "${gr_online}" \
+      "${node}" "${node_slug}" "${node_cpu}" "${node_mem}" \
+      "${pvc_req}" "${pvc_cap}" "${restarts}" "${deleting}" \
       >> "${TSV_FILE}"
 
-    # Detect primary change
     if [[ "${gr_role}" == "PRIMARY" && "${pod_name}" != "${PREVIOUS_PRIMARY}" ]]; then
       if [[ -n "${PREVIOUS_PRIMARY}" ]]; then
         log "PRIMARY FAILOVER: ${PREVIOUS_PRIMARY} -> ${pod_name}"
@@ -240,7 +417,14 @@ for item in data.get('items', []):
 
   done <<< "${pod_lines}"
 
-  # Detect node migration (pod moved to a different DOKS worker)
+  # Detect pod count change (horizontal scaling)
+  local pod_count
+  pod_count="$(echo "${pod_lines}" | grep -c '.' || echo 0)"
+  if [[ -n "${PREVIOUS_POD_COUNT}" && "${pod_count}" != "${PREVIOUS_POD_COUNT}" ]]; then
+    log "POD COUNT CHANGE: ${PREVIOUS_POD_COUNT} -> ${pod_count}"
+  fi
+  PREVIOUS_POD_COUNT="${pod_count}"
+
   if [[ -n "${PREVIOUS_NODE_MAP}" && "${current_node_map}" != "${PREVIOUS_NODE_MAP}" ]]; then
     log "NODE CHANGE detected: was [${PREVIOUS_NODE_MAP}] now [${current_node_map}]"
   fi
@@ -261,6 +445,7 @@ shutdown() {
   kubectl_ns get pods -l "app.kubernetes.io/instance=${CLUSTER_NAME}" -o wide \
     > "${OUTPUT_DIR}/pods_final.txt" 2>/dev/null || true
   kubectl get nodes -o wide > "${OUTPUT_DIR}/nodes_final.txt" 2>/dev/null || true
+  rm -f "${GR_TMP}" "${NODE_TMP}" "${PVC_TMP}" "${GR_COUNTS_TMP}"
   log "final state saved — exiting"
   exit 0
 }
@@ -282,10 +467,11 @@ main() {
 
   capture_baseline
 
-  # Write TSV header
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "timestamp" "pod" "phase" "ready" "gr_role" "gr_state" \
-    "doks_node" "slug" "vcpus" "mem_gib" "restarts" "deleting" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "timestamp" "pod" "phase" "ready" \
+    "gr_role" "gr_state" "gr_detail" "gr_members" "gr_online" \
+    "doks_node" "slug" "vcpus" "mem_gib" \
+    "pvc_req" "pvc_cap" "restarts" "deleting" \
     > "${TSV_FILE}"
 
   log "polling started"

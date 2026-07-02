@@ -29,10 +29,15 @@ class Row:
     ready: str
     gr_role: str
     gr_state: str
+    gr_detail: str
+    gr_members: str
+    gr_online: str
     doks_node: str
     slug: str
     vcpus: str
     mem_gib: str
+    pvc_req: str
+    pvc_cap: str
     restarts: str
     deleting: str
 
@@ -51,10 +56,15 @@ def load_tsv(path: Path) -> list[Row]:
                 ready=rec.get("ready", ""),
                 gr_role=rec.get("gr_role", ""),
                 gr_state=rec.get("gr_state", ""),
+                gr_detail=rec.get("gr_detail", ""),
+                gr_members=rec.get("gr_members", "?"),
+                gr_online=rec.get("gr_online", "?"),
                 doks_node=rec.get("doks_node", ""),
                 slug=rec.get("slug", ""),
                 vcpus=rec.get("vcpus", ""),
                 mem_gib=rec.get("mem_gib", ""),
+                pvc_req=rec.get("pvc_req", "?"),
+                pvc_cap=rec.get("pvc_cap", "?"),
                 restarts=rec.get("restarts", "0"),
                 deleting=rec.get("deleting", ""),
             ))
@@ -108,12 +118,26 @@ def generate_summary(rows: list[Row], log_lines: list[str]) -> str:
         transitions: list[str] = []
         for r in pod_rows:
             state_key = f"{r.gr_role}/{r.gr_state}"
+            if r.gr_detail and r.gr_detail not in ("-", "_"):
+                state_key += f" ({r.gr_detail})"
             if state_key != prev_state:
                 transitions.append(f"[{r.timestamp}] {state_key}")
                 prev_state = state_key
         lines.append(f"  {pod}: {len(transitions)} transition(s)")
         for t in transitions:
             lines.append(f"    {t}")
+
+    # --- GR errors / non-ONLINE states ---
+    error_rows = [r for r in rows if r.gr_state not in ("ONLINE", "Synced", "?", "")]
+    if error_rows:
+        lines.append(f"\n--- Non-ONLINE GR States: {len(error_rows)} occurrence(s) ---")
+        seen: set[str] = set()
+        for r in error_rows:
+            key = f"{r.pod}:{r.gr_state}:{r.gr_detail}"
+            if key not in seen:
+                detail = f" — {r.gr_detail}" if r.gr_detail else ""
+                lines.append(f"  [{r.timestamp}] {r.pod}: {r.gr_state}{detail}")
+                seen.add(key)
 
     # --- Pod phase transitions ---
     lines.append("\n--- Pod Phase Transitions ---")
@@ -160,6 +184,39 @@ def generate_summary(rows: list[Row], log_lines: list[str]) -> str:
             slug_last[r.slug] = r.timestamp
     for slug in sorted(slug_first.keys()):
         lines.append(f"  {slug}: first seen {slug_first[slug]}, last seen {slug_last[slug]}")
+
+    # --- GR group size (horizontal scaling) ---
+    lines.append("\n--- GR Group Size (Horizontal Scaling) ---")
+    prev_members = ""
+    member_changes: list[str] = []
+    for ts in timestamps:
+        cycle = [r for r in rows if r.timestamp == ts]
+        if cycle:
+            members = cycle[0].gr_members
+            online = cycle[0].gr_online
+            key = f"{members}/{online}"
+            if key != prev_members:
+                member_changes.append(f"[{ts}] members={members} online={online}")
+                prev_members = key
+    for m in member_changes:
+        lines.append(f"  {m}")
+    if not member_changes:
+        lines.append("  no changes")
+
+    # --- PVC / Storage (storage scaling) ---
+    lines.append("\n--- PVC Storage (Storage Scaling) ---")
+    for pod in pods:
+        pod_rows = [r for r in rows if r.pod == pod]
+        prev_pvc = ""
+        pvc_changes: list[str] = []
+        for r in pod_rows:
+            pvc_key = f"req={r.pvc_req} cap={r.pvc_cap}"
+            if pvc_key != prev_pvc:
+                pvc_changes.append(f"[{r.timestamp}] {pvc_key}")
+                prev_pvc = pvc_key
+        lines.append(f"  {pod}: {len(pvc_changes)} change(s)")
+        for c in pvc_changes:
+            lines.append(f"    {c}")
 
     # --- Restarts ---
     lines.append("\n--- Restarts ---")
