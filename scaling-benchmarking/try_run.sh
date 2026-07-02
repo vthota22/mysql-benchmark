@@ -57,11 +57,9 @@ export DO_API_TOKEN="${DO_API_TOKEN:-}"
 export DO_API_URL="${DO_API_URL:-}"
 export CLUSTER_ID="${CLUSTER_ID:-}"
 
-# Auto-fetch connection details from doctl if not set; save back to config
-if [[ -z "${MYSQL_HOST:-}" || -z "${MYSQL_PORT:-}" || -z "${MYSQL_USER:-}" || -z "${MYSQL_PASSWORD:-}" ]]; then
-  if [[ -n "${CLUSTER_ID:-}" && -n "${DO_API_TOKEN:-}" ]]; then
-    fetch_cluster_details "${CONFIG}"
-  fi
+# Always fetch live cluster details + connection info from doctl; save back to config
+if [[ -n "${CLUSTER_ID:-}" && -n "${DO_API_TOKEN:-}" ]]; then
+  fetch_cluster_details "${CONFIG}"
 fi
 
 : "${MYSQL_HOST:?Set MYSQL_HOST in benchmark.conf or provide CLUSTER_ID + DO_API_TOKEN}"

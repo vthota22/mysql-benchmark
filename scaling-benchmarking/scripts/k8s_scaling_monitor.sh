@@ -48,6 +48,8 @@ NODE_LOG="${OUTPUT_DIR}/k8s_nodes.jsonl"
 PVC_LOG="${OUTPUT_DIR}/k8s_pvcs.jsonl"
 MONITOR_LOG="${OUTPUT_DIR}/k8s_monitor.log"
 TIMELINE_LOG="${OUTPUT_DIR}/k8s_timeline.jsonl"
+METRICS_LOG="${OUTPUT_DIR}/mysqld_exporter_metrics.jsonl"
+POD_LOGS_DIR="${OUTPUT_DIR}/pod_logs"
 
 : > "${SNAPSHOT_LOG}"
 : > "${EVENT_LOG}"
@@ -56,6 +58,8 @@ TIMELINE_LOG="${OUTPUT_DIR}/k8s_timeline.jsonl"
 : > "${PVC_LOG}"
 : > "${MONITOR_LOG}"
 : > "${TIMELINE_LOG}"
+: > "${METRICS_LOG}"
+mkdir -p "${POD_LOGS_DIR}"
 
 LAST_EVENT_TIMESTAMP=""
 PREVIOUS_PRIMARY=""
@@ -63,6 +67,8 @@ PREVIOUS_POD_STATES=""
 PREVIOUS_CLUSTER_SIZE=""
 PREVIOUS_NODE_COUNT=""
 CACHED_PASSWORD=""
+# PIDs of background log-streaming processes
+LOG_STREAM_PIDS=()
 
 log() {
   local ts
@@ -551,6 +557,150 @@ print(json.dumps(pvcs))
     "${ts}" "${epoch}" "${pvc_summary}" >> "${PVC_LOG}"
 }
 
+# ── mysqld-exporter metrics (scraped via kubectl exec wget) ────────────────
+collect_mysqld_metrics() {
+  local ts epoch
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  epoch="$(date +%s)"
+
+  local pods_list
+  pods_list="$(kubectl_ns get pods \
+    -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=${MYSQL_COMPONENT_LABEL}" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{"\n"}{end}' 2>/dev/null)"
+
+  while IFS=' ' read -r pod_name pod_phase; do
+    [[ -z "${pod_name}" ]] && continue
+    [[ "${pod_phase}" != "Running" ]] && continue
+
+    local raw_metrics
+    raw_metrics="$(kubectl_ns exec "${pod_name}" -c mysqld-exporter -- \
+      wget -qO- http://localhost:9104/metrics 2>/dev/null)" || { continue; }
+
+    local metrics_json
+    metrics_json="$(echo "${raw_metrics}" | python3 -c "
+import sys, json
+metrics = {}
+for line in sys.stdin:
+    line = line.strip()
+    if not line or line.startswith('#'):
+        continue
+    parts = line.split(None, 1)
+    if len(parts) != 2:
+        continue
+    name, val = parts
+    try:
+        val = float(val)
+    except ValueError:
+        continue
+    # Only collect key metrics to keep output manageable
+    keep = (
+        'mysql_global_status_threads_running',
+        'mysql_global_status_threads_connected',
+        'mysql_global_status_queries',
+        'mysql_global_status_questions',
+        'mysql_global_status_com_select',
+        'mysql_global_status_com_insert',
+        'mysql_global_status_com_update',
+        'mysql_global_status_com_delete',
+        'mysql_global_status_com_commit',
+        'mysql_global_status_com_rollback',
+        'mysql_global_status_connections',
+        'mysql_global_status_aborted_connects',
+        'mysql_global_status_aborted_clients',
+        'mysql_global_status_innodb_buffer_pool_bytes_data',
+        'mysql_global_status_innodb_buffer_pool_bytes_dirty',
+        'mysql_global_status_innodb_buffer_pool_read_requests',
+        'mysql_global_status_innodb_buffer_pool_reads',
+        'mysql_global_status_innodb_buffer_pool_wait_free',
+        'mysql_global_status_innodb_buffer_pool_write_requests',
+        'mysql_global_status_innodb_row_lock_waits',
+        'mysql_global_status_innodb_row_lock_time',
+        'mysql_global_status_innodb_rows_read',
+        'mysql_global_status_innodb_rows_inserted',
+        'mysql_global_status_innodb_rows_updated',
+        'mysql_global_status_innodb_rows_deleted',
+        'mysql_global_status_innodb_data_reads',
+        'mysql_global_status_innodb_data_writes',
+        'mysql_global_status_innodb_os_log_written',
+        'mysql_global_status_slow_queries',
+        'mysql_global_status_table_locks_waited',
+        'mysql_global_status_open_tables',
+        'mysql_global_status_max_used_connections',
+        'mysql_global_variables_innodb_buffer_pool_size',
+        'mysql_global_variables_max_connections',
+    )
+    if name in keep:
+        metrics[name] = val
+print(json.dumps(metrics))
+" 2>/dev/null)" || { continue; }
+
+    [[ -z "${metrics_json}" || "${metrics_json}" == "{}" ]] && continue
+
+    printf '{"ts":"%s","epoch":%s,"pod":"%s","metrics":%s}\n' \
+      "${ts}" "${epoch}" "${pod_name}" "${metrics_json}" >> "${METRICS_LOG}"
+
+  done <<< "${pods_list}"
+}
+
+# ── Pod log streaming (background kubectl logs -f) ─────────────────────────
+start_log_streams() {
+  local pods_list
+  pods_list="$(kubectl_ns get pods \
+    -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=${MYSQL_COMPONENT_LABEL}" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+
+  while IFS= read -r pod_name; do
+    [[ -z "${pod_name}" ]] && continue
+
+    # Stream MySQL container logs (errors, warnings, failover messages)
+    local log_file="${POD_LOGS_DIR}/${pod_name}_mysql.log"
+    kubectl_ns logs "${pod_name}" -c "${MYSQL_CONTAINER}" -f --timestamps \
+      > "${log_file}" 2>/dev/null &
+    LOG_STREAM_PIDS+=($!)
+    log "started log stream for ${pod_name}/${MYSQL_CONTAINER} (pid=$!)"
+  done <<< "${pods_list}"
+
+  # Stream operator logs
+  local operator_pod
+  operator_pod="$(kubectl_ns get pods \
+    -l "app.kubernetes.io/name=percona-server-mysql-operator" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || \
+    kubectl_ns get pods \
+    -l "app.kubernetes.io/name=percona-xtradb-cluster-operator" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+
+  if [[ -n "${operator_pod}" ]]; then
+    local op_log_file="${POD_LOGS_DIR}/${operator_pod}.log"
+    kubectl_ns logs "${operator_pod}" -f --timestamps \
+      > "${op_log_file}" 2>/dev/null &
+    LOG_STREAM_PIDS+=($!)
+    log "started log stream for operator ${operator_pod} (pid=$!)"
+  fi
+}
+
+stop_log_streams() {
+  for pid in "${LOG_STREAM_PIDS[@]}"; do
+    kill "${pid}" 2>/dev/null || true
+  done
+  wait 2>/dev/null || true
+  LOG_STREAM_PIDS=()
+}
+
+# Capture recent logs on shutdown (in case streaming missed anything)
+capture_final_logs() {
+  local pods_list
+  pods_list="$(kubectl_ns get pods \
+    -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=${MYSQL_COMPONENT_LABEL}" \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+
+  while IFS= read -r pod_name; do
+    [[ -z "${pod_name}" ]] && continue
+    # Grab the last 500 lines as a safety net
+    kubectl_ns logs "${pod_name}" -c "${MYSQL_CONTAINER}" --tail=500 --timestamps \
+      > "${POD_LOGS_DIR}/${pod_name}_mysql_final.log" 2>/dev/null || true
+  done <<< "${pods_list}"
+}
+
 # ── One-time baseline capture ──────────────────────────────────────────────
 capture_baseline() {
   log "capturing baseline state"
@@ -590,6 +740,9 @@ capture_baseline() {
     done <<< "${pods_list}"
   fi
 
+  # Start background log streams for all MySQL pods + operator
+  start_log_streams
+
   emit_timeline "MONITOR_START" "$(printf '\"baseline captured (cr_type=%s, cluster=%s)\"' "${CR_TYPE}" "${CLUSTER_NAME}")"
   log "baseline capture complete"
 }
@@ -598,6 +751,9 @@ capture_baseline() {
 shutdown() {
   log "monitor shutting down (signal received)"
   emit_timeline "MONITOR_STOP" '"received shutdown signal"'
+
+  stop_log_streams
+  capture_final_logs
 
   kubectl_ns get pods -l "app.kubernetes.io/instance=${CLUSTER_NAME}" -o wide \
     > "${OUTPUT_DIR}/pods_final.txt" 2>/dev/null || true
@@ -636,6 +792,11 @@ main() {
     # Replication queries are heavier; run every other cycle
     if (( cycle % 2 == 0 )); then
       collect_replication_status
+    fi
+
+    # mysqld-exporter metrics every other cycle (offset from replication)
+    if (( cycle % 2 == 1 )); then
+      collect_mysqld_metrics
     fi
 
     # Events and nodes every 3 cycles

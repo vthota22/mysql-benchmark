@@ -195,8 +195,9 @@ _save_fetched_to_conf() {
   log_phase "0_FETCH" "saved fetched values to ${config_file}"
 }
 
-# Auto-fetch cluster details and connection info from doctl when not set.
-# Requires CLUSTER_ID and DO_API_TOKEN to be set.
+# Fetch cluster details and connection info from doctl.
+# Always fetches when CLUSTER_ID + DO_API_TOKEN are set, overwriting stale values
+# so the config always reflects the live cluster state.
 # Pass the config file path as $1 to write fetched values back; omit to skip.
 fetch_cluster_details() {
   local config_file="${1:-}"
@@ -208,79 +209,65 @@ fetch_cluster_details() {
     return 1
   fi
 
-  local needs_cluster=0 needs_conn=0
-  if [[ -z "${INITIAL_SIZE:-}" || -z "${INITIAL_NUM_NODES:-}" || -z "${INITIAL_STORAGE_SIZE_GIB:-}" ]]; then
-    needs_cluster=1
-  fi
-  if [[ -z "${MYSQL_HOST:-}" || -z "${MYSQL_PORT:-}" || -z "${MYSQL_USER:-}" || -z "${MYSQL_PASSWORD:-}" ]]; then
-    needs_conn=1
-  fi
-
-  if [[ "${needs_cluster}" -eq 0 && "${needs_conn}" -eq 0 ]]; then
-    return 0
-  fi
-
-  log_phase "0_FETCH" "auto-fetching cluster details from doctl (cluster=${CLUSTER_ID})"
+  log_phase "0_FETCH" "fetching cluster details from doctl (cluster=${CLUSTER_ID})"
 
   local -a updated_keys=()
 
-  if [[ "${needs_cluster}" -eq 1 ]]; then
-    local cluster_info
-    cluster_info="$(run_doctl databases get "${CLUSTER_ID}" \
-      --format Size,NumNodes,StorageMib --no-header 2>/dev/null)" || {
-      log_phase "0_FETCH" "WARNING: failed to fetch cluster info from doctl"
-      return 1
-    }
-    local fetched_size fetched_nodes fetched_storage_mib
-    read -r fetched_size fetched_nodes fetched_storage_mib <<< "${cluster_info}"
+  # Fetch cluster info: slug, node count, storage
+  local cluster_info
+  cluster_info="$(run_doctl databases get "${CLUSTER_ID}" \
+    --format Size,NumNodes,StorageMib --no-header 2>/dev/null)" || {
+    log_phase "0_FETCH" "WARNING: failed to fetch cluster info from doctl"
+    return 1
+  }
+  local fetched_size fetched_nodes fetched_storage_mib
+  read -r fetched_size fetched_nodes fetched_storage_mib <<< "${cluster_info}"
 
-    if [[ -z "${INITIAL_SIZE:-}" && -n "${fetched_size}" ]]; then
-      INITIAL_SIZE="${fetched_size}"
-      updated_keys+=("INITIAL_SIZE")
-      log_phase "0_FETCH" "INITIAL_SIZE=${INITIAL_SIZE} (from doctl)"
-    fi
-    if [[ -z "${INITIAL_NUM_NODES:-}" && -n "${fetched_nodes}" ]]; then
-      INITIAL_NUM_NODES="${fetched_nodes}"
-      updated_keys+=("INITIAL_NUM_NODES")
-      log_phase "0_FETCH" "INITIAL_NUM_NODES=${INITIAL_NUM_NODES} (from doctl)"
-    fi
-    if [[ -z "${INITIAL_STORAGE_SIZE_GIB:-}" && -n "${fetched_storage_mib}" ]]; then
-      INITIAL_STORAGE_SIZE_GIB=$(( fetched_storage_mib / 1024 ))
-      updated_keys+=("INITIAL_STORAGE_SIZE_GIB")
-      log_phase "0_FETCH" "INITIAL_STORAGE_SIZE_GIB=${INITIAL_STORAGE_SIZE_GIB} (from doctl, ${fetched_storage_mib} MiB)"
-    fi
+  if [[ -n "${fetched_size}" ]]; then
+    INITIAL_SIZE="${fetched_size}"
+    updated_keys+=("INITIAL_SIZE")
+    log_phase "0_FETCH" "INITIAL_SIZE=${INITIAL_SIZE}"
+  fi
+  if [[ -n "${fetched_nodes}" ]]; then
+    INITIAL_NUM_NODES="${fetched_nodes}"
+    updated_keys+=("INITIAL_NUM_NODES")
+    log_phase "0_FETCH" "INITIAL_NUM_NODES=${INITIAL_NUM_NODES}"
+  fi
+  if [[ -n "${fetched_storage_mib}" ]]; then
+    INITIAL_STORAGE_SIZE_GIB=$(( fetched_storage_mib / 1024 ))
+    updated_keys+=("INITIAL_STORAGE_SIZE_GIB")
+    log_phase "0_FETCH" "INITIAL_STORAGE_SIZE_GIB=${INITIAL_STORAGE_SIZE_GIB} (${fetched_storage_mib} MiB)"
   fi
 
-  if [[ "${needs_conn}" -eq 1 ]]; then
-    local conn_info
-    conn_info="$(run_doctl databases connection "${CLUSTER_ID}" \
-      --format Host,Port,User,Password --no-header 2>/dev/null)" || {
-      log_phase "0_FETCH" "WARNING: failed to fetch connection info from doctl"
-      return 1
-    }
-    local fetched_host fetched_port fetched_user fetched_pass
-    read -r fetched_host fetched_port fetched_user fetched_pass <<< "${conn_info}"
+  # Fetch connection info: host, port, user, password
+  local conn_info
+  conn_info="$(run_doctl databases connection "${CLUSTER_ID}" \
+    --format Host,Port,User,Password --no-header 2>/dev/null)" || {
+    log_phase "0_FETCH" "WARNING: failed to fetch connection info from doctl"
+    return 1
+  }
+  local fetched_host fetched_port fetched_user fetched_pass
+  read -r fetched_host fetched_port fetched_user fetched_pass <<< "${conn_info}"
 
-    if [[ -z "${MYSQL_HOST:-}" && -n "${fetched_host}" ]]; then
-      MYSQL_HOST="${fetched_host}"
-      updated_keys+=("MYSQL_HOST")
-      log_phase "0_FETCH" "MYSQL_HOST=${MYSQL_HOST} (from doctl)"
-    fi
-    if [[ -z "${MYSQL_PORT:-}" && -n "${fetched_port}" ]]; then
-      MYSQL_PORT="${fetched_port}"
-      updated_keys+=("MYSQL_PORT")
-      log_phase "0_FETCH" "MYSQL_PORT=${MYSQL_PORT} (from doctl)"
-    fi
-    if [[ -z "${MYSQL_USER:-}" && -n "${fetched_user}" ]]; then
-      MYSQL_USER="${fetched_user}"
-      updated_keys+=("MYSQL_USER")
-      log_phase "0_FETCH" "MYSQL_USER=${MYSQL_USER} (from doctl)"
-    fi
-    if [[ -z "${MYSQL_PASSWORD:-}" && -n "${fetched_pass}" ]]; then
-      MYSQL_PASSWORD="${fetched_pass}"
-      updated_keys+=("MYSQL_PASSWORD")
-      log_phase "0_FETCH" "MYSQL_PASSWORD=****** (from doctl)"
-    fi
+  if [[ -n "${fetched_host}" ]]; then
+    MYSQL_HOST="${fetched_host}"
+    updated_keys+=("MYSQL_HOST")
+    log_phase "0_FETCH" "MYSQL_HOST=${MYSQL_HOST}"
+  fi
+  if [[ -n "${fetched_port}" ]]; then
+    MYSQL_PORT="${fetched_port}"
+    updated_keys+=("MYSQL_PORT")
+    log_phase "0_FETCH" "MYSQL_PORT=${MYSQL_PORT}"
+  fi
+  if [[ -n "${fetched_user}" ]]; then
+    MYSQL_USER="${fetched_user}"
+    updated_keys+=("MYSQL_USER")
+    log_phase "0_FETCH" "MYSQL_USER=${MYSQL_USER}"
+  fi
+  if [[ -n "${fetched_pass}" ]]; then
+    MYSQL_PASSWORD="${fetched_pass}"
+    updated_keys+=("MYSQL_PASSWORD")
+    log_phase "0_FETCH" "MYSQL_PASSWORD=******"
   fi
 
   # Write fetched values back to config file

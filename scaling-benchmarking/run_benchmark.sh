@@ -106,7 +106,9 @@ print_startup_banner() {
     echo "Scaling:  disabled (SKIP_SCALING=1)"
   fi
   if k8s_monitor_enabled; then
-    echo "K8s mon:  ns=${K8S_NAMESPACE} pxc=${PXC_CLUSTER_NAME:-auto} poll=${K8S_MONITOR_POLL_SEC}s"
+    echo "K8s mon:  enabled (kubeconfig=${K8S_KUBECONFIG} ns=${K8S_NAMESPACE} cluster=${PXC_CLUSTER_NAME:-auto} poll=${K8S_MONITOR_POLL_SEC}s)"
+  else
+    echo "K8s mon:  disabled (K8S_KUBECONFIG='${K8S_KUBECONFIG:-}' not set or file not found)"
   fi
   echo ""
 }
@@ -251,8 +253,8 @@ phase2_run_with_scaling() {
     [[ -n "${INITIAL_SIZE:-}" ]] && echo "INITIAL_SIZE=${INITIAL_SIZE}"
     [[ -n "${INITIAL_NUM_NODES:-}" ]] && echo "INITIAL_NUM_NODES=${INITIAL_NUM_NODES}"
     [[ -n "${INITIAL_STORAGE_SIZE_GIB:-}" ]] && echo "INITIAL_STORAGE_SIZE_GIB=${INITIAL_STORAGE_SIZE_GIB}"
-    [[ -n "${SCALE_TYPES:-}" ]] && echo "SCALE_TYPES=${SCALE_TYPES}"
-    [[ -n "${SCALE_DESCRIPTION:-}" ]] && echo "SCALE_DESCRIPTION=${SCALE_DESCRIPTION}"
+    [[ -n "${SCALE_TYPES:-}" ]] && echo "SCALE_TYPES=\"${SCALE_TYPES}\""
+    [[ -n "${SCALE_DESCRIPTION:-}" ]] && echo "SCALE_DESCRIPTION=\"${SCALE_DESCRIPTION}\""
   } >> "${SCALE_TIMING_FILE}"
 
   # Start K8s pod monitor in background (observation only — independent of scaling)
