@@ -30,6 +30,11 @@ failover_defaults() {
   : "${FAILOVER_MONITOR_OP_TIMEOUT:=1}"
   : "${FAILOVER_GR_POD_MONITOR:=1}"
   : "${FAILOVER_K8S_POD_MONITOR:=1}"
+  # Block failover trigger until all GR members are ONLINE and none RECOVERING
+  : "${FAILOVER_GR_READINESS_GATE:=1}"
+  : "${FAILOVER_GR_READINESS_POLL_SEC:=2}"
+  : "${FAILOVER_GR_READINESS_TIMEOUT_SEC:=600}"
+  : "${FAILOVER_GR_READINESS_ABORT_ON_TIMEOUT:=1}"
   : "${FAILOVER_COLLECT_K8S_EVENTS:=1}"
   : "${FAILOVER_RUN_TPCC_CHECK:=0}"
   : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011}"
@@ -1564,6 +1569,139 @@ wait_for_sysbench_start() {
   done
   echo "ERROR: sysbench did not reach running state within ${timeout}s — see ${log_file}" >&2
   return 1
+}
+
+failover_gr_readiness_gate_enabled() {
+  [[ "${FAILOVER_GR_READINESS_GATE:-1}" == "1" ]]
+}
+
+_failover_query_gr_members() {
+  mysql_cli_timed -N -B -e "
+    SELECT MEMBER_HOST, MEMBER_STATE, MEMBER_ROLE
+      FROM performance_schema.replication_group_members
+     ORDER BY MEMBER_HOST;"
+}
+
+# Evaluate GR topology for pre-failover gate.
+# Sets GR_READY_SUMMARY. Returns 0=ready, 1=not ready, 2=query empty/failed.
+_failover_eval_gr_cluster_readiness() {
+  local tsv="${1:?tsv required}"
+  local host state role
+  local total=0 online=0 recovering=0 primary=0
+  local -a bad=()
+
+  GR_READY_SUMMARY=""
+  while IFS=$'\t' read -r host state role || [[ -n "${host}" ]]; do
+    [[ -z "${host}" ]] && continue
+    total=$((total + 1))
+    state="${state^^}"
+    role="${role^^}"
+    if [[ "${state}" == "ONLINE" ]]; then
+      online=$((online + 1))
+    fi
+    if [[ "${state}" == "RECOVERING" ]]; then
+      recovering=$((recovering + 1))
+    fi
+    if [[ "${role}" == "PRIMARY" ]]; then
+      primary=$((primary + 1))
+    fi
+    if [[ "${state}" != "ONLINE" ]]; then
+      bad+=("${host}:${state}/${role}")
+    fi
+  done <<< "${tsv}"
+
+  if (( total == 0 )); then
+    GR_READY_SUMMARY="no GR members returned"
+    return 2
+  fi
+  if (( recovering > 0 )); then
+    GR_READY_SUMMARY="${recovering} member(s) RECOVERING"
+    return 1
+  fi
+  if (( online != total )); then
+    GR_READY_SUMMARY="only ${online}/${total} ONLINE (${bad[*]})"
+    return 1
+  fi
+  if (( primary != 1 )); then
+    GR_READY_SUMMARY="expected 1 PRIMARY, found ${primary}"
+    return 1
+  fi
+  GR_READY_SUMMARY="all ${total} members ONLINE, 1 PRIMARY"
+  return 0
+}
+
+# Wait until GR is stable before firing failover (back-to-back iteration safety).
+wait_for_gr_readiness_before_failover() {
+  local results_dir="${1:?results dir required}"
+  local log_file="${results_dir}/failover_gr_readiness.log"
+  local poll_sec="${FAILOVER_GR_READINESS_POLL_SEC:-2}"
+  local timeout_sec="${FAILOVER_GR_READINESS_TIMEOUT_SEC:-600}"
+  local abort="${FAILOVER_GR_READINESS_ABORT_ON_TIMEOUT:-1}"
+  local waited=0 poll_num=0 tsv rc
+
+  if ! failover_gr_readiness_gate_enabled; then
+    return 0
+  fi
+
+  echo "=== GR readiness gate (all ONLINE, none RECOVERING) ===" | tee "${log_file}"
+  echo "Poll interval=${poll_sec}s timeout=${timeout_sec}s" | tee -a "${log_file}"
+
+  while (( waited <= timeout_sec )); do
+    poll_num=$((poll_num + 1))
+    tsv="$(_failover_query_gr_members 2>/dev/null || true)"
+    rc=2
+    if [[ -n "${tsv}" ]]; then
+      _failover_eval_gr_cluster_readiness "${tsv}"
+      rc=$?
+    else
+      GR_READY_SUMMARY="mysql GR query failed"
+    fi
+
+    {
+      local ready_flag=0
+      (( rc == 0 )) && ready_flag=1
+      echo "poll=${poll_num} waited=${waited}s utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) ready=${ready_flag} summary=${GR_READY_SUMMARY}"
+      if [[ -n "${tsv}" ]]; then
+        while IFS=$'\t' read -r host state role; do
+          [[ -z "${host}" ]] && continue
+          echo "  ${host}  ${state}  ${role}"
+        done <<< "${tsv}"
+      fi
+    } | tee -a "${log_file}"
+
+    if (( rc == 0 )); then
+      echo "GR readiness gate PASSED after ${waited}s: ${GR_READY_SUMMARY}" | tee -a "${log_file}"
+      {
+        echo "FAILOVER_GR_READINESS_GATE=passed"
+        echo "FAILOVER_GR_READINESS_WAIT_SEC=${waited}"
+        echo "FAILOVER_GR_READINESS_SUMMARY=${GR_READY_SUMMARY}"
+        echo "FAILOVER_GR_READINESS_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      } >> "${results_dir}/failover_event.txt"
+      return 0
+    fi
+
+    if (( waited >= timeout_sec )); then
+      break
+    fi
+    echo "GR not ready (${GR_READY_SUMMARY}); retry in ${poll_sec}s..." | tee -a "${log_file}"
+    sleep "${poll_sec}"
+    waited=$((waited + poll_sec))
+  done
+
+  echo "ERROR: GR readiness gate TIMEOUT after ${timeout_sec}s: ${GR_READY_SUMMARY}" | tee -a "${log_file}"
+  {
+    echo "FAILOVER_GR_READINESS_GATE=timeout"
+    echo "FAILOVER_GR_READINESS_WAIT_SEC=${timeout_sec}"
+    echo "FAILOVER_GR_READINESS_SUMMARY=${GR_READY_SUMMARY}"
+    echo "FAILOVER_GR_READINESS_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >> "${results_dir}/failover_event.txt"
+
+  if [[ "${abort}" == "1" ]]; then
+    return 1
+  fi
+  echo "WARNING: proceeding despite GR not ready (FAILOVER_GR_READINESS_ABORT_ON_TIMEOUT=0)" \
+    | tee -a "${log_file}"
+  return 0
 }
 
 sleep_until_failover_trigger() {

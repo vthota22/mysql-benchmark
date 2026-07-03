@@ -735,6 +735,25 @@ def load_k8s_pods_monitor(scenario_dir: Path) -> list[dict[str, str | float]]:
 POD_CHART_COLORS = ("#60a5fa", "#34d399", "#fbbf24", "#c084fc", "#f87171", "#2dd4bf")
 
 
+GR_STATE_LEVELS = (
+    "unreachable",
+    "ERROR",
+    "OFFLINE",
+    "RECOVERING",
+    "ONLINE",
+    "PRIMARY",
+)
+K8S_STATE_LEVELS = (
+    "Not found",
+    "Failed / Unknown",
+    "Terminating",
+    "Pending",
+    "Running (partial ready)",
+    "Running (ready)",
+)
+STATE_LANE_HEIGHT = 6
+
+
 def _gr_state_level(role: str, state: str, connect_ok: str) -> float:
     if connect_ok != "1":
         return 0.0
@@ -753,6 +772,18 @@ def _gr_state_level(role: str, state: str, connect_ok: str) -> float:
     return 2.0
 
 
+def _gr_state_label(role: str, state: str, connect_ok: str) -> str:
+    if connect_ok != "1":
+        return "unreachable"
+    role_u = role.strip().upper()
+    state_u = state.strip().upper()
+    if not role_u or role_u == "N/A":
+        return state_u or "unknown"
+    if not state_u or state_u == "N/A":
+        return role_u
+    return f"{role_u} / {state_u}"
+
+
 def _k8s_readiness_level(phase: str, ready_num: str, ready_den: str, deleting: str) -> float:
     phase_u = phase.strip()
     if phase_u in ("NotFound", ""):
@@ -760,21 +791,41 @@ def _k8s_readiness_level(phase: str, ready_num: str, ready_den: str, deleting: s
     if phase_u in ("Failed", "Unknown"):
         return 1.0
     if deleting == "1" or phase_u == "Terminating":
-        return 1.5
-    if phase_u == "Pending":
         return 2.0
+    if phase_u == "Pending":
+        return 3.0
     if phase_u == "Running":
         try:
             num = int(ready_num)
             den = int(ready_den)
         except ValueError:
-            return 3.0
+            return 4.0
         if den > 0 and num == den:
             return 5.0
-        if den > 0:
-            return 3.0 + (num / den) * 1.99
-        return 3.0
-    return 2.0
+        return 4.0
+    return 3.0
+
+
+def _k8s_state_label(phase: str, ready_num: str, ready_den: str, deleting: str) -> str:
+    phase_u = phase.strip()
+    if phase_u in ("NotFound", ""):
+        return "Not found"
+    if phase_u in ("Failed", "Unknown"):
+        return phase_u
+    if deleting == "1" or phase_u == "Terminating":
+        return "Terminating"
+    if phase_u == "Pending":
+        return "Pending"
+    if phase_u == "Running":
+        try:
+            num = int(ready_num)
+            den = int(ready_den)
+            if den > 0:
+                return f"Running ({num}/{den} ready)"
+        except ValueError:
+            pass
+        return "Running"
+    return phase_u or "Unknown"
 
 
 def _rows_at_trigger(
@@ -790,35 +841,6 @@ def _rows_at_trigger(
     return out
 
 
-def _detect_gr_transitions(
-    rows: list[dict[str, str | float]], trigger: float
-) -> list[dict[str, str | float | str]]:
-    by_pod: dict[str, list[dict[str, str | float]]] = {}
-    for row in rows:
-        if float(row["sysbench_sec"]) < trigger - 1:
-            continue
-        by_pod.setdefault(str(row["pod"]), []).append(row)
-    transitions: list[dict[str, str | float | str]] = []
-    for pod in sorted(by_pod):
-        prev: dict[str, str | float] | None = None
-        for row in sorted(by_pod[pod], key=lambda r: float(r["sysbench_sec"])):
-            state_key = f"{row['gr_role']}/{row['gr_state']}"
-            if prev is not None:
-                prev_key = f"{prev['gr_role']}/{prev['gr_state']}"
-                if state_key != prev_key:
-                    transitions.append(
-                        {
-                            "pod": pod,
-                            "sysbench_sec": float(row["sysbench_sec"]),
-                            "from_trigger": float(row["sysbench_sec"]) - trigger,
-                            "from_state": prev_key,
-                            "to_state": state_key,
-                        }
-                    )
-            prev = row
-    return transitions
-
-
 def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict:
     gr_rows = load_gr_pod_monitor(scenario_dir)
     k8s_rows = load_k8s_pods_monitor(scenario_dir)
@@ -828,8 +850,6 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
     event = load_metadata(scenario_dir / "failover_event.txt")
     target_pod = event.get("FAILOVER_TARGET_POD", "")
 
-    cert_datasets: list[dict] = []
-    applier_datasets: list[dict] = []
     gr_state_datasets: list[dict] = []
     k8s_state_datasets: list[dict] = []
 
@@ -840,33 +860,24 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
             (r for r in gr_rows if str(r["pod"]) == pod),
             key=lambda r: float(r["sysbench_sec"]),
         )
-        cert_points = []
-        applier_points = []
         state_points = []
+        prev_label: str | None = None
         for row in pod_rows:
             sec = float(row["sysbench_sec"])
-            try:
-                cert = float(row["cert_queue"])
-            except ValueError:
-                cert = None
-            try:
-                applier = float(row["applier_queue"])
-            except ValueError:
-                applier = None
-            if cert is not None and cert >= 0:
-                cert_points.append({"x": sec, "y": cert})
-            if applier is not None and applier >= 0:
-                applier_points.append({"x": sec, "y": applier})
-            level = _gr_state_level(
-                str(row["gr_role"]), str(row["gr_state"]), str(row["connect_ok"])
-            )
-            state_points.append({"x": sec, "y": idx * 6 + level})
-        cert_datasets.append(
-            {"label": pod, "data": cert_points, "borderColor": color, "backgroundColor": color}
-        )
-        applier_datasets.append(
-            {"label": pod, "data": applier_points, "borderColor": color, "backgroundColor": color}
-        )
+            role = str(row["gr_role"])
+            gr_state = str(row["gr_state"])
+            connect_ok = str(row["connect_ok"])
+            level = _gr_state_level(role, gr_state, connect_ok)
+            label = _gr_state_label(role, gr_state, connect_ok)
+            pt: dict = {
+                "x": sec,
+                "y": idx * STATE_LANE_HEIGHT + level,
+                "label": label,
+            }
+            if label != prev_label:
+                pt["transition"] = True
+            state_points.append(pt)
+            prev_label = label
         gr_state_datasets.append(
             {
                 "label": pod,
@@ -885,15 +896,24 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
             key=lambda r: float(r["sysbench_sec"]),
         )
         state_points = []
+        prev_label: str | None = None
         for row in pod_rows:
             sec = float(row["sysbench_sec"])
-            level = _k8s_readiness_level(
-                str(row["phase"]),
-                str(row["ready_num"]),
-                str(row["ready_den"]),
-                str(row["deleting"]),
-            )
-            state_points.append({"x": sec, "y": idx * 6 + level})
+            phase = str(row["phase"])
+            ready_num = str(row["ready_num"])
+            ready_den = str(row["ready_den"])
+            deleting = str(row["deleting"])
+            level = _k8s_readiness_level(phase, ready_num, ready_den, deleting)
+            label = _k8s_state_label(phase, ready_num, ready_den, deleting)
+            pt: dict = {
+                "x": sec,
+                "y": idx * STATE_LANE_HEIGHT + level,
+                "label": label,
+            }
+            if label != prev_label:
+                pt["transition"] = True
+            state_points.append(pt)
+            prev_label = label
         k8s_state_datasets.append(
             {
                 "label": pod,
@@ -904,36 +924,7 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
             }
         )
 
-    gr_at_trigger = _rows_at_trigger(gr_rows, trigger)
     k8s_at_trigger = _rows_at_trigger(k8s_rows, trigger)
-    queue_at_trigger = []
-    for pod in gr_pods:
-        row = gr_at_trigger.get(pod)
-        if not row:
-            continue
-        queue_at_trigger.append(
-            {
-                "pod": pod,
-                "role": str(row.get("gr_role", "")),
-                "cert_queue": str(row.get("cert_queue", "")),
-                "applier_queue": str(row.get("applier_queue", "")),
-            }
-        )
-
-    gr_state_table = []
-    for pod in gr_pods:
-        row = gr_at_trigger.get(pod)
-        if not row:
-            continue
-        gr_state_table.append(
-            {
-                "pod": pod,
-                "hostname": str(row.get("hostname", "")),
-                "role": str(row.get("gr_role", "")),
-                "state": str(row.get("gr_state", "")),
-            }
-        )
-
     k8s_state_table = []
     for pod in k8s_pods:
         row = k8s_at_trigger.get(pod)
@@ -954,93 +945,15 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
         "has_k8s": bool(k8s_rows),
         "trigger_sec": trigger,
         "target_pod": target_pod,
-        "cert_datasets": cert_datasets,
-        "applier_datasets": applier_datasets,
         "gr_state_datasets": gr_state_datasets,
         "gr_state_lanes": gr_pods,
+        "gr_state_levels": list(GR_STATE_LEVELS),
         "k8s_state_datasets": k8s_state_datasets,
         "k8s_state_lanes": k8s_pods,
-        "queue_at_trigger": queue_at_trigger,
-        "gr_state_table": gr_state_table,
+        "k8s_state_levels": list(K8S_STATE_LEVELS),
+        "state_lane_height": STATE_LANE_HEIGHT,
         "k8s_state_table": k8s_state_table,
-        "gr_transitions": _detect_gr_transitions(gr_rows, trigger),
     }
-
-
-def _cluster_queue_table_html(data: dict) -> str:
-    rows = data.get("queue_at_trigger") or []
-    if not rows:
-        return ""
-    body = []
-    for row in rows:
-        cert = row.get("cert_queue", "")
-        applier = row.get("applier_queue", "")
-        try:
-            cert_ok = float(cert) <= 0
-        except ValueError:
-            cert_ok = False
-        try:
-            applier_ok = float(applier) <= 0
-        except ValueError:
-            applier_ok = False
-        ok = cert_ok and applier_ok
-        body.append(
-            f"<tr><td>{html.escape(str(row.get('pod', '')))}</td>"
-            f"<td>{html.escape(str(row.get('role', '')))}</td>"
-            f"<td>{html.escape(str(cert))}</td>"
-            f"<td>{html.escape(str(applier))}</td>"
-            f"<td>{'✓' if ok else '✗'}</td></tr>"
-        )
-    return (
-        '<table class="cluster-table"><thead><tr>'
-        "<th>Pod</th><th>GR role</th><th>Cert queue</th><th>Applier queue</th><th>≈0?</th>"
-        "</tr></thead><tbody>"
-        + "".join(body)
-        + "</tbody></table>"
-    )
-
-
-def _cluster_gr_state_table_html(data: dict) -> str:
-    rows = data.get("gr_state_table") or []
-    if not rows:
-        return ""
-    body = []
-    for row in rows:
-        body.append(
-            f"<tr><td>{html.escape(str(row.get('pod', '')))}</td>"
-            f"<td>{html.escape(str(row.get('hostname', '')))}</td>"
-            f"<td>{html.escape(str(row.get('role', '')))}</td>"
-            f"<td>{html.escape(str(row.get('state', '')))}</td></tr>"
-        )
-    return (
-        '<table class="cluster-table"><thead><tr>'
-        "<th>Pod</th><th>Hostname</th><th>GR role</th><th>GR state</th>"
-        "</tr></thead><tbody>"
-        + "".join(body)
-        + "</tbody></table>"
-    )
-
-
-def _cluster_gr_transitions_table_html(data: dict) -> str:
-    rows = data.get("gr_transitions") or []
-    if not rows:
-        return '<p class="muted">No GR role/state transitions detected after trigger.</p>'
-    body = []
-    for row in rows[:20]:
-        rel = float(row["from_trigger"])
-        body.append(
-            f"<tr><td>{html.escape(f'{rel:+.1f}s')}</td>"
-            f"<td>{html.escape(str(row.get('pod', '')))}</td>"
-            f"<td>{html.escape(str(row.get('from_state', '')))}</td>"
-            f"<td>{html.escape(str(row.get('to_state', '')))}</td></tr>"
-        )
-    return (
-        '<table class="cluster-table"><thead><tr>'
-        "<th>From trigger</th><th>Pod</th><th>From</th><th>To</th>"
-        "</tr></thead><tbody>"
-        + "".join(body)
-        + "</tbody></table>"
-    )
 
 
 def _cluster_k8s_state_table_html(data: dict) -> str:
@@ -1091,22 +1004,12 @@ def _cluster_monitors_html(scenario_dir: Path, trigger: float, *, panel_id: str 
     if data.get("has_gr"):
         sections.extend(
             [
-                "<h3>GR certification &amp; applier queues</h3>",
-                '<div class="chart-wrap chart-wrap-sm">'
-                f'<canvas id="grCertQueueChart{suffix}"></canvas></div>',
-                '<div class="chart-wrap chart-wrap-sm">'
-                f'<canvas id="grApplierQueueChart{suffix}"></canvas></div>',
-                '<p class="monitor-subhead">Queue depth at failover trigger</p>',
-                _cluster_queue_table_html(data),
                 "<h3>GR member state timeline</h3>",
-                '<p class="monitor-subhead">Stepped timeline per pod '
-                "(unreachable → ERROR → OFFLINE → RECOVERING → ONLINE → PRIMARY).</p>",
+                '<p class="monitor-subhead">One lane per pod. Hover any point for '
+                "<code>ROLE / STATE</code> (e.g. <code>SECONDARY / ONLINE</code>, "
+                "<code>PRIMARY / ONLINE</code>). Y-axis shows pod name and state bands.</p>",
                 '<div class="chart-wrap">'
                 f'<canvas id="grStateChart{suffix}"></canvas></div>',
-                '<p class="monitor-subhead">GR state at trigger</p>',
-                _cluster_gr_state_table_html(data),
-                "<h3>GR transitions after trigger</h3>",
-                _cluster_gr_transitions_table_html(data),
             ]
         )
 
@@ -1114,8 +1017,9 @@ def _cluster_monitors_html(scenario_dir: Path, trigger: float, *, panel_id: str 
         sections.extend(
             [
                 "<h3>K8s pod readiness timeline</h3>",
-                '<p class="monitor-subhead">Stepped timeline per mysql pod '
-                "(not found → terminating → pending → partial ready → N/N running).</p>",
+                '<p class="monitor-subhead">One lane per pod. Hover any point for phase and '
+                "ready count (e.g. <code>Running (6/6 ready)</code>, "
+                "<code>Terminating</code>). Y-axis shows pod name and state bands.</p>",
                 '<div class="chart-wrap">'
                 f'<canvas id="k8sPodChart{suffix}"></canvas></div>',
                 '<p class="monitor-subhead">Pod status at trigger</p>',
@@ -1154,14 +1058,40 @@ CLUSTER_CHARTS_JS = """
       };
     }
 
-    function laneYTicks(lanes) {
+    function stateTimelineYTicks(lanes, levelNames, laneHeight) {
+      laneHeight = laneHeight || 6;
       return {
-        ticks: {
-          callback: function(value) {
-            const lane = Math.floor(value / 6);
-            const level = value - lane * 6;
-            if (Math.abs(level - 2.5) > 0.6) return "";
+        autoSkip: false,
+        callback: function(value) {
+          if (!Number.isFinite(value)) return "";
+          const lane = Math.floor(value / laneHeight);
+          const frac = value - lane * laneHeight;
+          const level = Math.round(frac);
+          if (Math.abs(frac - 2.5) < 0.35) {
             return lanes[lane] || "";
+          }
+          if (Math.abs(frac - level) < 0.05 && level >= 0 && level < levelNames.length) {
+            return lane === 0 ? levelNames[level] : "";
+          }
+          return "";
+        }
+      };
+    }
+
+    function stateTimelineTooltip() {
+      return {
+        mode: "nearest",
+        intersect: false,
+        callbacks: {
+          title: function(items) {
+            if (!items || !items.length) return "";
+            return "t = " + Number(items[0].parsed.x).toFixed(1) + " s";
+          },
+          label: function(ctx) {
+            const pod = ctx.dataset.label || "";
+            const pt = ctx.raw || {};
+            const state = pt.label || "";
+            return pod + (state ? ": " + state : "");
           }
         }
       };
@@ -1172,16 +1102,17 @@ CLUSTER_CHARTS_JS = """
       suffix = suffix || "";
       chartStore = chartStore || null;
       const triggerSec = clusterData.trigger_sec;
+      const laneHeight = clusterData.state_lane_height || 6;
 
-      function lineOpts(yTitle, lanes) {
+      function lineOpts(yTitle, lanes, levelNames) {
         const scales = {
           x: { type: "linear", title: { display: true, text: "Elapsed time (s from sysbench start)" } },
           y: { title: { display: true, text: yTitle }, beginAtZero: true }
         };
         if (lanes && lanes.length) {
           scales.y.min = -0.5;
-          scales.y.max = lanes.length * 6 - 0.5;
-          scales.y.ticks = laneYTicks(lanes).ticks;
+          scales.y.max = lanes.length * laneHeight - 0.5;
+          scales.y.ticks = stateTimelineYTicks(lanes, levelNames || [], laneHeight);
         }
         return {
           responsive: true, maintainAspectRatio: false, interaction: { mode: "nearest", intersect: false },
@@ -1190,31 +1121,57 @@ CLUSTER_CHARTS_JS = """
         };
       }
 
-      function makeLineChart(id, datasets, yTitle, lanes) {
+      function makeLineChart(id, datasets, yTitle, lanes, levelNames, stateTimeline) {
         const el = document.getElementById(id);
         if (!el || !datasets || !datasets.length) return;
         datasets.forEach(ds => {
-          ds.pointRadius = 0;
+          if (stateTimeline) {
+            ds.pointRadius = function(ctx) {
+              const pt = ctx.raw || {};
+              return pt.transition ? 4 : 0;
+            };
+            ds.pointHoverRadius = 6;
+            ds.pointBackgroundColor = ds.borderColor;
+          } else {
+            ds.pointRadius = 0;
+            ds.pointHoverRadius = 4;
+          }
           ds.borderWidth = ds.borderWidth || 1.5;
           ds.stepped = "before";
           ds.fill = false;
           ds.tension = 0;
         });
+        const opts = lineOpts(yTitle, lanes, levelNames);
+        if (stateTimeline) {
+          opts.plugins.tooltip = stateTimelineTooltip();
+        }
         const chart = new Chart(el, {
           type: "line",
           data: { datasets },
-          options: lineOpts(yTitle, lanes)
+          options: opts
         });
         if (chartStore) chartStore[id] = chart;
       }
 
       if (clusterData.has_gr) {
-        makeLineChart("grCertQueueChart" + suffix, clusterData.cert_datasets, "Cert queue depth");
-        makeLineChart("grApplierQueueChart" + suffix, clusterData.applier_datasets, "Applier queue depth");
-        makeLineChart("grStateChart" + suffix, clusterData.gr_state_datasets, "GR state (lane per pod)", clusterData.gr_state_lanes);
+        makeLineChart(
+          "grStateChart" + suffix,
+          clusterData.gr_state_datasets,
+          "GR role/state (one lane per pod)",
+          clusterData.gr_state_lanes,
+          clusterData.gr_state_levels,
+          true
+        );
       }
       if (clusterData.has_k8s) {
-        makeLineChart("k8sPodChart" + suffix, clusterData.k8s_state_datasets, "Readiness (lane per pod)", clusterData.k8s_state_lanes);
+        makeLineChart(
+          "k8sPodChart" + suffix,
+          clusterData.k8s_state_datasets,
+          "Pod phase/readiness (one lane per pod)",
+          clusterData.k8s_state_lanes,
+          clusterData.k8s_state_levels,
+          true
+        );
       }
     }
 """
