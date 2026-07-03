@@ -511,20 +511,23 @@ _failover_poll_gr_pod_once() {
   local ns="${2:?namespace required}"
   local pod="${3:?pod required}"
   local -a kubectl
+  local exec_timeout="${FAILOVER_MONITOR_OP_TIMEOUT:-2}"
+  (( exec_timeout < 5 )) && exec_timeout=5
   mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
-  _failover_run_timeout 2 "${kubectl[@]}" exec -n "${ns}" "${pod}" -c mysql -- \
-    mysql -N -B -e "
+  # Percona operator mounts monitor credentials at /etc/mysql/mysql-users-secret/monitor
+  _failover_run_timeout "${exec_timeout}" "${kubectl[@]}" exec -n "${ns}" "${pod}" -c mysql -- \
+    sh -c 'mysql -umonitor -p"$(tr -d "\n" </etc/mysql/mysql-users-secret/monitor)" -N -B -e "
 SELECT @@hostname,
        IFNULL((SELECT MEMBER_ROLE FROM performance_schema.replication_group_members
-               WHERE MEMBER_ID = @@server_uuid LIMIT 1), 'N/A'),
+               WHERE MEMBER_ID = @@server_uuid LIMIT 1), '\''N/A'\''),
        IFNULL((SELECT MEMBER_STATE FROM performance_schema.replication_group_members
-               WHERE MEMBER_ID = @@server_uuid LIMIT 1), 'N/A'),
+               WHERE MEMBER_ID = @@server_uuid LIMIT 1), '\''N/A'\''),
        IFNULL((SELECT COUNT_TRANSACTIONS_IN_QUEUE
                  FROM performance_schema.replication_group_member_stats
                 WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1),
        IFNULL((SELECT COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE
                  FROM performance_schema.replication_group_member_stats
-                WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1);" 2>/dev/null || true
+                WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1);"' 2>/dev/null || true
 }
 
 _failover_poll_k8s_mysql_pods_once() {
@@ -553,11 +556,11 @@ except (subprocess.CalledProcessError, FileNotFoundError):
     sys.exit(0)
 
 doc = json.loads(raw)
-mysql_re = re.compile(r"^mysql-[0-9]+$")
+mysql_re = re.compile(r"mysql-\d+$")
 for item in sorted(doc.get("items") or [], key=lambda x: x.get("metadata", {}).get("name", "")):
     meta = item.get("metadata") or {}
     name = meta.get("name", "")
-    if not mysql_re.match(name):
+    if not mysql_re.search(name):
         continue
     status = item.get("status") or {}
     phase = status.get("phase") or "Unknown"

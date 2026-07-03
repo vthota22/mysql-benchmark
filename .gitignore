@@ -1,2 +1,6 @@
 results
-reports 
+reports
+control.local.conf
+benchmark.conf
+control/.report_cache
+sysbench-1.1/bin/sysbench

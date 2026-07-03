@@ -72,10 +72,14 @@ FAILOVER_EDITIONS="standard advanced"
 # FAILOVER_TRIGGER_SECOND=         # optional override; default warmup + baseline (= 300 with defaults above)
 # Per scenario wall clock: warmup + baseline + observe (600s with defaults above)
 # FAILOVER_REPORT_INTERVAL=1       # 1-second granularity (required for RTO + graphs)
-# FAILOVER_MONITOR_INTERVAL=1      # primary/topology poll interval (seconds)
-# FAILOVER_MONITOR_WRITE_PROBE=1   # separate write INSERT each poll (HAProxy write routing)
+# FAILOVER_MONITOR_INTERVAL=1      # primary/topology poll interval (seconds, fixed wall-clock grid)
+# FAILOVER_MONITOR_CONNECT_TIMEOUT=1  # mysql --connect-timeout per monitor poll
+# FAILOVER_MONITOR_OP_TIMEOUT=1    # max seconds per mysql session (timeout(1); one session = write + topology)
+# FAILOVER_MONITOR_WRITE_PROBE=1   # INSERT write probe in same mysql session as topology SELECT
 # FAILOVER_GENERATE_GRAPHS=1       # PNG + interactive HTML (HTML needs no extra deps; PNG needs matplotlib)
 # FAILOVER_MONITOR_PRIMARY=1       # poll @@hostname, read_only, GR state/role, write probe
+# FAILOVER_GR_POD_MONITOR=1        # Advanced: poll GR role/state/queues on each mysql pod via kubectl exec
+# FAILOVER_K8S_POD_MONITOR=1       # Advanced: poll mysql-* pod phase/readiness via kubectl
 # FAILOVER_COLLECT_K8S_EVENTS=1    # kubectl event snapshots (Advanced only)
 # FAILOVER_RUN_TPCC_CHECK=0        # 1 = TPC-C check after failover (sets data_loss in failover_kpi.csv)
 #
@@ -84,6 +88,8 @@ FAILOVER_EDITIONS="standard advanced"
 # FAILOVER_SCENARIO_DELAY_SEC=120         # pause between scenarios (cooldown / cluster settle)
 # FAILOVER_THREAD_MATRIX="4 8 16 32"      # run failover at each thread count (results under edition/t<N>/)
 # FAILOVER_THREAD_DELAY_SEC=120             # pause between thread counts in a matrix run
+# FAILOVER_ITERATIONS=1                     # repeat full scenario loop N times (results under edition/iter<N>/)
+# FAILOVER_ITERATION_DELAY_SEC=120          # pause between back-to-back failover iterations
 # TPC-C trx_profile is passed to tpcc.lua: mixed = standard TPC-C mix; write_only = 50/50 new_order/payment
 #
 # Output: results/failover_*/advanced/t<N>/<scenario>/...  (when FAILOVER_THREAD_MATRIX is set)
@@ -91,8 +97,9 @@ FAILOVER_EDITIONS="standard advanced"
 #   mixed/      — standard TPC-C transaction mix (reads + writes)
 #   write_only/ — 100% new_order/payment; writes_failed_during_failover KPI populated
 # Combined rollup: results/failover_*/failover_kpi.csv and failover_comparison.txt
-#   failure_detection_sec   — trigger → first monitor write_ok=0 (seconds from trigger)
-#   primary_election_sec    — trigger → promotion (GR PRIMARY + hostname change + write_ok=1)
+#   failure_detection_sec   — trigger → first monitor connect failure (connect_ok=0)
+#   primary_election_sec    — first connect failure → promotion (GR PRIMARY + write_ok=1)
+#   total_failover_sec      — trigger → promotion (total downtime until writes OK)
 #   app_recovery_sec        — trigger → RTO (TPS ≥ 90% baseline for 30s stable)
 #   transactions_failed_during_failover — excess err/s + reconn/s over pre-trigger baseline (TTD → RTO)
 #   writes_failed_during_failover — monitor polls with connect_ok=1 and write_ok=0 (trigger → max(RTO, promote))
@@ -104,7 +111,7 @@ FAILOVER_EDITIONS="standard advanced"
 #
 # Trigger control (same timeline either way):
 # FAILOVER_TRIGGER_ENABLED=1       # 0 = skip all failover actions
-# FAILOVER_POD_DELETE=1            # Advanced: 0 = no kubectl pod delete (control run)
+# FAILOVER_POD_DELETE=1            # Advanced pod_delete method: 0 = no kubectl pod delete (control run)
 
 # RTO analysis thresholds
 # FAILOVER_RECOVERY_THRESHOLD=0.90   # 90% of baseline TPS = recovered
@@ -143,11 +150,21 @@ STANDARD_CLUSTER_UUID=
 # STANDARD_CLUSTER_STORAGE_MIB=204800
 # STANDARD_CLUSTER_NUM_NODES=3   # see NUM_NODES / STANDARD_CLUSTER_NUM_NODES at top of file
 
-# --- Advanced Edition failover trigger (kubectl delete primary pod) ---
-# Ungraceful kill (default): grace-period=0 --force
+# --- Advanced Edition failover trigger ---
+# Method: pod_delete | mysqld_kill
+#   pod_delete   — kubectl delete primary pod (default)
+#   mysqld_kill  — kubectl exec kill mysqld inside primary pod (process crash)
+FAILOVER_ADVANCED_TRIGGER_METHOD=pod_delete
+# Harness prepares kubeconfig + primary pod during baseline, re-resolves pod
+# FAILOVER_TRIGGER_PREPARE_SEC seconds before trigger, then fires at trigger second.
+# FAILOVER_TRIGGER_PREPARE_SEC=5
+# pod_delete: ungraceful kill (default): grace-period=0 --force
 FAILOVER_POD_DELETE_FORCE=1
 FAILOVER_POD_DELETE_GRACE_SEC=0
-# Graceful delete instead: FAILOVER_POD_DELETE_FORCE=0 FAILOVER_POD_DELETE_GRACE_SEC=30
+# pod_delete graceful delete instead: FAILOVER_POD_DELETE_FORCE=0 FAILOVER_POD_DELETE_GRACE_SEC=30
+# mysqld_kill: SIGKILL mysqld in mysql container (default signal 9)
+# FAILOVER_MYSQLD_KILL_SIGNAL=9
+# ADVANCED_K8S_MYSQL_CONTAINER=mysql
 ADVANCED_CLUSTER_UUID=
 
 # Kubeconfig: use one of these (fill in when API details are available)
@@ -157,6 +174,25 @@ ADVANCED_CLUSTER_UUID=
 # ADVANCED_KUBECONFIG_FETCH_CMD='curl -sS -H "Authorization: Bearer $TOKEN" "https://..." > "$RESULTS_DIR/kubeconfig"'
 
 ADVANCED_K8S_NAMESPACE=
+# PerconaServerMySQL CR name (for HAProxy health-check patch)
+# ADVANCED_PSMYSQL_CR_NAME=benchmark-failover2
+
+# HAProxy backend health check (Advanced): maps to HA_SERVER_OPTIONS check inter N ms
+# Defaults match Percona Server MySQL operator (haproxy_add_mysql_nodes.sh): inter 10000ms, rise 1, fall 2
+# HAPROXY_HEALTH_CHECK_INTERVAL_SEC=10
+# HAPROXY_HEALTH_CHECK_RISE=1
+# HAPROXY_HEALTH_CHECK_FALL=2
+# HAPROXY_APPLY_BEFORE_FAILOVER=1
+# HAPROXY_APPLY_WAIT_SEC=90
+
+# PMM client integration (Advanced, once per cluster — skipped if spec.pmm.enabled=true)
+# PMM_APPLY_BEFORE_FAILOVER=0       # 1 = patch secrets + CR before first failover run
+# PMM_REQUIRE_INTEGRATION=0         # 1 = abort if PMM not enabled and apply=0
+# PMM_SERVER_HOST=                  # PMM server IP/hostname (spec.pmm.serverHost)
+# PMM_SERVER_TOKEN=                 # pmmservertoken for <CR>-secrets and internal-<CR>
+# PMM_CLIENT_IMAGE=percona/pmm-client:3.7.0
+# PMM_ROLLOUT_TIMEOUT_SEC=300       # kubectl rollout status statefulset/<CR>-mysql
+
 # ADVANCED_K8S_CONTEXT=
 # ADVANCED_K8S_PRIMARY_POD_NAME=          # optional if auto-detect works
 # ADVANCED_K8S_POD_LABEL_SELECTOR=        # e.g. mysql.percona.com/role=primary
