@@ -29,6 +29,7 @@ failover_defaults() {
   : "${FAILOVER_MONITOR_CONNECT_TIMEOUT:=1}"
   : "${FAILOVER_MONITOR_OP_TIMEOUT:=1}"
   : "${FAILOVER_GR_POD_MONITOR:=1}"
+  : "${FAILOVER_K8S_POD_MONITOR:=1}"
   : "${FAILOVER_COLLECT_K8S_EVENTS:=1}"
   : "${FAILOVER_RUN_TPCC_CHECK:=0}"
   : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011}"
@@ -56,6 +57,13 @@ failover_defaults() {
   : "${HAPROXY_APPLY_BEFORE_FAILOVER:=1}"
   : "${HAPROXY_APPLY_WAIT_SEC:=90}"
   : "${ADVANCED_PSMYSQL_CR_NAME:=}"
+  # PMM client integration (Advanced): patch secrets + CR once per cluster (skipped if spec.pmm.enabled=true)
+  : "${PMM_APPLY_BEFORE_FAILOVER:=0}"
+  : "${PMM_REQUIRE_INTEGRATION:=0}"
+  : "${PMM_SERVER_HOST:=}"
+  : "${PMM_SERVER_TOKEN:=}"
+  : "${PMM_CLIENT_IMAGE:=percona/pmm-client:3.7.0}"
+  : "${PMM_ROLLOUT_TIMEOUT_SEC:=300}"
 }
 
 failover_scenario_trx_profile() {
@@ -510,7 +518,62 @@ SELECT @@hostname,
        IFNULL((SELECT MEMBER_ROLE FROM performance_schema.replication_group_members
                WHERE MEMBER_ID = @@server_uuid LIMIT 1), 'N/A'),
        IFNULL((SELECT MEMBER_STATE FROM performance_schema.replication_group_members
-               WHERE MEMBER_ID = @@server_uuid LIMIT 1), 'N/A');" 2>/dev/null || true
+               WHERE MEMBER_ID = @@server_uuid LIMIT 1), 'N/A'),
+       IFNULL((SELECT COUNT_TRANSACTIONS_IN_QUEUE
+                 FROM performance_schema.replication_group_member_stats
+                WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1),
+       IFNULL((SELECT COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE
+                 FROM performance_schema.replication_group_member_stats
+                WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1);" 2>/dev/null || true
+}
+
+_failover_poll_k8s_mysql_pods_once() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local target_pod="${3:-}"
+
+  python3 - "${kubeconfig}" "${ns}" "${target_pod}" "${ADVANCED_K8S_CONTEXT:-}" <<'PY'
+import json
+import re
+import subprocess
+import sys
+
+kubeconfig, ns, target_pod, context = sys.argv[1:5]
+base = ["kubectl", f"--kubeconfig={kubeconfig}"]
+if context:
+    base.extend(["--context", context])
+
+try:
+    raw = subprocess.check_output(
+        base + ["get", "pods", "-n", ns, "-o", "json"],
+        text=True,
+        stderr=subprocess.DEVNULL,
+    )
+except (subprocess.CalledProcessError, FileNotFoundError):
+    sys.exit(0)
+
+doc = json.loads(raw)
+mysql_re = re.compile(r"^mysql-[0-9]+$")
+for item in sorted(doc.get("items") or [], key=lambda x: x.get("metadata", {}).get("name", "")):
+    meta = item.get("metadata") or {}
+    name = meta.get("name", "")
+    if not mysql_re.match(name):
+        continue
+    status = item.get("status") or {}
+    phase = status.get("phase") or "Unknown"
+    containers = status.get("containerStatuses") or []
+    ready_num = sum(1 for c in containers if c.get("ready"))
+    ready_den = len(containers)
+    restarts = 0
+    if containers:
+        restarts = sum(int(c.get("restartCount") or 0) for c in containers)
+    deleting = 1 if meta.get("deletionTimestamp") else 0
+    is_target = 1 if target_pod and name == target_pod else 0
+    print(
+        f"{name}\t{phase}\t{ready_num}\t{ready_den}\t{restarts}\t{deleting}\t{is_target}",
+        flush=True,
+    )
+PY
 }
 
 start_gr_pod_monitor() {
@@ -518,11 +581,11 @@ start_gr_pod_monitor() {
   local pid_file="${results_dir}/gr_pod_monitor.pid"
   local out_file="${results_dir}/gr_pod_monitor.tsv"
   local meta_file="${results_dir}/gr_pod_monitor_meta.txt"
-  local kubeconfig="${results_dir}/kubeconfig"
+  local kubeconfig=""
   local ns="${ADVANCED_K8S_NAMESPACE:-}"
 
   command -v kubectl >/dev/null 2>&1 || return 0
-  [[ -f "${kubeconfig}" ]] || return 0
+  kubeconfig="$(_failover_resolve_kubeconfig "${results_dir}")" || return 0
   [[ -n "${ns}" ]] || return 0
 
   local interval="${FAILOVER_MONITOR_INTERVAL}"
@@ -530,16 +593,17 @@ start_gr_pod_monitor() {
   start_epoch=$(python3 -c "import time; print('%.3f' % time.time())")
 
   : > "${out_file}"
-  echo -e "timestamp_utc\telapsed_sec\tpod\tconnect_ok\thostname\tgr_member_role\tgr_member_state" >> "${out_file}"
+  echo -e "timestamp_utc\telapsed_sec\tpod\tconnect_ok\thostname\tgr_member_role\tgr_member_state\tcert_queue\tapplier_queue" >> "${out_file}"
   {
     echo "GR_POD_MONITOR_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "GR_POD_MONITOR_START_EPOCH=${start_epoch}"
     echo "GR_POD_MONITOR_INTERVAL_SEC=${interval}"
     echo "GR_POD_MONITOR_NAMESPACE=${ns}"
+    echo "GR_POD_MONITOR_KUBECONFIG=${kubeconfig}"
   } > "${meta_file}"
 
   (
-    local tick=0 target_epoch elapsed ts due_tick pod line host role state
+    local tick=0 target_epoch elapsed ts due_tick pod line host role state cert_q applier_q
     while true; do
       due_tick=$(python3 -c "
 import math, time
@@ -564,10 +628,14 @@ print(int(math.floor((time.time() - start) / interval)))
           host=${line%%$'\t'*}
           rest=${line#*$'\t'}
           role=${rest%%$'\t'*}
-          state=${rest#*$'\t'}
-          echo -e "${ts}\t${elapsed}\t${pod}\t1\t${host}\t${role}\t${state}" >> "${out_file}"
+          rest=${rest#*$'\t'}
+          state=${rest%%$'\t'*}
+          rest=${rest#*$'\t'}
+          cert_q=${rest%%$'\t'*}
+          applier_q=${rest#*$'\t'}
+          echo -e "${ts}\t${elapsed}\t${pod}\t1\t${host}\t${role}\t${state}\t${cert_q}\t${applier_q}" >> "${out_file}"
         else
-          echo -e "${ts}\t${elapsed}\t${pod}\t0\tERROR\tERROR\tERROR" >> "${out_file}"
+          echo -e "${ts}\t${elapsed}\t${pod}\t0\tERROR\tERROR\tERROR\t-1\t-1" >> "${out_file}"
         fi
       done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
 
@@ -594,6 +662,141 @@ stop_gr_pod_monitor() {
   fi
   if [[ -f "${results_dir}/gr_pod_monitor_meta.txt" ]]; then
     echo "GR_POD_MONITOR_END_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${results_dir}/gr_pod_monitor_meta.txt"
+  fi
+}
+
+start_k8s_pods_monitor() {
+  local results_dir="${1:?results dir required}"
+  local pid_file="${results_dir}/k8s_pods_monitor.pid"
+  local out_file="${results_dir}/k8s_pods_monitor.tsv"
+  local meta_file="${results_dir}/k8s_pods_monitor_meta.txt"
+  local kubeconfig=""
+  local ns="${ADVANCED_K8S_NAMESPACE:-}"
+  local target_pod=""
+
+  [[ "${FAILOVER_K8S_POD_MONITOR:-1}" == "1" ]] || return 0
+  command -v kubectl >/dev/null 2>&1 || return 0
+  kubeconfig="$(_failover_resolve_kubeconfig "${results_dir}")" || return 0
+  [[ -n "${ns}" ]] || return 0
+
+  if [[ -f "${results_dir}/failover_trigger_prepared.env" ]]; then
+    # shellcheck disable=SC1090
+    source "${results_dir}/failover_trigger_prepared.env" 2>/dev/null || true
+    target_pod="${FAILOVER_TARGET_POD:-}"
+  fi
+
+  local interval="${FAILOVER_MONITOR_INTERVAL}"
+  local start_epoch
+  start_epoch=$(python3 -c "import time; print('%.3f' % time.time())")
+
+  : > "${out_file}"
+  echo -e "timestamp_utc\telapsed_sec\tpod\tphase\tready_num\tready_den\trestarts\tdeleting\tis_target" >> "${out_file}"
+  {
+    echo "K8S_PODS_MONITOR_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "K8S_PODS_MONITOR_START_EPOCH=${start_epoch}"
+    echo "K8S_PODS_MONITOR_INTERVAL_SEC=${interval}"
+    echo "K8S_PODS_MONITOR_NAMESPACE=${ns}"
+    echo "K8S_PODS_MONITOR_KUBECONFIG=${kubeconfig}"
+    echo "K8S_PODS_MONITOR_TARGET_POD=${target_pod}"
+  } > "${meta_file}"
+
+  (
+    local tick=0 target_epoch elapsed ts due_tick pod line phase ready_num ready_den restarts deleting is_target
+    while true; do
+      due_tick=$(python3 -c "
+import math, time
+start = float('${start_epoch}')
+interval = float('${interval}')
+print(int(math.floor((time.time() - start) / interval)))
+")
+      while (( tick < due_tick )); do
+        tick=$((tick + 1))
+      done
+
+      target_epoch=$(python3 -c "print(float('${start_epoch}') + ${tick} * float('${interval}'))")
+      _failover_monitor_sleep_until "${target_epoch}"
+
+      elapsed=$(python3 -c "print('%.3f' % (float('${target_epoch}') - float('${start_epoch}')))")
+      ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+      local current_target="${target_pod}"
+      if [[ -f "${results_dir}/failover_event.txt" ]]; then
+        current_target=$(grep -E '^FAILOVER_TARGET_POD=' "${results_dir}/failover_event.txt" 2>/dev/null \
+          | tail -1 | cut -d= -f2- || echo "${target_pod}")
+      fi
+
+      while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        pod=${line%%$'\t'*}
+        rest=${line#*$'\t'}
+        phase=${rest%%$'\t'*}
+        rest=${rest#*$'\t'}
+        ready_num=${rest%%$'\t'*}
+        rest=${rest#*$'\t'}
+        ready_den=${rest%%$'\t'*}
+        rest=${rest#*$'\t'}
+        restarts=${rest%%$'\t'*}
+        rest=${rest#*$'\t'}
+        deleting=${rest%%$'\t'*}
+        is_target=${rest#*$'\t'}
+        if [[ -n "${current_target}" && "${pod}" == "${current_target}" ]]; then
+          is_target=1
+        fi
+        echo -e "${ts}\t${elapsed}\t${pod}\t${phase}\t${ready_num}\t${ready_den}\t${restarts}\t${deleting}\t${is_target}" \
+          >> "${out_file}"
+      done < <(_failover_poll_k8s_mysql_pods_once "${kubeconfig}" "${ns}" "${current_target}")
+
+      tick=$((tick + 1))
+    done
+  ) &
+
+  echo $! > "${pid_file}"
+  echo "K8s pods monitor started (pid=$(cat "${pid_file}"), ${interval}s grid, mysql-* pod readiness)"
+}
+
+stop_k8s_pods_monitor() {
+  local results_dir="${1:?results dir required}"
+  local pid_file="${results_dir}/k8s_pods_monitor.pid"
+
+  if [[ -f "${pid_file}" ]]; then
+    local pid
+    pid=$(cat "${pid_file}")
+    if kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+    fi
+    rm -f "${pid_file}"
+  fi
+  if [[ -f "${results_dir}/k8s_pods_monitor_meta.txt" ]]; then
+    echo "K8S_PODS_MONITOR_END_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${results_dir}/k8s_pods_monitor_meta.txt"
+  fi
+}
+
+# Restart GR + K8s pod monitors after kubeconfig is available (Advanced prepare step).
+failover_start_advanced_cluster_monitors() {
+  local results_dir="${1:?results dir required}"
+  local kubeconfig=""
+
+  command -v kubectl >/dev/null 2>&1 || return 0
+  kubeconfig="$(_failover_resolve_kubeconfig "${results_dir}")" || {
+    echo "Advanced cluster monitors: skipped (no kubeconfig yet)" >&2
+    return 0
+  }
+
+  if [[ "${kubeconfig}" != "${results_dir}/kubeconfig" ]]; then
+    cp "${kubeconfig}" "${results_dir}/kubeconfig"
+    chmod 600 "${results_dir}/kubeconfig"
+    kubeconfig="${results_dir}/kubeconfig"
+  fi
+
+  echo "--- Starting Advanced cluster monitors (GR pod + K8s readiness) ---"
+  stop_gr_pod_monitor "${results_dir}"
+  stop_k8s_pods_monitor "${results_dir}"
+  if [[ "${FAILOVER_GR_POD_MONITOR:-1}" == "1" ]]; then
+    start_gr_pod_monitor "${results_dir}"
+  fi
+  if [[ "${FAILOVER_K8S_POD_MONITOR:-1}" == "1" ]]; then
+    start_k8s_pods_monitor "${results_dir}"
   fi
 }
 
@@ -720,6 +923,237 @@ PY
       sleep 5
     done
     echo "WARNING: HAProxy not ready after ${wait_sec}s (state=${state:-unknown}) — continuing" >&2
+  fi
+
+  return 0
+}
+
+_failover_kubectl_resource_exists() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local resource="${2:?resource required}"
+  local name="${3:?name required}"
+  local ns="${4:?namespace required}"
+  local -a kubectl=()
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+  "${kubectl[@]}" get "${resource}" "${name}" -n "${ns}" >/dev/null 2>&1
+}
+
+_failover_pmm_cr_spec() {
+  # Prints: enabled serverHost (e.g. "true 10.0.0.5" or "false ")
+  local kubeconfig="${1:?kubeconfig required}"
+  local cr="${2:?cr required}"
+  local ns="${3:?namespace required}"
+  local -a kubectl=()
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+  "${kubectl[@]}" get perconaservermysql "${cr}" -n "${ns}" \
+    -o jsonpath='{.spec.pmm.enabled}{" "}{.spec.pmm.serverHost}' 2>/dev/null || true
+}
+
+_failover_pmm_enabled_on_cr() {
+  local spec
+  spec="$(_failover_pmm_cr_spec "$@")"
+  [[ "${spec%% *}" == "true" ]]
+}
+
+# Enable PMM on Advanced cluster (secrets + PerconaServerMySQL spec). Idempotent: skips when
+# spec.pmm.enabled is already true. Requires ADVANCED_PSMYSQL_CR_NAME, ADVANCED_K8S_NAMESPACE,
+# PMM_SERVER_HOST, PMM_SERVER_TOKEN when applying.
+ensure_pmm_integration() {
+  local edition_dir="${1:-}"
+  local ns="${ADVANCED_K8S_NAMESPACE:-}"
+  local cr="${ADVANCED_PSMYSQL_CR_NAME:-}"
+  local kubeconfig=""
+  local apply="${PMM_APPLY_BEFORE_FAILOVER:-0}"
+  local require="${PMM_REQUIRE_INTEGRATION:-0}"
+  local token="${PMM_SERVER_TOKEN:-}"
+  local server_host="${PMM_SERVER_HOST:-}"
+  local client_image="${PMM_CLIENT_IMAGE:-percona/pmm-client:3.7.0}"
+  local rollout_timeout="${PMM_ROLLOUT_TIMEOUT_SEC:-300}"
+  local -a kubectl=()
+
+  if [[ -z "${cr}" || -z "${ns}" ]]; then
+    if [[ "${require}" == "1" ]]; then
+      echo "ERROR: PMM_REQUIRE_INTEGRATION=1 but ADVANCED_PSMYSQL_CR_NAME or ADVANCED_K8S_NAMESPACE is unset" >&2
+      return 1
+    fi
+    echo "PMM integration: skipped (set ADVANCED_PSMYSQL_CR_NAME and ADVANCED_K8S_NAMESPACE)" >&2
+    return 0
+  fi
+
+  if ! kubeconfig="$(_failover_resolve_kubeconfig "${edition_dir}")"; then
+    if [[ "${require}" == "1" || "${apply}" == "1" ]]; then
+      echo "ERROR: PMM check/apply requires kubeconfig (set ADVANCED_KUBECONFIG_PATH on droplet)" >&2
+      return 1
+    fi
+    echo "PMM integration: skipped (no kubeconfig)" >&2
+    return 0
+  fi
+
+  command -v kubectl >/dev/null 2>&1 || {
+    echo "ERROR: kubectl not found — cannot check or apply PMM integration" >&2
+    return 1
+  }
+
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+
+  if _failover_pmm_enabled_on_cr "${kubeconfig}" "${cr}" "${ns}"; then
+    local current_host=""
+    current_host="$(_failover_pmm_cr_spec "${kubeconfig}" "${cr}" "${ns}")"
+    current_host="${current_host#* }"
+    echo "--- PMM integration: already enabled on CR ${cr} (serverHost=${current_host:-unknown}) — skipping ---"
+    return 0
+  fi
+
+  if [[ "${apply}" != "1" ]]; then
+    if [[ "${require}" == "1" ]]; then
+      echo "ERROR: PMM is not enabled on cluster ${cr} and PMM_APPLY_BEFORE_FAILOVER=0." >&2
+      echo "       Set PMM_APPLY_BEFORE_FAILOVER=1 with PMM_SERVER_HOST + PMM_SERVER_TOKEN," >&2
+      echo "       or integrate PMM manually, or set PMM_REQUIRE_INTEGRATION=0 to continue." >&2
+      return 1
+    fi
+    echo "--- PMM integration: not enabled on CR ${cr} (PMM_APPLY_BEFORE_FAILOVER=0) — continuing ---"
+    return 0
+  fi
+
+  if [[ -z "${server_host}" ]]; then
+    echo "ERROR: PMM_APPLY_BEFORE_FAILOVER=1 requires PMM_SERVER_HOST" >&2
+    return 1
+  fi
+  if [[ -z "${token}" ]]; then
+    echo "ERROR: PMM_APPLY_BEFORE_FAILOVER=1 requires PMM_SERVER_TOKEN" >&2
+    return 1
+  fi
+  if ! [[ "${rollout_timeout}" =~ ^[0-9]+$ ]] || (( rollout_timeout < 1 )); then
+    echo "ERROR: PMM_ROLLOUT_TIMEOUT_SEC must be a positive integer" >&2
+    return 1
+  fi
+
+  echo "--- PMM integration: enabling on CR ${cr} (namespace ${ns}) ---"
+  echo "    PMM serverHost: ${server_host}"
+  echo "    PMM client image: ${client_image}"
+
+  local cluster_secret="${cr}-secrets"
+  local internal_secret="internal-${cr}"
+
+  if ! _failover_kubectl_resource_exists "${kubeconfig}" secret "${cluster_secret}" "${ns}"; then
+    echo "ERROR: secret ${cluster_secret} not found in namespace ${ns}" >&2
+    return 1
+  fi
+
+  echo "Patching secret ${cluster_secret} (pmmservertoken)..."
+  if ! python3 - "${cluster_secret}" "${ns}" "${token}" "${kubeconfig}" "${ADVANCED_K8S_CONTEXT:-}" <<'PY'
+import json
+import subprocess
+import sys
+
+name, ns, token, kubeconfig, context = sys.argv[1:6]
+base = ["kubectl", f"--kubeconfig={kubeconfig}"]
+if context:
+    base.extend(["--context", context])
+patch = json.dumps({"stringData": {"pmmservertoken": token}})
+subprocess.run(
+    base + ["patch", "secret", name, "-n", ns, "--type", "merge", "-p", patch],
+    check=True,
+    text=True,
+)
+PY
+  then
+    echo "ERROR: failed to patch secret ${cluster_secret}" >&2
+    return 1
+  fi
+
+  if _failover_kubectl_resource_exists "${kubeconfig}" secret "${internal_secret}" "${ns}"; then
+    echo "Patching secret ${internal_secret} (pmmservertoken)..."
+    if ! python3 - "${internal_secret}" "${ns}" "${token}" "${kubeconfig}" "${ADVANCED_K8S_CONTEXT:-}" <<'PY'
+import json
+import subprocess
+import sys
+
+name, ns, token, kubeconfig, context = sys.argv[1:6]
+base = ["kubectl", f"--kubeconfig={kubeconfig}"]
+if context:
+    base.extend(["--context", context])
+patch = json.dumps({"stringData": {"pmmservertoken": token}})
+subprocess.run(
+    base + ["patch", "secret", name, "-n", ns, "--type", "merge", "-p", patch],
+    check=True,
+    text=True,
+)
+PY
+    then
+      echo "ERROR: failed to patch secret ${internal_secret}" >&2
+      return 1
+    fi
+  else
+    echo "WARNING: secret ${internal_secret} not found — skipping internal secret patch" >&2
+  fi
+
+  echo "Patching PerconaServerMySQL ${cr} (spec.pmm.enabled=true)..."
+  if ! python3 - "${cr}" "${ns}" "${server_host}" "${client_image}" "${kubeconfig}" "${ADVANCED_K8S_CONTEXT:-}" <<'PY'
+import json
+import subprocess
+import sys
+
+cr, ns, server_host, client_image, kubeconfig, context = sys.argv[1:7]
+base = ["kubectl", f"--kubeconfig={kubeconfig}"]
+if context:
+    base.extend(["--context", context])
+patch = {
+    "spec": {
+        "pmm": {
+            "enabled": True,
+            "image": client_image,
+            "serverHost": server_host,
+        }
+    }
+}
+subprocess.run(
+    base
+    + [
+        "patch",
+        "perconaservermysql",
+        cr,
+        "-n",
+        ns,
+        "--type",
+        "merge",
+        "-p",
+        json.dumps(patch),
+    ],
+    check=True,
+    text=True,
+)
+PY
+  then
+    echo "ERROR: failed to patch PerconaServerMySQL ${cr}" >&2
+    return 1
+  fi
+
+  local sts="${cr}-mysql"
+  echo "Waiting for MySQL StatefulSet rollout (${sts}, timeout=${rollout_timeout}s)..."
+  if ! "${kubectl[@]}" rollout status "statefulset/${sts}" -n "${ns}" --timeout="${rollout_timeout}s"; then
+    echo "ERROR: rollout of statefulset/${sts} did not complete within ${rollout_timeout}s" >&2
+    return 1
+  fi
+
+  if ! _failover_pmm_enabled_on_cr "${kubeconfig}" "${cr}" "${ns}"; then
+    echo "ERROR: PMM still not reported as enabled on CR after rollout" >&2
+    return 1
+  fi
+
+  echo "PMM integration: complete (CR ${cr}, serverHost=${server_host})"
+
+  if [[ -n "${edition_dir}" ]]; then
+    mkdir -p "${edition_dir}"
+    {
+      echo "PMM_APPLY_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "ADVANCED_PSMYSQL_CR_NAME=${cr}"
+      echo "ADVANCED_K8S_NAMESPACE=${ns}"
+      echo "PMM_SERVER_HOST=${server_host}"
+      echo "PMM_CLIENT_IMAGE=${client_image}"
+      echo "PMM_CLUSTER_SECRET=${cluster_secret}"
+      echo "PMM_INTERNAL_SECRET=${internal_secret}"
+    } > "${edition_dir}/pmm_integration.env"
   fi
 
   return 0
@@ -952,6 +1386,9 @@ start_failover_watchers() {
     if [[ "${FAILOVER_GR_POD_MONITOR:-1}" == "1" ]]; then
       start_gr_pod_monitor "${results_dir}"
     fi
+    if [[ "${FAILOVER_K8S_POD_MONITOR:-1}" == "1" ]]; then
+      start_k8s_pods_monitor "${results_dir}"
+    fi
   fi
 }
 
@@ -960,6 +1397,7 @@ stop_failover_watchers() {
 
   stop_k8s_event_collector "${results_dir}"
   stop_gr_pod_monitor "${results_dir}"
+  stop_k8s_pods_monitor "${results_dir}"
   if failover_monitor_enabled; then
     stop_primary_monitor "${results_dir}"
   fi

@@ -192,6 +192,15 @@ _cmd_start() {
   fi
 
   _write_lock "${pid}" "${results_dir}"
+  if ! _pid_alive "${pid}"; then
+    echo "ERROR: benchmark exited immediately (pid ${pid})." >&2
+    if [[ -f "${REPO_ROOT}/results/control_wrapper.log" ]]; then
+      echo "--- results/control_wrapper.log (last 40 lines) ---" >&2
+      tail -n 40 "${REPO_ROOT}/results/control_wrapper.log" >&2
+    fi
+    rm -f "${LOCK_FILE}"
+    exit 1
+  fi
   echo "started pid=${pid} results_dir=${results_dir}"
 }
 

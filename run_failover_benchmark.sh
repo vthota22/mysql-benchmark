@@ -69,6 +69,7 @@ if failover_trigger_enabled; then
 else
   echo "Trigger:  DISABLED — load-only control run (FAILOVER_TRIGGER_ENABLED=0)"
 fi
+echo "PMM:      apply=${PMM_APPLY_BEFORE_FAILOVER:-0} require=${PMM_REQUIRE_INTEGRATION:-0}"
 echo ""
 
 run_failover_scenario() {
@@ -106,6 +107,7 @@ run_failover_scenario() {
     echo "--- Preparing failover trigger (kubeconfig, kubectl, primary pod) ---"
     BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${scenario_dir}" prepare \
       2>&1 | tee -a "${scenario_dir}/failover_trigger.log"
+    failover_start_advanced_cluster_monitors "${scenario_dir}"
   fi
 
   echo "--- Baseline load period, then failover trigger ---"
@@ -209,6 +211,9 @@ run_failover_edition() {
   echo ""
 
   if [[ "${edition}" == "advanced" ]]; then
+    ensure_pmm_integration "${edition_dir}" \
+      || { echo "Aborting ${edition}: PMM integration check/apply failed"; return 1; }
+    echo ""
     apply_haproxy_health_check "${edition_dir}" \
       || { echo "Aborting ${edition}: HAProxy health check apply failed"; return 1; }
     echo ""
