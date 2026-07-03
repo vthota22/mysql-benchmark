@@ -62,7 +62,9 @@ if [[ -n "${CLUSTER_ID:-}" && -n "${DO_API_TOKEN:-}" ]]; then
   fetch_cluster_details "${CONFIG}"
 fi
 
-: "${MYSQL_HOST:?Set MYSQL_HOST in benchmark.conf or provide CLUSTER_ID + DO_API_TOKEN}"
+apply_mysql_host_override "${CONFIG}"
+
+: "${MYSQL_HOST:?Set MYSQL_HOST, OVERRIDE_MYSQL_HOST, or provide CLUSTER_ID + DO_API_TOKEN}"
 : "${MYSQL_PORT:?Set MYSQL_PORT in benchmark.conf or provide CLUSTER_ID + DO_API_TOKEN}"
 : "${MYSQL_USER:?Set MYSQL_USER in benchmark.conf or provide CLUSTER_ID + DO_API_TOKEN}"
 : "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in benchmark.conf or provide CLUSTER_ID + DO_API_TOKEN}"

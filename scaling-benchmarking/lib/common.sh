@@ -195,6 +195,23 @@ _save_fetched_to_conf() {
   log_phase "0_FETCH" "saved fetched values to ${config_file}"
 }
 
+# When OVERRIDE_MYSQL_HOST is set, use it instead of MYSQL_HOST from doctl or
+# benchmark.conf. Always writes the effective host to MYSQL_HOST in the config.
+apply_mysql_host_override() {
+  local config_file="${1:-}"
+
+  if [[ -z "${OVERRIDE_MYSQL_HOST:-}" ]]; then
+    return 0
+  fi
+
+  MYSQL_HOST="${OVERRIDE_MYSQL_HOST}"
+  log_phase "0_FETCH" "MYSQL_HOST=${MYSQL_HOST} (OVERRIDE_MYSQL_HOST overrides doctl and benchmark.conf)"
+
+  if [[ -n "${config_file}" && -f "${config_file}" ]]; then
+    _update_conf_value "${config_file}" "MYSQL_HOST" "${MYSQL_HOST}"
+  fi
+}
+
 # Fetch cluster details and connection info from doctl.
 # Always fetches when CLUSTER_ID + DO_API_TOKEN are set, overwriting stale values
 # so the config always reflects the live cluster state.
@@ -250,9 +267,13 @@ fetch_cluster_details() {
   read -r fetched_host fetched_port fetched_user fetched_pass <<< "${conn_info}"
 
   if [[ -n "${fetched_host}" ]]; then
-    MYSQL_HOST="${fetched_host}"
-    updated_keys+=("MYSQL_HOST")
-    log_phase "0_FETCH" "MYSQL_HOST=${MYSQL_HOST}"
+    if [[ -n "${OVERRIDE_MYSQL_HOST:-}" ]]; then
+      log_phase "0_FETCH" "skipping doctl MYSQL_HOST=${fetched_host} (OVERRIDE_MYSQL_HOST is set)"
+    else
+      MYSQL_HOST="${fetched_host}"
+      updated_keys+=("MYSQL_HOST")
+      log_phase "0_FETCH" "MYSQL_HOST=${MYSQL_HOST}"
+    fi
   fi
   if [[ -n "${fetched_port}" ]]; then
     MYSQL_PORT="${fetched_port}"
@@ -299,7 +320,9 @@ require_config() {
     fetch_cluster_details "${BENCHMARK_CONF_FILE:-}"
   fi
 
-  : "${MYSQL_HOST:?Set MYSQL_HOST in benchmark.conf or provide DO_API_TOKEN to auto-fetch}"
+  apply_mysql_host_override "${BENCHMARK_CONF_FILE:-}"
+
+  : "${MYSQL_HOST:?Set MYSQL_HOST in benchmark.conf, OVERRIDE_MYSQL_HOST, or provide DO_API_TOKEN to auto-fetch}"
   : "${MYSQL_PORT:?Set MYSQL_PORT in benchmark.conf or provide DO_API_TOKEN to auto-fetch}"
   : "${MYSQL_USER:?Set MYSQL_USER in benchmark.conf or provide DO_API_TOKEN to auto-fetch}"
   : "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in benchmark.conf or provide DO_API_TOKEN to auto-fetch}"

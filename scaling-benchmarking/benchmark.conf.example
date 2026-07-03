@@ -10,12 +10,17 @@ ENGINE="advanced"
 CLUSTER_ID="your-cluster-uuid"
 
 # --- MySQL connection ---
-# Leave these empty to auto-fetch from doctl using CLUSTER_ID + DO_API_TOKEN.
+# Port/user/password are auto-fetched from doctl when CLUSTER_ID + DO_API_TOKEN are set.
+# MYSQL_HOST is also fetched from doctl unless OVERRIDE_MYSQL_HOST is set.
 MYSQL_HOST=""
 MYSQL_PORT=""
 MYSQL_USER=""
 MYSQL_PASSWORD=""
 MYSQL_DB="sbtest_tpcc"
+
+# Optional: force a specific MySQL host (e.g. HAProxy VIP or primary pod IP).
+# When non-empty, wins over MYSQL_HOST and the doctl host; written to MYSQL_HOST.
+OVERRIDE_MYSQL_HOST=""
 
 # --- Sysbench TPC-C ---
 TPCC_SCALE=10

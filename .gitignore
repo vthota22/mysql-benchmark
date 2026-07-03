@@ -8,4 +8,9 @@ scaling-benchmarking/reports2/
 scaling-benchmarking/combine_reports.py
 scaling-benchmarking/adv_mysql_backup_and_scaling_2026-06-23.html
 scaling-benchmarking/logs/
+sca
 secrets/
+scaling-benchmarking/scripts/download_results.sh
+scaling-benchmarking/scripts/enable_pmm.sh
+scaling-benchmarking/scripts/fetch_temporal_workflow_history.py
+scaling-benchmarking/scripts/upload_kubeconfig.sh
