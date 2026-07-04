@@ -33,23 +33,34 @@ _run_log_complete() {
     && grep -q "${COMPLETE_MARKER}" "${REPO_ROOT}/${results_dir}/full_run.log" 2>/dev/null
 }
 
-_find_incomplete_results_dir() {
+# Only timestamped job dirs (results/prepare_YYYYMMDD_HHMMSS), not prepare_wrapper.log etc.
+_list_prepare_dirs() {
   local d
-  for d in $(ls -1dt "${REPO_ROOT}"/results/prepare_* 2>/dev/null); do
-    local rel="${d#${REPO_ROOT}/}"
+  shopt -s nullglob
+  for d in "${REPO_ROOT}"/results/prepare_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]; do
+    [[ -d "${d}" ]] && echo "${d}"
+  done
+  shopt -u nullglob
+}
+
+_find_incomplete_results_dir() {
+  local d rel
+  while IFS= read -r d; do
+    [[ -n "${d}" ]] || continue
+    rel="${d#${REPO_ROOT}/}"
     [[ -f "${d}/full_run.log" ]] || continue
     if ! _run_log_complete "${rel}"; then
       echo "${rel}"
       return 0
     fi
-  done
+  done < <(_list_prepare_dirs | sort -dt)
 }
 
 _find_latest_results_dir() {
-  local latest
-  latest="$(ls -1dt "${REPO_ROOT}"/results/prepare_* 2>/dev/null | head -1 || true)"
-  if [[ -n "${latest}" ]]; then
-    echo "${latest#${REPO_ROOT}/}"
+  local d
+  d="$(_list_prepare_dirs | sort -dt | head -1 || true)"
+  if [[ -n "${d}" ]]; then
+    echo "${d#${REPO_ROOT}/}"
   fi
 }
 
@@ -65,7 +76,7 @@ _resolve_results_dir() {
 _find_new_results_dir() {
   local -n _known_ref="${1:?known dirs array name required}"
   local d existing known
-  for d in $(ls -1dt "${REPO_ROOT}"/results/prepare_* 2>/dev/null); do
+  while IFS= read -r d; do
     known=0
     for existing in "${_known_ref[@]:-}"; do
       if [[ "${d}" == "${existing}" ]]; then
@@ -76,7 +87,7 @@ _find_new_results_dir() {
     [[ "${known}" -eq 1 ]] && continue
     echo "${d#${REPO_ROOT}/}"
     return 0
-  done
+  done < <(_list_prepare_dirs | sort -dt)
 }
 
 _write_lock() {
@@ -172,7 +183,7 @@ _cmd_start() {
   local -a existing_dirs=()
   while IFS= read -r d; do
     [[ -n "${d}" ]] && existing_dirs+=("${d}")
-  done < <(ls -1d "${REPO_ROOT}"/results/prepare_* 2>/dev/null || true)
+  done < <(_list_prepare_dirs)
 
   local timestamp results_dir
   timestamp="$(date +%Y%m%d_%H%M%S)"
@@ -249,8 +260,9 @@ _cmd_list() {
   limit=$((limit > 50 ? 50 : limit))
 
   cd "${REPO_ROOT}"
-  ls -1dt results/prepare_* 2>/dev/null | head -n "${limit}" | while IFS= read -r d; do
-    [[ -n "${d}" ]] || continue
+  ls -1dt results/prepare_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9] 2>/dev/null \
+    | head -n "${limit}" | while IFS= read -r d; do
+    [[ -n "${d}" && -d "${d}" ]] || continue
     local completed=0 success=0
     if _run_log_complete "${d}"; then
       completed=1
