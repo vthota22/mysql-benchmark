@@ -334,7 +334,10 @@ def add_phase_traces(fig, metrics: list[MetricRow], y_field: str, row: int, col:
 
 
 def timing_for_markers(timing: dict[str, str], run_dir: Path) -> dict[str, str]:
-    offset = resolve_sysbench_offset(timing, run_dir / "tpcc_run.log")
+    run_log = run_dir / "tpcc_run.log"
+    if not run_log.is_file():
+        run_log = run_dir / "benchmark.log"
+    offset = resolve_sysbench_offset(timing, run_log)
     if offset:
         return {**timing, "SYSBENCH_OFFSET_SEC": str(offset)}
     return timing

@@ -28,7 +28,6 @@ RUN_DIR="${RESULTS_BASE}/run_${TIMESTAMP}_${ENGINE}"
 mkdir -p "${RUN_DIR}"
 cp "${CONFIG}" "${RUN_DIR}/benchmark.conf"
 
-RUN_LOG="${RUN_DIR}/tpcc_run.log"
 SCALE_TIMING_FILE="${RUN_DIR}/scale_timing.env"
 SCALE_LOG="${RUN_DIR}/scale.log"
 TIMESERIES_CSV="${RUN_DIR}/metrics_timeseries.csv"
@@ -123,7 +122,7 @@ phase1_init_database() {
     log_phase "1_INIT" "SKIP_PREPARE=1 — ensuring database exists, checking TPC-C tables"
     ensure_database_exists
 
-    if ! verify_tpcc_tables | tee -a "${RUN_LOG}"; then
+    if ! verify_tpcc_tables; then
       log_phase "1_INIT" "ERROR: TPC-C table verification failed"
       return 1
     fi
@@ -136,7 +135,7 @@ phase1_init_database() {
   mysql_admin -e "DROP DATABASE IF EXISTS \`${MYSQL_DB}\`; CREATE DATABASE \`${MYSQL_DB}\`;"
 
   log_phase "1_INIT" "running sysbench tpcc prepare (tables=${TPCC_TABLES} scale=${TPCC_SCALE})"
-  run_tpcc prepare | tee -a "${RUN_LOG}"
+  run_tpcc prepare
 }
 
 run_scale_workflow() {
@@ -238,7 +237,6 @@ phase2_run_with_scaling() {
     log_phase "2_RUN" "SKIP_SCALING=1 — no cluster resize (timing in ${SCALE_TIMING_FILE})"
   fi
 
-  : > "${RUN_LOG}"
   : > "${SCALE_TIMING_FILE}"
   : > "${SCALE_LOG}"
 
@@ -289,7 +287,7 @@ phase2_run_with_scaling() {
       sysbench_offset_recorded=1
     fi
     prefix_tpcc_line_timestamp "${line}"
-  done < "${tpcc_fifo}" | tee -a "${RUN_LOG}"
+  done < "${tpcc_fifo}"
   rm -f "${tpcc_fifo}"
   if ! wait "${tpcc_pid}"; then
     tpcc_rc=$?
@@ -310,7 +308,6 @@ phase2_run_with_scaling() {
 phase3_finalize_logs() {
   log_phase "3_LOG" "run dir:       ${RUN_DIR}"
   log_phase "3_LOG" "config copy:   ${RUN_DIR}/benchmark.conf"
-  log_phase "3_LOG" "run log:       ${RUN_LOG}"
   log_phase "3_LOG" "scale timing:  ${SCALE_TIMING_FILE}"
   log_phase "3_LOG" "scale log:     ${SCALE_LOG}"
   log_phase "3_LOG" "full log:      ${FULL_LOG}"
@@ -326,7 +323,7 @@ phase4_parse_metrics() {
 
   log_phase "4_PARSE" "building per-timestamp metrics CSV"
   python3 "${SCRIPT_DIR}/scripts/parse_timeseries.py" \
-    --run-log "${RUN_LOG}" \
+    --run-log "${FULL_LOG}" \
     --scale-timing-file "${SCALE_TIMING_FILE}" \
     --timeseries-csv "${TIMESERIES_CSV}" \
     --scale-events-csv "${SCALE_EVENTS_CSV}" \

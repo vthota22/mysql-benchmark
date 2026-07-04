@@ -6,8 +6,18 @@
 #   2. Pod state: phase, ready, GR member state (ONLINE/RECOVERING/ERROR)
 #   3. DOKS node binding: which K8s worker node + slug each pod runs on
 #   4. gr_detail: error reason when GR state is not ONLINE
+#   5. read_only / super_read_only per pod (failover detection)
+#   6. GR apply queue and transactions behind (replication lag)
+#   7. HAProxy/router pod state (phase, ready, backend routing)
+#   8. K8s service endpoint changes (when HAProxy detects new primary)
+#   9. K8s namespace events (pod kills, probe failures, scheduling)
 #
-# Outputs k8s_monitor.tsv (time-series) and k8s_monitor.log (events).
+# Outputs:
+#   k8s_monitor.tsv        — per-pod time-series (MySQL pods)
+#   haproxy_monitor.tsv    — per-pod time-series (HAProxy/router pods)
+#   endpoints_monitor.tsv  — service endpoint changes
+#   k8s_events.tsv         — namespace events log
+#   k8s_monitor.log        — key events (failovers, changes)
 #
 # Usage (standalone):
 #   export KUBECONFIG=/path/to/kubeconfig
@@ -34,6 +44,9 @@ MYSQL_COMPONENT_LABEL=""
 mkdir -p "${OUTPUT_DIR}"
 
 TSV_FILE="${OUTPUT_DIR}/k8s_monitor.tsv"
+HAPROXY_TSV="${OUTPUT_DIR}/haproxy_monitor.tsv"
+ENDPOINTS_TSV="${OUTPUT_DIR}/endpoints_monitor.tsv"
+EVENTS_TSV="${OUTPUT_DIR}/k8s_events.tsv"
 MONITOR_LOG="${OUTPUT_DIR}/k8s_monitor.log"
 
 : > "${MONITOR_LOG}"
@@ -43,11 +56,16 @@ PREVIOUS_PRIMARY=""
 PREVIOUS_NODE_MAP=""
 PREVIOUS_POD_COUNT=""
 PREVIOUS_PVC_SIZES=""
+PREVIOUS_ENDPOINTS=""
+PREVIOUS_HAPROXY_BACKENDS=""
 NODE_CYCLE=0
 NODES_LOADED=false
+LAST_EVENT_TS=""
 
 # Temporary files for lookups (avoids associative-array + set -u issues)
 GR_TMP="${OUTPUT_DIR}/.gr_members.tsv"
+GR_STATS_TMP="${OUTPUT_DIR}/.gr_stats.tsv"
+READONLY_TMP="${OUTPUT_DIR}/.readonly_status.tsv"
 NODE_TMP="${OUTPUT_DIR}/.node_info.tsv"
 PVC_TMP="${OUTPUT_DIR}/.pvc_info.tsv"
 GR_COUNTS_TMP="${OUTPUT_DIR}/.gr_counts.txt"
@@ -303,6 +321,283 @@ gr_lookup() {
   fi
 }
 
+# ── Per-pod read_only and super_read_only status ──────────────────────────
+# Writes TSV to READONLY_TMP: short_hostname \t read_only \t super_read_only
+refresh_readonly_status() {
+  : > "${READONLY_TMP}"
+
+  local password
+  password="$(get_mysql_password)"
+  [[ -z "${password}" ]] && return
+
+  local running_pods
+  running_pods="$(kubectl_ns get pods \
+    -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=${MYSQL_COMPONENT_LABEL}" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+
+  while IFS= read -r pod_name; do
+    [[ -z "${pod_name}" ]] && continue
+    local ro_raw
+    ro_raw="$(mysql_in_pod "${pod_name}" "${password}" -e "
+      SELECT @@hostname, @@read_only, @@super_read_only;
+    " 2>/dev/null)" || continue
+    echo "${ro_raw}" | while IFS=$'\t' read -r host ro sro; do
+      [[ -z "${host}" ]] && continue
+      printf '%s\t%s\t%s\n' "${host}" "${ro}" "${sro}"
+    done >> "${READONLY_TMP}"
+  done <<< "${running_pods}"
+}
+
+# Lookup from READONLY_TMP: given a pod name, return "read_only \t super_read_only"
+readonly_lookup() {
+  local pod_name="${1}"
+  [[ -z "${pod_name}" || ! -f "${READONLY_TMP}" ]] && { echo "?\t?"; return; }
+  local match
+  match="$(grep "^${pod_name}	" "${READONLY_TMP}" 2>/dev/null | head -1)" || true
+  if [[ -n "${match}" ]]; then
+    echo "${match}" | cut -f2-
+  else
+    echo "?\t?"
+  fi
+}
+
+# ── GR member stats (apply queue / transactions behind) ───────────────────
+# Writes TSV to GR_STATS_TMP: short_hostname \t count_transactions_in_queue \t
+#   count_transactions_remote_in_applier_queue \t count_transactions_checked
+refresh_gr_stats() {
+  : > "${GR_STATS_TMP}"
+
+  local password
+  password="$(get_mysql_password)"
+  [[ -z "${password}" ]] && return
+
+  local running_pods
+  running_pods="$(kubectl_ns get pods \
+    -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=${MYSQL_COMPONENT_LABEL}" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+
+  local stats_raw="" queried_pod=""
+  while IFS= read -r pod_name; do
+    [[ -z "${pod_name}" ]] && continue
+    if [[ "${CR_TYPE}" == "ps" ]]; then
+      stats_raw="$(mysql_in_pod "${pod_name}" "${password}" -e "
+        SELECT
+          SUBSTRING_INDEX(MEMBER_ID, '-', -1) AS member_short,
+          MEMBER_ID,
+          COUNT_TRANSACTIONS_IN_QUEUE,
+          COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE,
+          COUNT_TRANSACTIONS_REMOTE_APPLIED,
+          COUNT_TRANSACTIONS_LOCAL_PROPOSED
+        FROM performance_schema.replication_group_member_stats;
+      " 2>/dev/null)" && { queried_pod="${pod_name}"; break; }
+    fi
+  done <<< "${running_pods}"
+
+  [[ -z "${stats_raw}" ]] && return
+
+  # Map MEMBER_ID back to hostname using GR_TMP (which has hostnames)
+  # We'll also query the hostname-to-member mapping
+  local mapping_raw=""
+  if [[ -n "${queried_pod}" ]]; then
+    mapping_raw="$(mysql_in_pod "${queried_pod}" "${password}" -e "
+      SELECT
+        SUBSTRING_INDEX(MEMBER_HOST, '.', 1) AS short_host,
+        COUNT_TRANSACTIONS_IN_QUEUE,
+        COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE
+      FROM performance_schema.replication_group_member_stats s
+      JOIN performance_schema.replication_group_members m USING (MEMBER_ID);
+    " 2>/dev/null)" || true
+  fi
+
+  if [[ -n "${mapping_raw}" ]]; then
+    echo "${mapping_raw}" | while IFS=$'\t' read -r host queue applier_queue; do
+      [[ -z "${host}" ]] && continue
+      printf '%s\t%s\t%s\n' "${host}" "${queue}" "${applier_queue}"
+    done > "${GR_STATS_TMP}"
+  fi
+}
+
+# Lookup from GR_STATS_TMP: given a pod name, return "queue \t applier_queue"
+gr_stats_lookup() {
+  local pod_name="${1}"
+  [[ -z "${pod_name}" || ! -f "${GR_STATS_TMP}" ]] && { echo "?\t?"; return; }
+  local match
+  match="$(grep "^${pod_name}	" "${GR_STATS_TMP}" 2>/dev/null | head -1)" || true
+  if [[ -n "${match}" ]]; then
+    echo "${match}" | cut -f2-
+  else
+    echo "?\t?"
+  fi
+}
+
+# ── HAProxy / MySQL Router pod monitoring ─────────────────────────────────
+poll_haproxy_pods() {
+  local ts="${1:?timestamp required}"
+
+  # Percona operator labels HAProxy pods with component=haproxy
+  local haproxy_json
+  haproxy_json="$(kubectl_ns get pods \
+    -l "app.kubernetes.io/instance=${CLUSTER_NAME}" \
+    -o json 2>/dev/null)" || return
+
+  local proxy_lines
+  proxy_lines="$(echo "${haproxy_json}" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for item in data.get('items', []):
+    meta = item['metadata']
+    labels = meta.get('labels', {})
+    component = labels.get('app.kubernetes.io/component', '')
+    # Match haproxy, router, or proxysql components
+    if component not in ('haproxy', 'router', 'proxysql', 'mysql-router'):
+        continue
+    spec = item['spec']
+    status = item['status']
+    cs = status.get('containerStatuses', [])
+    ready = all(c.get('ready', False) for c in cs) if cs else False
+    restarts = sum(c.get('restartCount', 0) for c in cs)
+    # Container state reason
+    reason = ''
+    for c in cs:
+        state_info = c.get('state', {})
+        for stype in ('waiting', 'terminated'):
+            if stype in state_info:
+                reason = state_info[stype].get('reason', '')
+                break
+        if reason:
+            break
+    print('\t'.join([
+        meta['name'],
+        component,
+        status.get('phase', 'Unknown'),
+        'true' if ready else 'false',
+        spec.get('nodeName', ''),
+        str(restarts),
+        reason or '-',
+    ]))
+" 2>/dev/null)" || return
+
+  [[ -z "${proxy_lines}" ]] && return
+
+  while IFS=$'\t' read -r pod_name component phase ready node restarts reason; do
+    [[ -z "${pod_name}" ]] && continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${ts}" "${pod_name}" "${component}" "${phase}" "${ready}" \
+      "${node}" "${restarts}" "${reason}" \
+      >> "${HAPROXY_TSV}"
+  done <<< "${proxy_lines}"
+}
+
+# ── Service endpoints tracking (reveals when HAProxy sees new primary) ────
+poll_endpoints() {
+  local ts="${1:?timestamp required}"
+
+  # Get endpoints for the cluster's services
+  local endpoints_json
+  endpoints_json="$(kubectl_ns get endpoints \
+    -l "app.kubernetes.io/instance=${CLUSTER_NAME}" \
+    -o json 2>/dev/null)" || return
+
+  local ep_lines
+  ep_lines="$(echo "${endpoints_json}" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for item in data.get('items', []):
+    name = item['metadata']['name']
+    subsets = item.get('subsets', [])
+    for subset in subsets:
+        addrs = subset.get('addresses', [])
+        not_ready = subset.get('notReadyAddresses', [])
+        ports = subset.get('ports', [])
+        port_str = ','.join(f\"{p.get('name','')}/{p.get('port','')}\" for p in ports)
+        for a in addrs:
+            target = a.get('targetRef', {})
+            pod = target.get('name', a.get('ip', '?'))
+            print(f\"{name}\tready\t{pod}\t{a.get('ip','')}\t{port_str}\")
+        for a in not_ready:
+            target = a.get('targetRef', {})
+            pod = target.get('name', a.get('ip', '?'))
+            print(f\"{name}\tnot_ready\t{pod}\t{a.get('ip','')}\t{port_str}\")
+" 2>/dev/null)" || return
+
+  local current_endpoints=""
+  while IFS=$'\t' read -r svc_name ep_state pod_name ip ports; do
+    [[ -z "${svc_name}" ]] && continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${ts}" "${svc_name}" "${ep_state}" "${pod_name}" "${ip}" "${ports}" \
+      >> "${ENDPOINTS_TSV}"
+    current_endpoints="${current_endpoints}${svc_name}:${ep_state}:${pod_name} "
+  done <<< "${ep_lines}"
+
+  # Detect endpoint changes (reveals when HAProxy routes to new primary)
+  if [[ -n "${PREVIOUS_ENDPOINTS}" && "${current_endpoints}" != "${PREVIOUS_ENDPOINTS}" ]]; then
+    log "ENDPOINT CHANGE detected (HAProxy routing may have shifted)"
+    log "  was: ${PREVIOUS_ENDPOINTS}"
+    log "  now: ${current_endpoints}"
+  fi
+  PREVIOUS_ENDPOINTS="${current_endpoints}"
+}
+
+# ── K8s events capture (namespace-scoped) ─────────────────────────────────
+poll_k8s_events() {
+  local ts="${1:?timestamp required}"
+
+  local events_json
+  # Get events from the last 60 seconds to avoid duplicates across polls
+  events_json="$(kubectl_ns get events \
+    --sort-by='.lastTimestamp' \
+    -o json 2>/dev/null)" || return
+
+  echo "${events_json}" | python3 -c "
+import json, sys, os
+
+last_ts_file = os.environ.get('LAST_EVENT_TS_FILE', '')
+last_seen = ''
+if last_ts_file and os.path.isfile(last_ts_file):
+    with open(last_ts_file) as f:
+        last_seen = f.read().strip()
+
+data = json.load(sys.stdin)
+events = data.get('items', [])
+
+new_last = last_seen
+output_lines = []
+for e in events:
+    event_ts = e.get('lastTimestamp', '') or e.get('metadata', {}).get('creationTimestamp', '')
+    if last_seen and event_ts <= last_seen:
+        continue
+    kind = e.get('involvedObject', {}).get('kind', '?')
+    obj_name = e.get('involvedObject', {}).get('name', '?')
+    reason = e.get('reason', '?')
+    msg = e.get('message', '').replace('\t', ' ').replace('\n', ' ')[:200]
+    etype = e.get('type', 'Normal')
+    count = e.get('count', 1)
+    output_lines.append(f\"{event_ts}\t{etype}\t{kind}\t{obj_name}\t{reason}\t{count}\t{msg}\")
+    if event_ts > new_last:
+        new_last = event_ts
+
+for line in output_lines:
+    print(line)
+
+if last_ts_file and new_last != last_seen:
+    with open(last_ts_file, 'w') as f:
+        f.write(new_last)
+" 2>/dev/null | while IFS=$'\t' read -r event_ts etype kind obj reason count msg; do
+    [[ -z "${event_ts}" ]] && continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${ts}" "${event_ts}" "${etype}" "${kind}" "${obj}" "${reason}" "${count}" "${msg}" \
+      >> "${EVENTS_TSV}"
+
+    # Log notable events (warnings, errors, pod kills, probe failures)
+    if [[ "${etype}" == "Warning" ]] || \
+       [[ "${reason}" == "Killing" || "${reason}" == "Unhealthy" || \
+          "${reason}" == "FailedScheduling" || "${reason}" == "Evicted" || \
+          "${reason}" == "OOMKilling" || "${reason}" == "BackOff" ]]; then
+      log "K8S_EVENT [${etype}] ${kind}/${obj}: ${reason} — ${msg}"
+    fi
+  done
+}
+
 # ── Single poll ────────────────────────────────────────────────────────────
 poll_once() {
   local ts
@@ -310,6 +605,8 @@ poll_once() {
 
   maybe_refresh_nodes
   refresh_gr_info
+  refresh_readonly_status
+  refresh_gr_stats
   refresh_pvc_info
 
   # GR member counts (total / online)
@@ -397,12 +694,32 @@ for item in data.get('items', []):
     pvc_req="$(echo "${pvc_info}" | cut -f1)"
     pvc_cap="$(echo "${pvc_info}" | cut -f2)"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    # read_only / super_read_only status
+    local ro_info
+    ro_info="$(readonly_lookup "${pod_name}")"
+    local read_only super_read_only
+    read_only="$(echo "${ro_info}" | cut -f1)"
+    super_read_only="$(echo "${ro_info}" | cut -f2)"
+
+    # GR replication queue stats
+    local stats_info
+    stats_info="$(gr_stats_lookup "${pod_name}")"
+    local gr_queue gr_applier_queue
+    gr_queue="$(echo "${stats_info}" | cut -f1)"
+    gr_applier_queue="$(echo "${stats_info}" | cut -f2)"
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "${ts}" "${pod_name}" "${phase}" "${ready}" \
       "${gr_role}" "${gr_state}" "${gr_detail}" "${gr_members}" "${gr_online}" \
       "${node}" "${node_slug}" "${node_cpu}" "${node_mem}" \
       "${pvc_req}" "${pvc_cap}" "${restarts}" "${deleting}" \
+      "${read_only}" "${super_read_only}" "${gr_queue}" "${gr_applier_queue}" \
       >> "${TSV_FILE}"
+
+    # Log transitions to/from read_only (key failover indicator)
+    if [[ "${read_only}" == "1" && "${gr_role}" == "PRIMARY" ]]; then
+      log "READ_ONLY on PRIMARY: ${pod_name} (read_only=${read_only}, super_read_only=${super_read_only}) — failover imminent or in progress"
+    fi
 
     if [[ "${gr_role}" == "PRIMARY" && "${pod_name}" != "${PREVIOUS_PRIMARY}" ]]; then
       if [[ -n "${PREVIOUS_PRIMARY}" ]]; then
@@ -429,6 +746,11 @@ for item in data.get('items', []):
     log "NODE CHANGE detected: was [${PREVIOUS_NODE_MAP}] now [${current_node_map}]"
   fi
   PREVIOUS_NODE_MAP="${current_node_map}"
+
+  # Poll HAProxy/router pods, endpoints, and K8s events
+  poll_haproxy_pods "${ts}"
+  poll_endpoints "${ts}"
+  poll_k8s_events "${ts}"
 }
 
 # ── Startup / shutdown ─────────────────────────────────────────────────────
@@ -445,7 +767,10 @@ shutdown() {
   kubectl_ns get pods -l "app.kubernetes.io/instance=${CLUSTER_NAME}" -o wide \
     > "${OUTPUT_DIR}/pods_final.txt" 2>/dev/null || true
   kubectl get nodes -o wide > "${OUTPUT_DIR}/nodes_final.txt" 2>/dev/null || true
-  rm -f "${GR_TMP}" "${NODE_TMP}" "${PVC_TMP}" "${GR_COUNTS_TMP}"
+  # Capture final endpoint state for debugging
+  kubectl_ns get endpoints -l "app.kubernetes.io/instance=${CLUSTER_NAME}" -o wide \
+    > "${OUTPUT_DIR}/endpoints_final.txt" 2>/dev/null || true
+  rm -f "${GR_TMP}" "${GR_STATS_TMP}" "${READONLY_TMP}" "${NODE_TMP}" "${PVC_TMP}" "${GR_COUNTS_TMP}" "${LAST_EVENT_TS_FILE:-}"
   log "final state saved — exiting"
   exit 0
 }
@@ -467,12 +792,29 @@ main() {
 
   capture_baseline
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "timestamp" "pod" "phase" "ready" \
     "gr_role" "gr_state" "gr_detail" "gr_members" "gr_online" \
     "doks_node" "slug" "vcpus" "mem_gib" \
     "pvc_req" "pvc_cap" "restarts" "deleting" \
+    "read_only" "super_read_only" "gr_queue" "gr_applier_queue" \
     > "${TSV_FILE}"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "timestamp" "pod" "component" "phase" "ready" "node" "restarts" "reason" \
+    > "${HAPROXY_TSV}"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "timestamp" "service" "state" "pod" "ip" "ports" \
+    > "${ENDPOINTS_TSV}"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "poll_ts" "event_ts" "type" "kind" "object" "reason" "count" "message" \
+    > "${EVENTS_TSV}"
+
+  # Track last-seen event timestamp to avoid duplicate event output
+  export LAST_EVENT_TS_FILE="${OUTPUT_DIR}/.last_event_ts"
+  : > "${LAST_EVENT_TS_FILE}"
 
   log "polling started"
 
