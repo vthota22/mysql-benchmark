@@ -523,14 +523,25 @@ for item in data.get('items', []):
   local current_endpoints=""
   while IFS=$'\t' read -r svc_name ep_state pod_name ip ports; do
     [[ -z "${svc_name}" ]] && continue
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${ts}" "${svc_name}" "${ep_state}" "${pod_name}" "${ip}" "${ports}" \
-      >> "${ENDPOINTS_TSV}"
     current_endpoints="${current_endpoints}${svc_name}:${ep_state}:${pod_name} "
   done <<< "${ep_lines}"
 
-  # Detect endpoint changes (reveals when HAProxy routes to new primary)
-  if [[ -n "${PREVIOUS_ENDPOINTS}" && "${current_endpoints}" != "${PREVIOUS_ENDPOINTS}" ]]; then
+  # Only record when endpoints change (plus initial baseline on first poll)
+  if [[ -z "${PREVIOUS_ENDPOINTS}" ]]; then
+    while IFS=$'\t' read -r svc_name ep_state pod_name ip ports; do
+      [[ -z "${svc_name}" ]] && continue
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "${ts}" "${svc_name}" "${ep_state}" "${pod_name}" "${ip}" "${ports}" \
+        >> "${ENDPOINTS_TSV}"
+    done <<< "${ep_lines}"
+    log "ENDPOINTS baseline: ${current_endpoints}"
+  elif [[ "${current_endpoints}" != "${PREVIOUS_ENDPOINTS}" ]]; then
+    while IFS=$'\t' read -r svc_name ep_state pod_name ip ports; do
+      [[ -z "${svc_name}" ]] && continue
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "${ts}" "${svc_name}" "${ep_state}" "${pod_name}" "${ip}" "${ports}" \
+        >> "${ENDPOINTS_TSV}"
+    done <<< "${ep_lines}"
     log "ENDPOINT CHANGE detected (HAProxy routing may have shifted)"
     log "  was: ${PREVIOUS_ENDPOINTS}"
     log "  now: ${current_endpoints}"
