@@ -851,6 +851,7 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
     target_pod = event.get("FAILOVER_TARGET_POD", "")
 
     gr_state_datasets: list[dict] = []
+    applier_datasets: list[dict] = []
     k8s_state_datasets: list[dict] = []
 
     gr_pods = sorted({str(r["pod"]) for r in gr_rows})
@@ -861,9 +862,16 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
             key=lambda r: float(r["sysbench_sec"]),
         )
         state_points = []
+        applier_points = []
         prev_label: str | None = None
         for row in pod_rows:
             sec = float(row["sysbench_sec"])
+            try:
+                applier = float(row["applier_queue"])
+            except ValueError:
+                applier = None
+            if applier is not None and applier >= 0:
+                applier_points.append({"x": sec, "y": applier})
             role = str(row["gr_role"])
             gr_state = str(row["gr_state"])
             connect_ok = str(row["connect_ok"])
@@ -886,6 +894,9 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
                 "backgroundColor": color,
                 "borderWidth": 3 if pod == target_pod else 1.5,
             }
+        )
+        applier_datasets.append(
+            {"label": pod, "data": applier_points, "borderColor": color, "backgroundColor": color}
         )
 
     k8s_pods = sorted({str(r["pod"]) for r in k8s_rows})
@@ -946,6 +957,8 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
         "trigger_sec": trigger,
         "target_pod": target_pod,
         "gr_state_datasets": gr_state_datasets,
+        "applier_datasets": applier_datasets,
+        "has_applier_queue": any(ds.get("data") for ds in applier_datasets),
         "gr_state_lanes": gr_pods,
         "gr_state_levels": list(GR_STATE_LEVELS),
         "k8s_state_datasets": k8s_state_datasets,
@@ -1002,6 +1015,16 @@ def _cluster_monitors_html(scenario_dir: Path, trigger: float, *, panel_id: str 
     ]
 
     if data.get("has_gr"):
+        if data.get("has_applier_queue"):
+            sections.extend(
+                [
+                    "<h3>GR applier queue depth</h3>",
+                    '<p class="monitor-subhead">Remote transactions waiting in the applier queue '
+                    "on each pod (<code>COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE</code>).</p>",
+                    '<div class="chart-wrap chart-wrap-sm">'
+                    f'<canvas id="grApplierQueueChart{suffix}"></canvas></div>',
+                ]
+            )
         sections.extend(
             [
                 "<h3>GR member state timeline</h3>",
@@ -1137,7 +1160,7 @@ CLUSTER_CHARTS_JS = """
             ds.pointHoverRadius = 4;
           }
           ds.borderWidth = ds.borderWidth || 1.5;
-          ds.stepped = "before";
+          ds.stepped = stateTimeline ? "before" : false;
           ds.fill = false;
           ds.tension = 0;
         });
@@ -1154,6 +1177,13 @@ CLUSTER_CHARTS_JS = """
       }
 
       if (clusterData.has_gr) {
+        if (clusterData.has_applier_queue) {
+          makeLineChart(
+            "grApplierQueueChart" + suffix,
+            clusterData.applier_datasets,
+            "Applier queue depth"
+          );
+        }
         makeLineChart(
           "grStateChart" + suffix,
           clusterData.gr_state_datasets,
