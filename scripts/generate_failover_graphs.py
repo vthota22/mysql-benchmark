@@ -80,6 +80,15 @@ def load_benchmark_config(edition_dir: Path, meta: dict[str, str]) -> dict[str, 
     return cfg
 
 
+def _display_cfg_gb(val: str) -> str:
+    """Pretty-print GB values stored shell-safe as 85GB in mysql_runtime.env."""
+    if val in ("", "N/A"):
+        return "N/A"
+    if val.endswith("GB") and " " not in val:
+        return f"{val[:-2]} GB"
+    return val
+
+
 def _mysql_runtime_meta_rows(cfg: dict[str, str]) -> list[tuple[str, str]]:
     """Key InnoDB / GR settings captured before the run."""
     rows: list[tuple[str, str]] = []
@@ -102,6 +111,8 @@ def _mysql_runtime_meta_rows(cfg: dict[str, str]) -> list[tuple[str, str]]:
     )
     for label, key in mapping:
         val = _cfg_value(cfg, key)
+        if key.endswith("_GB"):
+            val = _display_cfg_gb(val)
         if val != "N/A":
             rows.append((label, val))
     return rows
@@ -140,7 +151,7 @@ def _fmt_bytes_gb(num_bytes: str | int | float | None) -> str:
     except (TypeError, ValueError):
         return "N/A"
     if val <= 0:
-        return "N/A"
+        return "0 GB"
     gb = val / (1024**3)
     if abs(gb - round(gb)) < 0.05:
         return f"{int(round(gb))} GB"

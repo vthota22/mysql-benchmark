@@ -362,6 +362,7 @@ capture_mysql_runtime_metadata() {
       --ssl-mode=REQUIRED "${MYSQL_DB}" -N -B \
       -e "SHOW GLOBAL VARIABLES WHERE Variable_name IN (
         'innodb_buffer_pool_size',
+        'innodb_page_size',
         'innodb_redo_log_capacity',
         'innodb_log_file_size',
         'innodb_log_files_in_group',
@@ -379,7 +380,9 @@ capture_mysql_runtime_metadata() {
       -e "SHOW GLOBAL STATUS WHERE Variable_name IN (
         'Innodb_buffer_pool_read_requests',
         'Innodb_buffer_pool_reads',
-        'Innodb_buffer_pool_bytes_data'
+        'Innodb_buffer_pool_bytes_data',
+        'Innodb_buffer_pool_pages_data',
+        'Innodb_redo_log_capacity_resized'
       );"
   } > "${status_tsv}" 2>&1 || true
 
@@ -418,12 +421,15 @@ def to_int(val):
 
 
 def fmt_gb(num_bytes):
-    if num_bytes is None or num_bytes <= 0:
+    # Shell-safe: no spaces (values are sourced from mysql_runtime.env).
+    if num_bytes is None:
         return "N/A"
+    if num_bytes <= 0:
+        return "0GB"
     gb = num_bytes / (1024 ** 3)
     if abs(gb - round(gb)) < 0.05:
-        return f"{int(round(gb))} GB"
-    return f"{gb:.2f} GB"
+        return f"{int(round(gb))}GB"
+    return f"{gb:.2f}GB"
 
 
 def fmt_ratio(bp_bytes, data_gb):
@@ -447,6 +453,8 @@ status_map = read_tsv(status_tsv)
 bp_bytes = to_int(vars_map.get("innodb_buffer_pool_size"))
 redo_bytes = to_int(vars_map.get("innodb_redo_log_capacity"))
 if redo_bytes is None:
+    redo_bytes = to_int(status_map.get("Innodb_redo_log_capacity_resized"))
+if redo_bytes is None:
     log_size = to_int(vars_map.get("innodb_log_file_size"))
     log_files = to_int(vars_map.get("innodb_log_files_in_group")) or 2
     if log_size is not None:
@@ -456,6 +464,11 @@ data_gb = scale * tables * 0.1
 read_requests = to_int(status_map.get("Innodb_buffer_pool_read_requests"))
 reads = to_int(status_map.get("Innodb_buffer_pool_reads"))
 bp_data_bytes = to_int(status_map.get("Innodb_buffer_pool_bytes_data"))
+if bp_data_bytes is None:
+    pages_data = to_int(status_map.get("Innodb_buffer_pool_pages_data"))
+    page_size = to_int(vars_map.get("innodb_page_size")) or 16384
+    if pages_data is not None:
+        bp_data_bytes = pages_data * page_size
 
 
 def fmt_used_pct(used_bytes, limit_bytes):
@@ -525,13 +538,16 @@ PY
     echo "Captured MySQL runtime metadata: ${runtime_env}"
     # shellcheck disable=SC1090
     source "${runtime_env}" 2>/dev/null || true
-    echo "  Buffer pool limit:        ${BUFFER_POOL_GB:-N/A}"
-    echo "  Buffer pool used (VIP):   ${BUFFER_POOL_USED_GB:-N/A} (${BUFFER_POOL_USED_PCT:-N/A})"
-    echo "  Redo log capacity:        ${REDO_LOG_CAPACITY_GB:-N/A}"
-    echo "  Buffer pool hit %:        ${BUFFER_POOL_HIT_PCT:-N/A}"
-    echo "  Buffer pool / data ratio: ${BUFFER_POOL_DATA_RATIO:-N/A}"
-    echo "  replica_parallel_workers: ${REPLICA_PARALLEL_WORKERS:-N/A}"
-    echo "  GR flow control cert/appl: ${GR_FLOW_CONTROL_CERTIFIER_THRESHOLD:-N/A} / ${GR_FLOW_CONTROL_APPLIER_THRESHOLD:-N/A}"
+    _runtime_env_get() {
+      grep -m1 "^${1}=" "${runtime_env}" 2>/dev/null | cut -d= -f2- || echo "N/A"
+    }
+    echo "  Buffer pool limit:        $(_runtime_env_get BUFFER_POOL_GB)"
+    echo "  Buffer pool used (VIP):   $(_runtime_env_get BUFFER_POOL_USED_GB) ($(_runtime_env_get BUFFER_POOL_USED_PCT))"
+    echo "  Redo log capacity:        $(_runtime_env_get REDO_LOG_CAPACITY_GB)"
+    echo "  Buffer pool hit %:        $(_runtime_env_get BUFFER_POOL_HIT_PCT)"
+    echo "  Buffer pool / data ratio: $(_runtime_env_get BUFFER_POOL_DATA_RATIO)"
+    echo "  replica_parallel_workers: $(_runtime_env_get REPLICA_PARALLEL_WORKERS)"
+    echo "  GR flow control cert/appl: $(_runtime_env_get GR_FLOW_CONTROL_CERTIFIER_THRESHOLD) / $(_runtime_env_get GR_FLOW_CONTROL_APPLIER_THRESHOLD)"
     return 0
   fi
 
