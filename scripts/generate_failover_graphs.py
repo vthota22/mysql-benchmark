@@ -711,6 +711,12 @@ def load_gr_pod_monitor(scenario_dir: Path) -> list[dict[str, str | float]]:
         parts = line.split("\t")
         if len(parts) < 7:
             continue
+        # New format (13 cols): ... conflicts, gtid_seq
+        # Legacy (14 cols): ... conflicts, member_weight, gtid_seq
+        if len(parts) >= 14:
+            gtid_idx = 13
+        else:
+            gtid_idx = 12
         elapsed = float(parts[1])
         rows.append(
             {
@@ -727,8 +733,7 @@ def load_gr_pod_monitor(scenario_dir: Path) -> list[dict[str, str | float]]:
                 "remote_applied": parts[9] if len(parts) > 9 else "-1",
                 "tx_checked": parts[10] if len(parts) > 10 else "-1",
                 "conflicts": parts[11] if len(parts) > 11 else "-1",
-                "member_weight": parts[12] if len(parts) > 12 else "-1",
-                "gtid_seq": parts[13] if len(parts) > 13 else "0",
+                "gtid_seq": parts[gtid_idx] if len(parts) > gtid_idx else "0",
             }
         )
     return rows
@@ -810,7 +815,6 @@ def _build_queue_point(
         "state": str(row.get("gr_state", "")),
         "cert_queue": _monitor_float(row.get("cert_queue")),
         "applier_queue": _monitor_float(row.get("applier_queue")),
-        "member_weight": _monitor_float(row.get("member_weight")),
         "conflicts": _monitor_float(row.get("conflicts")),
         "gtid_seq": _monitor_float(row.get("gtid_seq"), 0),
     }
@@ -860,8 +864,6 @@ def build_gr_pre_failover_summary(
             dt = float(cur["sysbench_sec"]) - float(prev["sysbench_sec"])
             if prev_applied >= 0 and cur_applied >= 0 and dt > 0 and cur_applied >= prev_applied:
                 apply_rates.append((cur_applied - prev_applied) / dt)
-        weight_vals = [_monitor_float(r.get("member_weight")) for r in rows]
-        weights_ok = [w for w in weight_vals if w >= 0]
         pods_summary.append(
             {
                 "pod": pod,
@@ -870,7 +872,6 @@ def build_gr_pre_failover_summary(
                 "max_applier": max(appliers_ok) if appliers_ok else None,
                 "avg_cert": round(sum(certs_ok) / len(certs_ok), 2) if certs_ok else None,
                 "avg_apply_rate": round(sum(apply_rates) / len(apply_rates), 2) if apply_rates else None,
-                "member_weight": weights_ok[-1] if weights_ok else None,
             }
         )
 
@@ -894,7 +895,7 @@ def build_gr_pre_failover_summary(
     elif primary_after and lag_leader and not promoted_was_lag_leader:
         note = (
             f"Pre-trigger applier lag leader was {lag_leader}; promoted primary was {primary_after}. "
-            f"Election may reflect member_weight/operator label rather than lowest queue depth."
+            f"Election may reflect operator primary label rather than lowest queue depth."
         )
 
     return {
@@ -924,7 +925,7 @@ def write_gr_pre_failover_artifacts(scenario_dir: Path, trigger: float | None = 
         f"Pre-trigger applier lag leader: {summary.get('lag_leader_pod') or 'N/A'}",
         f"Promoted pod was lag leader: {'yes' if summary.get('promoted_was_lag_leader') else 'no'}",
         "",
-        f"{'Rank':<5} {'Pod':<35} {'AvgAppl':<10} {'MaxAppl':<10} {'AvgCert':<10} {'ApplyRate':<10} {'Weight':<8}",
+        f"{'Rank':<5} {'Pod':<35} {'AvgAppl':<10} {'MaxAppl':<10} {'AvgCert':<10} {'ApplyRate':<10}",
     ]
     for pod_row in summary.get("pods") or []:
         lines.append(
@@ -933,8 +934,7 @@ def write_gr_pre_failover_artifacts(scenario_dir: Path, trigger: float | None = 
             f"{pod_row.get('avg_applier', 'N/A')!s:<10} "
             f"{pod_row.get('max_applier', 'N/A')!s:<10} "
             f"{pod_row.get('avg_cert', 'N/A')!s:<10} "
-            f"{pod_row.get('avg_apply_rate', 'N/A')!s:<10} "
-            f"{pod_row.get('member_weight', 'N/A')!s:<8}"
+            f"{pod_row.get('avg_apply_rate', 'N/A')!s:<10}"
         )
     if summary.get("note"):
         lines.extend(["", str(summary["note"])])
@@ -1298,8 +1298,7 @@ def _cluster_gr_pre_failover_table_html(data: dict) -> str:
             f"<td>{html.escape(str(row.get('avg_applier', 'N/A')))}</td>"
             f"<td>{html.escape(str(row.get('max_applier', 'N/A')))}</td>"
             f"<td>{html.escape(str(row.get('avg_cert', 'N/A')))}</td>"
-            f"<td>{html.escape(str(row.get('avg_apply_rate', 'N/A')))}</td>"
-            f"<td>{html.escape(str(row.get('member_weight', 'N/A')))}</td></tr>"
+            f"<td>{html.escape(str(row.get('avg_apply_rate', 'N/A')))}</td></tr>"
         )
     note = summary.get("note")
     note_html = (
@@ -1311,7 +1310,7 @@ def _cluster_gr_pre_failover_table_html(data: dict) -> str:
         + note_html
         + '<table class="cluster-table"><thead><tr>'
         "<th>Pod</th><th>Rank</th><th>Avg applier</th><th>Max applier</th>"
-        "<th>Avg cert</th><th>Apply rate (txn/s)</th><th>member_weight</th>"
+        "<th>Avg cert</th><th>Apply rate (txn/s)</th>"
         "</tr></thead><tbody>"
         + "".join(body)
         + "</tbody></table>"
@@ -1367,7 +1366,7 @@ def _cluster_monitors_html(scenario_dir: Path, trigger: float, *, panel_id: str 
                     "<h3>GR applier queue depth</h3>",
                     '<p class="monitor-subhead">Remote transactions waiting in the applier queue '
                     "(<code>COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE</code>). "
-                    "Hover for role/state, cert queue, apply rate, and member_weight.</p>",
+                    "Hover for role/state, cert queue, and apply rate.</p>",
                     '<div class="chart-wrap chart-wrap-sm">'
                     f'<canvas id="grApplierQueueChart{suffix}"></canvas></div>',
                 ]
@@ -1470,7 +1469,6 @@ CLUSTER_CHARTS_JS = """
             if (pt.applier_queue >= 0) lines.push("  applier queue: " + pt.applier_queue);
             if (pt.delta_queue != null) lines.push("  delta queue: " + pt.delta_queue);
             if (pt.apply_rate != null) lines.push("  apply rate: " + pt.apply_rate + " txn/s");
-            if (pt.member_weight >= 0) lines.push("  member_weight: " + pt.member_weight);
             if (pt.conflicts >= 0) lines.push("  conflicts: " + pt.conflicts);
             if (pt.gtid_seq >= 0) lines.push("  gtid seq tail: " + pt.gtid_seq);
             return lines;

@@ -567,8 +567,6 @@ SELECT @@hostname,
        IFNULL((SELECT COUNT_CONFLICTS_DETECTED
                  FROM performance_schema.replication_group_member_stats
                 WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1),
-       IFNULL((SELECT MEMBER_WEIGHT FROM performance_schema.replication_group_members
-               WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1),
        IFNULL(CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(@@GLOBAL.gtid_executed, '\'':'\'', -1), '\''-'\'', -1) AS UNSIGNED), 0);"' 2>/dev/null || true
 }
 
@@ -638,7 +636,7 @@ start_gr_pod_monitor() {
   start_epoch=$(python3 -c "import time; print('%.3f' % time.time())")
 
   : > "${out_file}"
-  echo -e "timestamp_utc\telapsed_sec\tpod\tconnect_ok\thostname\tgr_member_role\tgr_member_state\tcert_queue\tapplier_queue\tremote_applied\ttx_checked\tconflicts\tmember_weight\tgtid_seq" >> "${out_file}"
+  echo -e "timestamp_utc\telapsed_sec\tpod\tconnect_ok\thostname\tgr_member_role\tgr_member_state\tcert_queue\tapplier_queue\tremote_applied\ttx_checked\tconflicts\tgtid_seq" >> "${out_file}"
   {
     echo "GR_POD_MONITOR_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "GR_POD_MONITOR_START_EPOCH=${start_epoch}"
@@ -649,7 +647,7 @@ start_gr_pod_monitor() {
 
   (
     local tick=0 target_epoch elapsed ts due_tick pod line host role state cert_q applier_q
-    local remote_applied tx_checked conflicts member_weight gtid_seq
+    local remote_applied tx_checked conflicts gtid_seq
     while true; do
       due_tick=$(python3 -c "
 import math, time
@@ -671,15 +669,14 @@ print(int(math.floor((time.time() - start) / interval)))
         [[ -n "${pod}" ]] || continue
         line=$(_failover_poll_gr_pod_once "${kubeconfig}" "${ns}" "${pod}")
         if [[ "${line}" == *$'\t'* ]]; then
-          IFS=$'\t' read -r host role state cert_q applier_q remote_applied tx_checked conflicts member_weight gtid_seq <<< "${line}"
+          IFS=$'\t' read -r host role state cert_q applier_q remote_applied tx_checked conflicts gtid_seq <<< "${line}"
           remote_applied="${remote_applied:--1}"
           tx_checked="${tx_checked:--1}"
           conflicts="${conflicts:--1}"
-          member_weight="${member_weight:--1}"
           gtid_seq="${gtid_seq:-0}"
-          echo -e "${ts}\t${elapsed}\t${pod}\t1\t${host}\t${role}\t${state}\t${cert_q}\t${applier_q}\t${remote_applied}\t${tx_checked}\t${conflicts}\t${member_weight}\t${gtid_seq}" >> "${out_file}"
+          echo -e "${ts}\t${elapsed}\t${pod}\t1\t${host}\t${role}\t${state}\t${cert_q}\t${applier_q}\t${remote_applied}\t${tx_checked}\t${conflicts}\t${gtid_seq}" >> "${out_file}"
         else
-          echo -e "${ts}\t${elapsed}\t${pod}\t0\tERROR\tERROR\tERROR\t-1\t-1\t-1\t-1\t-1\t-1\t0" >> "${out_file}"
+          echo -e "${ts}\t${elapsed}\t${pod}\t0\tERROR\tERROR\tERROR\t-1\t-1\t-1\t-1\t-1\t0" >> "${out_file}"
         fi
       done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
 
