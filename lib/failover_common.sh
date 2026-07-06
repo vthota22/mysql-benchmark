@@ -675,10 +675,13 @@ for item in sorted(doc.get("items") or [], key=lambda x: x.get("metadata", {}).g
         restarts = sum(int(c.get("restartCount") or 0) for c in containers)
     deleting = 1 if meta.get("deletionTimestamp") else 0
     is_target = 1 if target_pod and name == target_pod else 0
-    print(
-        f"{name}\t{phase}\t{ready_num}\t{ready_den}\t{restarts}\t{deleting}\t{is_target}",
-        flush=True,
-    )
+    try:
+        print(
+            f"{name}\t{phase}\t{ready_num}\t{ready_den}\t{restarts}\t{deleting}\t{is_target}",
+            flush=True,
+        )
+    except BrokenPipeError:
+        sys.exit(0)
 PY
 }
 
@@ -759,6 +762,7 @@ stop_gr_pod_monitor() {
     local pid
     pid=$(cat "${pid_file}")
     if kill -0 "${pid}" 2>/dev/null; then
+      pkill -TERM -P "${pid}" 2>/dev/null || true
       kill "${pid}" 2>/dev/null || true
       wait "${pid}" 2>/dev/null || true
     fi
@@ -866,6 +870,7 @@ stop_k8s_pods_monitor() {
     local pid
     pid=$(cat "${pid_file}")
     if kill -0 "${pid}" 2>/dev/null; then
+      pkill -TERM -P "${pid}" 2>/dev/null || true
       kill "${pid}" 2>/dev/null || true
       wait "${pid}" 2>/dev/null || true
     fi
@@ -1487,11 +1492,15 @@ start_failover_watchers() {
   fi
   if [[ "${edition}" == "advanced" ]]; then
     : > "${results_dir}/k8s_events.log"
-    if [[ "${FAILOVER_GR_POD_MONITOR:-1}" == "1" ]]; then
-      start_gr_pod_monitor "${results_dir}"
-    fi
-    if [[ "${FAILOVER_K8S_POD_MONITOR:-1}" == "1" ]]; then
-      start_k8s_pods_monitor "${results_dir}"
+    # GR/K8s pod monitors need scenario kubeconfig; when Advanced trigger prepare runs,
+    # they start once in failover_start_advanced_cluster_monitors (avoid stop/restart race).
+    if ! failover_advanced_trigger_active; then
+      if [[ "${FAILOVER_GR_POD_MONITOR:-1}" == "1" ]]; then
+        start_gr_pod_monitor "${results_dir}"
+      fi
+      if [[ "${FAILOVER_K8S_POD_MONITOR:-1}" == "1" ]]; then
+        start_k8s_pods_monitor "${results_dir}"
+      fi
     fi
   fi
 }
