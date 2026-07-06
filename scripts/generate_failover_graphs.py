@@ -320,12 +320,13 @@ def load_scenario_bundle(scenario_dir: Path) -> dict:
     )
     trx_profile = meta.get("TPCC_TRX_PROFILE", kpi.get("trx_profile", "mixed"))
     threads = infer_thread_count(scenario_dir, meta, bench)
-    trigger = float(meta.get("FAILOVER_TRIGGER_SECOND", "0"))
+    trigger_log = _scenario_trigger_log_sec(scenario_dir)
+    trigger_wall = _scenario_trigger_wall_sec(scenario_dir)
     baseline = float(parsed.get("BASELINE_TPS", "0"))
     recovery = float(parsed.get("RECOVERY_THRESHOLD", str(baseline * 0.9 if baseline else 0)))
-    outage_start = float(parsed.get("OUTAGE_START", trigger))
-    outage_end = float(parsed.get("OUTAGE_END", trigger))
-    cluster_data = build_cluster_monitor_chart_data(scenario_dir, trigger)
+    outage_start = float(parsed.get("OUTAGE_START", trigger_log))
+    outage_end = float(parsed.get("OUTAGE_END", trigger_log))
+    cluster_data = build_cluster_monitor_chart_data(scenario_dir, trigger_wall)
     return {
         "dir": str(scenario_dir),
         "edition": edition,
@@ -340,7 +341,8 @@ def load_scenario_bundle(scenario_dir: Path) -> dict:
         "extended": extended,
         "primary": primary,
         "bench": bench,
-        "trigger": trigger,
+        "trigger": trigger_log,
+        "trigger_wall": trigger_wall,
         "baseline": baseline,
         "recovery": recovery,
         "outage_start": outage_start,
@@ -352,7 +354,7 @@ def load_scenario_bundle(scenario_dir: Path) -> dict:
             "err": [r["err_per_sec"] for r in rows],
             "reconn": [r["reconn_per_sec"] for r in rows],
             "lat_p95": [r["lat_p95_ms"] for r in rows],
-            "trigger_sec": trigger,
+            "trigger_sec": trigger_log,
             "baseline_tps": baseline,
             "recovery_threshold": recovery,
             "outage_start": outage_start,
@@ -678,10 +680,19 @@ def _meta_rows_for_bundle(bundle: dict) -> list[tuple[str, str]]:
     event = bundle["event"]
     parsed = bundle["parsed"]
     trigger = bundle["trigger"]
+    trigger_wall = float(bundle.get("trigger_wall", trigger))
     threads = bundle["threads"]
     baseline_tps, baseline_qps, baseline_lat = _resolve_baseline_metrics(
         parsed, bundle.get("rows", []), trigger
     )
+    trigger_rows: list[tuple[str, str]] = []
+    if trigger_wall != trigger:
+        trigger_rows = [
+            ("Trigger second (log)", str(int(trigger)) if trigger else "N/A"),
+            ("Trigger second (wall)", str(int(trigger_wall)) if trigger_wall else "N/A"),
+        ]
+    else:
+        trigger_rows = [("Trigger second", str(int(trigger)) if trigger else "N/A")]
     return [
         ("Edition", bundle["edition"]),
         ("Scenario", bundle["scenario"]),
@@ -695,7 +706,7 @@ def _meta_rows_for_bundle(bundle: dict) -> list[tuple[str, str]]:
         *_edition_metadata_rows(Path(bundle["dir"]), bench),
         ("Sysbench start (UTC)", meta.get("SYSBENCH_START_UTC", "N/A")),
         ("Failover trigger (UTC)", event.get("FAILOVER_TRIGGER_UTC", "N/A")),
-        ("Trigger second", str(int(trigger)) if trigger else "N/A"),
+        *trigger_rows,
         ("Trigger method", event.get("FAILOVER_METHOD", "N/A")),
         ("Target pod", event.get("FAILOVER_TARGET_POD", "N/A")),
         ("Baseline TPS", f"{baseline_tps:.2f}" if baseline_tps else "N/A"),
@@ -991,7 +1002,7 @@ def build_gr_pre_failover_summary(
 
 def write_gr_pre_failover_artifacts(scenario_dir: Path, trigger: float | None = None) -> Path | None:
     if trigger is None:
-        trigger = _scenario_trigger_sec(scenario_dir)
+        trigger = _scenario_trigger_wall_sec(scenario_dir)
     summary = build_gr_pre_failover_summary(scenario_dir, trigger)
     if not summary:
         return None
@@ -1040,12 +1051,55 @@ def write_gr_pre_failover_artifacts(scenario_dir: Path, trigger: float | None = 
     return txt_path
 
 
+def _scenario_trigger_wall_sec(scenario_dir: Path) -> float:
+    """Wall-clock sysbench second when failover fires (warmup + baseline); aligns monitors."""
+    for path in (scenario_dir / "failover_timeseries_meta.txt", scenario_dir / "sysbench_timing.txt"):
+        timing = load_metadata(path)
+        for key in ("FAILOVER_TRIGGER_WALL_SECOND", "FAILOVER_TRIGGER_SECOND"):
+            val = timing.get(key)
+            if val:
+                try:
+                    return float(val)
+                except ValueError:
+                    pass
+    return 120.0
+
+
+def _scenario_trigger_log_sec(scenario_dir: Path) -> float:
+    """Sysbench report-interval second for TPS/QPS charts (excludes warmup silence)."""
+    for path in (scenario_dir / "failover_timeseries_meta.txt", scenario_dir / "sysbench_timing.txt"):
+        timing = load_metadata(path)
+        val = timing.get("FAILOVER_TRIGGER_LOG_SECOND")
+        if val:
+            try:
+                return float(val)
+            except ValueError:
+                pass
+        try:
+            warmup = float(timing.get("FAILOVER_WARMUP_SEC", "0"))
+            baseline = float(timing.get("FAILOVER_BASELINE_SEC", 120))
+            if warmup > 0:
+                return baseline
+            wall_raw = timing.get("FAILOVER_TRIGGER_WALL_SECOND") or timing.get("FAILOVER_TRIGGER_SECOND")
+            if wall_raw:
+                wall = float(wall_raw)
+                if wall > baseline:
+                    return baseline
+                return wall
+        except ValueError:
+            pass
+        wall = timing.get("FAILOVER_TRIGGER_WALL_SECOND") or timing.get("FAILOVER_TRIGGER_SECOND")
+        if wall:
+            try:
+                return float(wall)
+            except ValueError:
+                pass
+    return 120.0
+
+
 def _scenario_trigger_sec(scenario_dir: Path) -> float:
-    timing = load_metadata(scenario_dir / "sysbench_timing.txt")
-    try:
-        return float(timing.get("FAILOVER_TRIGGER_SECOND", 120))
-    except ValueError:
-        return 120.0
+    """Log-axis trigger for throughput charts (backward-compatible alias)."""
+    return _scenario_trigger_log_sec(scenario_dir)
 
 
 def load_k8s_pods_monitor(scenario_dir: Path) -> list[dict[str, str | float]]:
@@ -1789,7 +1843,7 @@ def _select_monitor_transition_rows(
 def _monitor_trigger_table_html(scenario_dir: Path, bundle: dict) -> str:
     """HTML table: primary before / at delete / through promotion (per scenario panel)."""
     monitor_rows = load_primary_monitor(scenario_dir)
-    trigger = float(bundle.get("trigger", 0))
+    trigger = float(bundle.get("trigger_wall", bundle.get("trigger", 0)))
     primary_before = bundle.get("primary", {}).get("PRIMARY_BEFORE", "")
     primary_after = bundle.get("primary", {}).get("PRIMARY_AFTER", "")
     scenario = bundle.get("scenario", "")
@@ -2035,7 +2089,12 @@ def plot_comparison(
             continue
         rows = load_timeseries(ts_path)
         meta = load_metadata(meta_path)
-        trigger = float(meta.get("FAILOVER_TRIGGER_SECOND", "0"))
+        trigger = float(
+            meta.get("FAILOVER_TRIGGER_LOG_SECOND")
+            or meta.get("FAILOVER_TRIGGER_SECOND", "0")
+        )
+        if trigger <= 0:
+            trigger = _scenario_trigger_log_sec(edition_dir)
         edition = edition_dir.name
         color = colors.get(edition, None)
 
@@ -2783,15 +2842,20 @@ def generate_html_report(
     extended = extended or {}
     primary = primary or {}
     bench = load_benchmark_config(edition_dir, meta)
-    trigger = float(meta.get("FAILOVER_TRIGGER_SECOND", "0"))
+    trigger_log = _scenario_trigger_log_sec(edition_dir)
+    trigger_wall = _scenario_trigger_wall_sec(edition_dir)
+    if not meta.get("FAILOVER_TRIGGER_LOG_SECOND"):
+        meta.setdefault("FAILOVER_TRIGGER_LOG_SECOND", str(int(trigger_log)))
+    if not meta.get("FAILOVER_TRIGGER_WALL_SECOND"):
+        meta.setdefault("FAILOVER_TRIGGER_WALL_SECOND", str(int(trigger_wall)))
     scenario = meta.get("FAILOVER_SCENARIO", edition_dir.name if edition_dir.name in {"mixed", "write_only"} else "default")
     trx_profile = meta.get("TPCC_TRX_PROFILE", kpi.get("trx_profile", "mixed"))
     edition = resolve_edition_name(edition_dir, meta, event, kpi, bench)
     enrich_cluster_metadata(bench, edition)
-    baseline_tps, baseline_qps, baseline_lat = _resolve_baseline_metrics(parsed, rows, trigger)
+    baseline_tps, baseline_qps, baseline_lat = _resolve_baseline_metrics(parsed, rows, trigger_log)
     recovery = float(parsed.get("RECOVERY_THRESHOLD", str(baseline_tps * 0.9 if baseline_tps else 0)))
-    outage_start = float(parsed.get("OUTAGE_START", trigger))
-    outage_end = float(parsed.get("OUTAGE_END", trigger))
+    outage_start = float(parsed.get("OUTAGE_START", trigger_log))
+    outage_end = float(parsed.get("OUTAGE_END", trigger_log))
 
     elapsed = [r["elapsed_sec"] for r in rows]
     chart_data = {
@@ -2801,7 +2865,7 @@ def generate_html_report(
         "err": [r["err_per_sec"] for r in rows],
         "reconn": [r["reconn_per_sec"] for r in rows],
         "lat_p95": [r["lat_p95_ms"] for r in rows],
-        "trigger_sec": trigger,
+        "trigger_sec": trigger_log,
         "baseline_tps": baseline_tps,
         "recovery_threshold": recovery,
         "outage_start": outage_start,
@@ -2815,6 +2879,13 @@ def generate_html_report(
                 f'<li><a href="{html.escape(png.name)}">{html.escape(png.name)}</a></li>'
             )
 
+    if trigger_wall != trigger_log:
+        trigger_meta_rows = [
+            ("Trigger second (log)", str(int(trigger_log)) if trigger_log else "N/A"),
+            ("Trigger second (wall)", str(int(trigger_wall)) if trigger_wall else "N/A"),
+        ]
+    else:
+        trigger_meta_rows = [("Trigger second", str(int(trigger_log)) if trigger_log else "N/A")]
     meta_rows = [
         ("Edition", edition),
         ("Scenario", scenario),
@@ -2828,7 +2899,7 @@ def generate_html_report(
         *_edition_metadata_rows(edition_dir, bench),
         ("Sysbench start (UTC)", meta.get("SYSBENCH_START_UTC", "N/A")),
         ("Failover trigger (UTC)", event.get("FAILOVER_TRIGGER_UTC", "N/A")),
-        ("Trigger second", str(int(trigger)) if trigger else "N/A"),
+        *trigger_meta_rows,
         ("Trigger method", event.get("FAILOVER_METHOD", "N/A")),
         ("Target pod", event.get("FAILOVER_TARGET_POD", "N/A")),
         ("Baseline TPS", f"{baseline_tps:.2f}" if baseline_tps else "N/A"),
@@ -2839,8 +2910,15 @@ def generate_html_report(
         ),
     ]
     meta_html = _meta_table_html(meta_rows)
-    cluster_data = build_cluster_monitor_chart_data(edition_dir, trigger)
-    cluster_html = _cluster_monitors_html(edition_dir, trigger)
+    cluster_data = build_cluster_monitor_chart_data(edition_dir, trigger_wall)
+    cluster_html = _cluster_monitors_html(edition_dir, trigger_wall)
+    monitor_bundle = {
+        "trigger": trigger_log,
+        "trigger_wall": trigger_wall,
+        "primary": primary,
+        "event": event,
+        "scenario": scenario,
+    }
 
     out_path = edition_dir / "graphs" / "failover_report.html"
     out_path.parent.mkdir(exist_ok=True)
@@ -2958,11 +3036,11 @@ def generate_html_report(
       </div>
       <div class="card">
         <h2>Primary transition at trigger</h2>
-        {_monitor_trigger_table_html(edition_dir, {"trigger": trigger, "primary": primary, "event": event, "scenario": scenario})}
+        {_monitor_trigger_table_html(edition_dir, monitor_bundle)}
       </div>
       <div class="card">
         <h2>Metrics before vs after failover</h2>
-        {_before_after_throughput_table_html({"rows": rows, "trigger": trigger, "parsed": parsed, "kpi": kpi, "extended": extended})}
+        {_before_after_throughput_table_html({"rows": rows, "trigger": trigger_log, "parsed": parsed, "kpi": kpi, "extended": extended})}
       </div>
       <div class="card">
         <h2>Failover metrics</h2>
@@ -3137,7 +3215,7 @@ def generate_combined_sweep_html_report(
         monitor_html = _monitor_trigger_table_html(Path(bundle["dir"]), bundle)
         compare_html = _before_after_throughput_table_html(bundle)
         cluster_html = _cluster_monitors_html(
-            Path(bundle["dir"]), float(bundle["trigger"]), panel_id=panel_id
+            Path(bundle["dir"]), float(bundle.get("trigger_wall", bundle["trigger"])), panel_id=panel_id
         )
         chart_payload[key] = bundle["chart_data"]
         cluster_payload[key] = bundle.get("cluster_data") or {}
@@ -3466,7 +3544,12 @@ def generate_png_for_edition(
     meta: dict[str, str],
     parsed: dict[str, str],
 ) -> list[Path]:
-    trigger = float(meta.get("FAILOVER_TRIGGER_SECOND", "0"))
+    trigger = float(
+        meta.get("FAILOVER_TRIGGER_LOG_SECOND")
+        or meta.get("FAILOVER_TRIGGER_SECOND", "0")
+    )
+    if trigger <= 0:
+        trigger = _scenario_trigger_log_sec(edition_dir)
     edition = meta.get("FAILOVER_EDITION", edition_dir.name)
     baseline = float(parsed.get("BASELINE_TPS", "0"))
     recovery = float(parsed.get("RECOVERY_THRESHOLD", str(baseline * 0.9)))

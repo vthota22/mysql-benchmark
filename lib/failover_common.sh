@@ -260,6 +260,65 @@ failover_trigger_second() {
   echo $((FAILOVER_WARMUP_SEC + FAILOVER_BASELINE_SEC))
 }
 
+# Sysbench --report-interval timeline (excludes warmup); used for TPS/QPS graphs and analysis.
+failover_trigger_log_second() {
+  failover_defaults
+  if [[ -n "${FAILOVER_TRIGGER_LOG_SECOND:-}" ]]; then
+    echo "${FAILOVER_TRIGGER_LOG_SECOND}"
+    return 0
+  fi
+  echo "${FAILOVER_BASELINE_SEC}"
+}
+
+# Resolve log-axis trigger from a completed run (backward compatible with pre-warmup runs).
+failover_trigger_log_second_from_timing() {
+  local timing_file="${1:-}"
+  failover_defaults
+  if [[ -f "${timing_file}" ]]; then
+    local val warmup baseline wall
+    val=$(grep -E '^FAILOVER_TRIGGER_LOG_SECOND=' "${timing_file}" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+    if [[ -n "${val}" ]]; then
+      echo "${val}"
+      return 0
+    fi
+    warmup=$(grep -E '^FAILOVER_WARMUP_SEC=' "${timing_file}" 2>/dev/null | tail -1 | cut -d= -f2- || echo "0")
+    baseline=$(grep -E '^FAILOVER_BASELINE_SEC=' "${timing_file}" 2>/dev/null | tail -1 | cut -d= -f2- || echo "${FAILOVER_BASELINE_SEC}")
+    wall=$(grep -E '^FAILOVER_TRIGGER_SECOND=' "${timing_file}" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+    if [[ "${warmup}" =~ ^[0-9]+$ ]] && (( warmup > 0 )); then
+      echo "${baseline}"
+      return 0
+    fi
+    if [[ -n "${wall}" && "${wall}" =~ ^[0-9]+$ && "${baseline}" =~ ^[0-9]+$ ]] && (( wall > baseline )); then
+      # Pre-fix runs stored wall second only (warmup + baseline) without LOG/WARMUP keys.
+      echo "${baseline}"
+      return 0
+    fi
+    if [[ -n "${wall}" ]]; then
+      echo "${wall}"
+      return 0
+    fi
+  fi
+  failover_trigger_log_second
+}
+
+failover_trigger_wall_second_from_timing() {
+  local timing_file="${1:-}"
+  if [[ -f "${timing_file}" ]]; then
+    local val
+    val=$(grep -E '^FAILOVER_TRIGGER_WALL_SECOND=' "${timing_file}" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+    if [[ -n "${val}" ]]; then
+      echo "${val}"
+      return 0
+    fi
+    val=$(grep -E '^FAILOVER_TRIGGER_SECOND=' "${timing_file}" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+    if [[ -n "${val}" ]]; then
+      echo "${val}"
+      return 0
+    fi
+  fi
+  failover_trigger_second
+}
+
 _failover_tee_linebuffer() {
   if command -v stdbuf >/dev/null 2>&1; then
     stdbuf -oL -eL tee "$@"
@@ -1568,6 +1627,11 @@ run_tpcc_failover_load() {
   echo "FAILOVER_EDITION=${FAILOVER_EDITION:-advanced}" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_SCENARIO=${scenario}" >> "${results_dir}/sysbench_timing.txt"
   echo "TPCC_TRX_PROFILE=${trx_profile}" >> "${results_dir}/sysbench_timing.txt"
+  echo "FAILOVER_WARMUP_SEC=${FAILOVER_WARMUP_SEC}" >> "${results_dir}/sysbench_timing.txt"
+  echo "FAILOVER_BASELINE_SEC=${FAILOVER_BASELINE_SEC}" >> "${results_dir}/sysbench_timing.txt"
+  echo "FAILOVER_OBSERVE_SEC=${FAILOVER_OBSERVE_SEC}" >> "${results_dir}/sysbench_timing.txt"
+  echo "FAILOVER_TRIGGER_WALL_SECOND=$(failover_trigger_second)" >> "${results_dir}/sysbench_timing.txt"
+  echo "FAILOVER_TRIGGER_LOG_SECOND=$(failover_trigger_log_second)" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_TRIGGER_SECOND=$(failover_trigger_second)" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_TOTAL_SEC=${total_time}" >> "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_MYSQL_IGNORE_ERRORS=${ignore_errors}" >> "${results_dir}/sysbench_timing.txt"
@@ -1888,8 +1952,9 @@ export_failover_timeseries() {
   local csv_file="${results_dir}/failover_timeseries.csv"
   local meta_file="${results_dir}/failover_timeseries_meta.txt"
 
-  local trigger_second start_utc edition scenario trx_profile
-  trigger_second=$(failover_trigger_second)
+  local trigger_log trigger_wall start_utc edition scenario trx_profile
+  trigger_wall=$(failover_trigger_wall_second_from_timing "${timing_file}")
+  trigger_log=$(failover_trigger_log_second_from_timing "${timing_file}")
   start_utc=""
   edition="${FAILOVER_EDITION:-advanced}"
   scenario="mixed"
@@ -1898,7 +1963,8 @@ export_failover_timeseries() {
   if [[ -f "${timing_file}" ]]; then
     # shellcheck disable=SC1090
     source "${timing_file}" 2>/dev/null || true
-    trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
+    trigger_wall=$(failover_trigger_wall_second_from_timing "${timing_file}")
+    trigger_log=$(failover_trigger_log_second_from_timing "${timing_file}")
     start_utc="${SYSBENCH_START_UTC:-}"
     edition="${FAILOVER_EDITION:-${edition}}"
     scenario="${FAILOVER_SCENARIO:-mixed}"
@@ -1913,7 +1979,9 @@ export_failover_timeseries() {
     echo "SYSBENCH_START_UTC=${start_utc}"
     echo "FAILOVER_SCENARIO=${scenario:-mixed}"
     echo "TPCC_TRX_PROFILE=${trx_profile:-mixed}"
-    echo "FAILOVER_TRIGGER_SECOND=${trigger_second}"
+    echo "FAILOVER_TRIGGER_WALL_SECOND=${trigger_wall}"
+    echo "FAILOVER_TRIGGER_LOG_SECOND=${trigger_log}"
+    echo "FAILOVER_TRIGGER_SECOND=${trigger_wall}"
     echo "FAILOVER_EDITION=${edition}"
   } > "${meta_file}"
 
@@ -1925,7 +1993,7 @@ export_failover_timeseries() {
       "${results_dir}/../benchmark_config.env" >> "${meta_file}" 2>/dev/null || true
   fi
 
-  awk -v trigger="${trigger_second}" \
+  awk -v trigger="${trigger_log}" \
       -f - "${sysbench_log}" > "${csv_file}" <<'AWK'
 function parse_line(line,    i, n, f, sec, tps, qps, err, reconn, lat95) {
   n = split(line, f, " ")
@@ -2137,14 +2205,16 @@ analyze_failover_metrics() {
 
   failover_defaults
 
-  local trigger_second scenario trx_profile
-  trigger_second=$(failover_trigger_second)
+  local trigger_log trigger_wall scenario trx_profile
+  trigger_wall=$(failover_trigger_wall_second_from_timing "${timing_file}")
+  trigger_log=$(failover_trigger_log_second_from_timing "${timing_file}")
   scenario="mixed"
   trx_profile="mixed"
   if [[ -f "${timing_file}" ]]; then
     # shellcheck disable=SC1090
     source "${timing_file}" 2>/dev/null || true
-    trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
+    trigger_wall=$(failover_trigger_wall_second_from_timing "${timing_file}")
+    trigger_log=$(failover_trigger_log_second_from_timing "${timing_file}")
     scenario="${FAILOVER_SCENARIO:-mixed}"
     trx_profile="${TPCC_TRX_PROFILE:-mixed}"
   fi
@@ -2163,7 +2233,7 @@ analyze_failover_metrics() {
     return 1
   fi
 
-  _failover_parse_sysbench_intervals "${sysbench_log}" "${trigger_second}" \
+  _failover_parse_sysbench_intervals "${sysbench_log}" "${trigger_log}" \
     "${FAILOVER_RECOVERY_THRESHOLD}" "${FAILOVER_RECOVERY_STABLE_SEC}" \
     "${FAILOVER_OUTAGE_TPS_RATIO}" "${FAILOVER_OBSERVE_SEC}" > "${parsed_file}"
 
@@ -2179,7 +2249,12 @@ analyze_failover_metrics() {
     echo "TPC-C trx profile:    ${trx_profile}"
     echo "Trigger method:       ${method}"
     echo "Trigger UTC:          ${trigger_utc:-N/A}"
-    echo "Trigger second:       ${trigger_second} (from sysbench start)"
+    if [[ "${trigger_wall}" != "${trigger_log}" ]]; then
+      echo "Trigger second (wall):  ${trigger_wall} (warmup + baseline, harness sleep)"
+      echo "Trigger second (log):   ${trigger_log} (sysbench report timeline / graphs)"
+    else
+      echo "Trigger second:       ${trigger_log} (from sysbench start)"
+    fi
     echo ""
     echo "--- Throughput ---"
     printf "Baseline TPS (avg):   %.2f\n" "${BASELINE_TPS}"
@@ -2247,8 +2322,9 @@ write_failover_kpi() {
 
   failover_defaults
 
-  local trigger_second edition trigger_utc scenario trx_profile
-  trigger_second=$(failover_trigger_second)
+  local trigger_log trigger_wall edition trigger_utc scenario trx_profile
+  trigger_wall=$(failover_trigger_wall_second_from_timing "${timing_file}")
+  trigger_log=$(failover_trigger_log_second_from_timing "${timing_file}")
   edition="unknown"
   trigger_utc=""
   scenario="mixed"
@@ -2257,7 +2333,8 @@ write_failover_kpi() {
   if [[ -f "${timing_file}" ]]; then
     # shellcheck disable=SC1090
     source "${timing_file}" 2>/dev/null || true
-    trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
+    trigger_wall=$(failover_trigger_wall_second_from_timing "${timing_file}")
+    trigger_log=$(failover_trigger_log_second_from_timing "${timing_file}")
     scenario="${FAILOVER_SCENARIO:-mixed}"
     trx_profile="${TPCC_TRX_PROFILE:-mixed}"
   fi
@@ -2295,7 +2372,8 @@ write_failover_kpi() {
     return 1
   fi
 
-  awk -v trigger="${trigger_second}" \
+  awk -v log_trigger="${trigger_log}" \
+      -v wall_trigger="${trigger_wall}" \
       -v edition="${edition}" \
       -v scenario="${scenario}" \
       -v trx_profile="${trx_profile}" \
@@ -2321,15 +2399,15 @@ function load_timeseries(    line, f, sec) {
     reconn_arr[sec] = f[6] + 0
     lat_arr[sec] = f[7] + 0
     if (sec > load_end) load_end = sec
-    if (sec < trigger && tps_arr[sec] > 0) {
+    if (sec < log_trigger && tps_arr[sec] > 0) {
       pre_tps_sum += tps_arr[sec]
       pre_tps_cnt++
     }
-    if (sec < trigger && qps_arr[sec] > 0) {
+    if (sec < log_trigger && qps_arr[sec] > 0) {
       pre_qps_sum += qps_arr[sec]
       pre_qps_cnt++
     }
-    if (sec < trigger) {
+    if (sec < log_trigger) {
       pre_err_sum += err_arr[sec]
       pre_reconn_sum += reconn_arr[sec]
       pre_err_cnt++
@@ -2342,7 +2420,7 @@ function load_timeseries(    line, f, sec) {
   qps_thresh = baseline_qps * recovery_pct
   outage_tps = baseline_tps * outage_ratio
   outage_qps = baseline_qps * outage_ratio
-  observe_end = trigger + observe_sec
+  observe_end = log_trigger + observe_sec
   if (load_end > observe_end) observe_end = load_end
 }
 function detect_connect_failure_ttd(    sysbench_sec) {
@@ -2352,8 +2430,8 @@ function detect_connect_failure_ttd(    sysbench_sec) {
     split(line, f, "\t")
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
-    if (sysbench_sec < trigger) continue
-    if (f[3] != "1") return sysbench_sec - trigger
+    if (sysbench_sec < wall_trigger) continue
+    if (f[3] != "1") return sysbench_sec - wall_trigger
   }
   close(monitor)
   return -1
@@ -2361,16 +2439,16 @@ function detect_connect_failure_ttd(    sysbench_sec) {
 function count_write_probe_failures(recovery_rel, election_rel,    sysbench_sec, wo, end_abs, count) {
   count = 0
   end_abs = observe_end
-  if (recovery_rel >= 0) end_abs = trigger + recovery_rel
-  if (election_rel >= 0 && trigger + election_rel > end_abs)
-    end_abs = trigger + election_rel
+  if (recovery_rel >= 0) end_abs = log_trigger + recovery_rel
+  if (election_rel >= 0 && log_trigger + election_rel > end_abs)
+    end_abs = log_trigger + election_rel
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return 0
   close(monitor)
   while ((getline line < monitor) > 0) {
     split(line, f, "\t")
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
-    if (sysbench_sec < trigger || sysbench_sec > end_abs) continue
+    if (sysbench_sec < wall_trigger || sysbench_sec > end_abs) continue
     if (f[3] != "1") continue
     wo = monitor_write_ok(f)
     if (wo == 0) count++
@@ -2410,13 +2488,13 @@ function detect_primary_election_from_monitor(    sysbench_sec, saw_connect_fail
     split(line, f, "\t")
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
-    if (sysbench_sec < trigger) continue
+    if (sysbench_sec < wall_trigger) continue
     if (!saw_connect_fail) {
       if (f[3] != "1") saw_connect_fail = 1
       else continue
     }
     if (is_primary_elected(f))
-      return sysbench_sec - trigger
+      return sysbench_sec - wall_trigger
   }
   close(monitor)
   return -1
@@ -2424,12 +2502,12 @@ function detect_primary_election_from_monitor(    sysbench_sec, saw_connect_fail
 function detect_app_recovery_rto(    sec, stable_count, rto) {
   stable_count = 0
   rto = -1
-  for (sec = trigger; sec <= observe_end; sec++) {
+  for (sec = log_trigger; sec <= observe_end; sec++) {
     if (!(sec in tps_arr)) continue
     if (baseline_tps > 0 && tps_arr[sec] >= tps_thresh) {
       stable_count++
       if (stable_count >= stable && rto < 0) {
-        rto = sec - trigger - stable + 2
+        rto = sec - log_trigger - stable + 2
         if (rto < 0) rto = 0
       }
     } else {
@@ -2440,9 +2518,9 @@ function detect_app_recovery_rto(    sec, stable_count, rto) {
 }
 function dip_duration(failure_rel, recovery_rel,    sec, start, end, count) {
   count = 0
-  start = trigger + (failure_rel >= 0 ? failure_rel : 0)
+  start = log_trigger + (failure_rel >= 0 ? failure_rel : 0)
   end = observe_end
-  if (recovery_rel >= 0) end = trigger + recovery_rel - 1
+  if (recovery_rel >= 0) end = log_trigger + recovery_rel - 1
   for (sec = start; sec <= end; sec++) {
     if (!(sec in tps_arr)) continue
     if (baseline_tps > 0 && tps_arr[sec] < tps_thresh) count++
@@ -2451,10 +2529,10 @@ function dip_duration(failure_rel, recovery_rel,    sec, start, end, count) {
 }
 function peak_latency(failure_rel, recovery_rel,    sec, start, end, peak) {
   peak = 0
-  start = trigger + (failure_rel >= 0 ? failure_rel : 0)
+  start = log_trigger + (failure_rel >= 0 ? failure_rel : 0)
   end = observe_end
   if (recovery_rel >= 0) {
-    end = trigger + recovery_rel + stable
+    end = log_trigger + recovery_rel + stable
     if (end > observe_end) end = observe_end
   }
   for (sec = start; sec <= end; sec++) {
@@ -2474,9 +2552,9 @@ function failover_errors_in_window(fail_rel, recovery_rel,    sec, start, end, s
   }
   sum = 0
   peak = 0
-  start = trigger + (fail_rel >= 0 ? fail_rel : 0)
+  start = log_trigger + (fail_rel >= 0 ? fail_rel : 0)
   end = observe_end
-  if (recovery_rel >= 0) end = trigger + recovery_rel
+  if (recovery_rel >= 0) end = log_trigger + recovery_rel
   for (sec = start; sec <= end; sec++) {
     excess_err = 0
     excess_reconn = 0
@@ -2554,13 +2632,13 @@ write_failover_promotion_breakdown() {
 
   [[ -f "${monitor}" ]] || return 0
 
-  local trigger_second edition
-  trigger_second=$(failover_trigger_second)
+  local trigger_wall edition
+  trigger_wall=$(failover_trigger_wall_second_from_timing "${timing_file}")
   edition="unknown"
   if [[ -f "${timing_file}" ]]; then
     # shellcheck disable=SC1090
     source "${timing_file}" 2>/dev/null || true
-    trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
+    trigger_wall=$(failover_trigger_wall_second_from_timing "${timing_file}")
   fi
   if [[ -f "${event_file}" ]]; then
     edition=$(grep -E '^FAILOVER_EDITION=' "${event_file}" | tail -1 | cut -d= -f2- || echo "unknown")
@@ -2591,7 +2669,7 @@ write_failover_promotion_breakdown() {
     gr_election_source="${GR_ELECTION_SOURCE:-mysql_pod_logs}"
   fi
 
-  awk -v trigger="${trigger_second}" \
+  awk -v wall_trigger="${trigger_wall}" \
       -v edition="${edition}" \
       -v monitor="${monitor}" \
       -v gr_monitor="${gr_monitor}" \
@@ -2647,28 +2725,28 @@ function scan_ha_monitor(    line, f, sysbench_sec, host, wo) {
     sysbench_sec = (f[2] + 0) - monitor_offset
     host = f[4]
     wo = monitor_write_ok(f)
-    if (primary_before == "N/A" && sysbench_sec < trigger && f[3] == "1" && host != "ERROR")
+    if (primary_before == "N/A" && sysbench_sec < wall_trigger && f[3] == "1" && host != "ERROR")
       primary_before = host
-    if (sysbench_sec < trigger) continue
+    if (sysbench_sec < wall_trigger) continue
     if (stale_ha_end < 0 && f[3] == "1" && host == primary_before && wo == 1)
-      stale_ha_end = sysbench_sec - trigger
+      stale_ha_end = sysbench_sec - wall_trigger
     if (ttd < 0 && f[3] != "1") {
-      ttd = sysbench_sec - trigger
+      ttd = sysbench_sec - wall_trigger
       continue
     }
     if (ttd < 0) continue
     if (vip_connect < 0 && f[3] == "1") {
-      vip_connect = sysbench_sec - trigger
+      vip_connect = sysbench_sec - wall_trigger
       if (wo != 1) vip_connect_only = vip_connect
     }
     if (vip_connect_only < 0 && f[3] == "1" && wo != 1)
-      vip_connect_only = sysbench_sec - trigger
+      vip_connect_only = sysbench_sec - wall_trigger
     if (new_host < 0 && f[3] == "1" && host != "ERROR" && primary_before != "N/A" && host != primary_before)
-      new_host = sysbench_sec - trigger
+      new_host = sysbench_sec - wall_trigger
     if (gr_on_vip < 0 && is_primary_elected(f))
-      gr_on_vip = sysbench_sec - trigger
+      gr_on_vip = sysbench_sec - wall_trigger
     if (write_ok < 0 && is_primary_elected(f))
-      write_ok = sysbench_sec - trigger
+      write_ok = sysbench_sec - wall_trigger
   }
   close(monitor)
 }
@@ -2680,12 +2758,12 @@ function scan_gr_pods(    line, f, sysbench_sec, rel, pod, role, state) {
     if (f[1] == "timestamp_utc") continue
     if (f[4] != "1") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
-    if (sysbench_sec < trigger) continue
+    if (sysbench_sec < wall_trigger) continue
     role = f[6]
     state = f[7]
     pod = f[3]
     if (role == "PRIMARY" && (state == "ONLINE" || state == "PRIMARY")) {
-      rel = sysbench_sec - trigger
+      rel = sysbench_sec - wall_trigger
       if (gr_pod_primary < 0 || rel < gr_pod_primary) {
         gr_pod_primary = rel
         gr_pod_primary_name = pod
@@ -2770,7 +2848,7 @@ BEGIN {
     "Total time to promote (same as primary_election_sec KPI)")
 
   print "=== Failover Promotion Breakdown ===" > txt_out
-  print "Reference: seconds from failover trigger (sysbench second " trigger ")" >> txt_out
+  print "Reference: seconds from failover trigger (monitor/sysbench wall second " wall_trigger ")" >> txt_out
   print "Primary before failover: " primary_before >> txt_out
   if (gr_pod_primary_name != "") print "GR PRIMARY pod (internal): " gr_pod_primary_name >> txt_out
   print "" >> txt_out
@@ -2852,13 +2930,15 @@ write_failover_extended_metrics() {
   local check_result="${results_dir}/tpcc_check_result.env"
   local k8s_log="${results_dir}/k8s_events.log"
   local do_log="${results_dir}/do_events.log"
-  local trigger_log="${results_dir}/failover_trigger.log"
+  local trigger_log_file="${results_dir}/failover_trigger.log"
   local sysbench_log="${results_dir}/sysbench_run.log"
+  local timing_file="${results_dir}/sysbench_timing.txt"
 
   failover_defaults
 
-  local trigger_second trigger_utc edition method target_pod scenario trx_profile
-  trigger_second=$(failover_trigger_second)
+  local trigger_log trigger_wall trigger_utc edition method target_pod scenario trx_profile
+  trigger_wall=$(failover_trigger_wall_second_from_timing "${timing_file}")
+  trigger_log=$(failover_trigger_log_second_from_timing "${timing_file}")
   trigger_utc=""
   edition="unknown"
   method="unknown"
@@ -2866,10 +2946,11 @@ write_failover_extended_metrics() {
   scenario="mixed"
   trx_profile="mixed"
 
-  if [[ -f "${results_dir}/sysbench_timing.txt" ]]; then
+  if [[ -f "${timing_file}" ]]; then
     # shellcheck disable=SC1090
-    source "${results_dir}/sysbench_timing.txt" 2>/dev/null || true
-    trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
+    source "${timing_file}" 2>/dev/null || true
+    trigger_wall=$(failover_trigger_wall_second_from_timing "${timing_file}")
+    trigger_log=$(failover_trigger_log_second_from_timing "${timing_file}")
     scenario="${FAILOVER_SCENARIO:-mixed}"
     trx_profile="${TPCC_TRX_PROFILE:-mixed}"
   fi
@@ -2912,7 +2993,8 @@ write_failover_extended_metrics() {
     fi
   fi
 
-  awk -v trigger="${trigger_second}" \
+  awk -v log_trigger="${trigger_log}" \
+      -v wall_trigger="${trigger_wall}" \
       -v trigger_utc="${trigger_utc}" \
       -v edition="${edition}" \
       -v scenario="${scenario}" \
@@ -2932,7 +3014,7 @@ write_failover_extended_metrics() {
       -v timeseries="${timeseries}" \
       -v k8s_log="${k8s_log}" \
       -v do_log="${do_log}" \
-      -v trigger_log="${trigger_log}" \
+      -v trigger_log_file="${trigger_log_file}" \
       -v sysbench_log="${sysbench_log}" \
       -v generated_utc="${generated_utc}" \
       -f - > "${out_file}" <<'AWK'
@@ -2998,14 +3080,14 @@ function load_timeseries(    f, sec, tps, qps, err, reconn, lat, max_sec) {
     err_arr[sec] = err
     reconn_arr[sec] = reconn
     if (sec > max_sec) max_sec = sec
-    if (sec < trigger && tps > 0) { pre_sum += tps; pre_cnt++ }
-    if (sec < trigger && qps > 0) { pre_qps_sum += qps; pre_qps_cnt++ }
-    if (sec < trigger) {
+    if (sec < log_trigger && tps > 0) { pre_sum += tps; pre_cnt++ }
+    if (sec < log_trigger && qps > 0) { pre_qps_sum += qps; pre_qps_cnt++ }
+    if (sec < log_trigger) {
       pre_err_sum += err
       pre_reconn_sum += reconn
       pre_err_cnt++
     }
-    if (sec >= trigger) {
+    if (sec >= log_trigger) {
       if (min_tps_post == 0 || tps < min_tps_post) min_tps_post = tps
       if (min_qps_post == 0 || qps < min_qps_post) min_qps_post = qps
       if (lat > max_lat_post) max_lat_post = lat
@@ -3040,12 +3122,12 @@ function is_primary_elected(f,    wo, role, gr) {
 function compute_rto(    sec, stable_count, computed) {
   computed = -1
   stable_count = 0
-  for (sec = trigger; sec <= load_end_sec; sec++) {
+  for (sec = log_trigger; sec <= load_end_sec; sec++) {
     if (!(sec in tps_arr)) continue
     if (baseline > 0 && tps_arr[sec] >= recovery_threshold) {
       stable_count++
       if (stable_count >= stable && computed < 0) {
-        computed = sec - trigger - stable + 2
+        computed = sec - log_trigger - stable + 2
         if (computed < 0) computed = 0
       }
     } else {
@@ -3061,8 +3143,8 @@ function detect_connect_failure_ttd(    sysbench_sec) {
     split(line, f, "\t")
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
-    if (sysbench_sec < trigger) continue
-    if (f[3] != "1") return sysbench_sec - trigger
+    if (sysbench_sec < wall_trigger) continue
+    if (f[3] != "1") return sysbench_sec - wall_trigger
   }
   close(monitor)
   return -1
@@ -3075,16 +3157,16 @@ function phase_duration(end_rel, start_rel) {
 function count_write_probe_failures(rto_rel, promote_rel,    sysbench_sec, wo, end_abs, count) {
   count = 0
   end_abs = load_end_sec
-  if (rto_rel >= 0) end_abs = trigger + rto_rel
-  if (promote_rel >= 0 && trigger + promote_rel > end_abs)
-    end_abs = trigger + promote_rel
+  if (rto_rel >= 0) end_abs = log_trigger + rto_rel
+  if (promote_rel >= 0 && log_trigger + promote_rel > end_abs)
+    end_abs = log_trigger + promote_rel
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return 0
   close(monitor)
   while ((getline line < monitor) > 0) {
     split(line, f, "\t")
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
-    if (sysbench_sec < trigger || sysbench_sec > end_abs) continue
+    if (sysbench_sec < wall_trigger || sysbench_sec > end_abs) continue
     if (f[3] != "1") continue
     wo = monitor_write_ok(f)
     if (wo == 0) count++
@@ -3100,9 +3182,9 @@ function failover_tx_failures(fail_rel, rto_rel,    sec, start, end, sum, baseli
     baseline_reconn = pre_reconn_sum / pre_err_cnt
   }
   sum = 0
-  start = trigger + (fail_rel >= 0 ? fail_rel : 0)
+  start = log_trigger + (fail_rel >= 0 ? fail_rel : 0)
   end = load_end_sec
-  if (rto_rel >= 0) end = trigger + rto_rel
+  if (rto_rel >= 0) end = log_trigger + rto_rel
   for (sec = start; sec <= end; sec++) {
     if (sec in err_arr) {
       excess_err = err_arr[sec] - baseline_err
@@ -3125,20 +3207,20 @@ function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec, saw_connect_fa
     elapsed = f[2] + 0
     sysbench_sec = elapsed - monitor_offset
     if (f[3] != "1") {
-      if (sysbench_sec >= trigger && connect_fail < 0)
-        connect_fail = sysbench_sec - trigger
-      if (sysbench_sec >= trigger) saw_connect_fail = 1
+      if (sysbench_sec >= wall_trigger && connect_fail < 0)
+        connect_fail = sysbench_sec - wall_trigger
+      if (sysbench_sec >= wall_trigger) saw_connect_fail = 1
       continue
     }
     host = f[4]
     ro = f[5] + 0
     gr = monitor_gr_state(f)
-    if (primary_before == "N/A" && sysbench_sec < trigger) primary_before = host
-    if (sysbench_sec >= trigger) {
+    if (primary_before == "N/A" && sysbench_sec < wall_trigger) primary_before = host
+    if (sysbench_sec >= wall_trigger) {
       if (!saw_connect_fail) {
         continue
       } else if (promote_sec < 0 && is_primary_elected(f)) {
-        promote_sec = sysbench_sec - trigger
+        promote_sec = sysbench_sec - wall_trigger
       }
       if (primary_after == "N/A" && host != "ERROR") primary_after = host
     }
@@ -3180,7 +3262,7 @@ END {
   if (pre_qps_cnt > 0) baseline_qps = pre_qps_sum / pre_qps_cnt
 
   failure_detect = detect_connect_failure_ttd()
-  if (failure_detect >= 0) failure_detect_abs = trigger + failure_detect
+  if (failure_detect >= 0) failure_detect_abs = wall_trigger + failure_detect
   promote_after_detect = phase_duration(promote_sec, failure_detect)
 
   computed_rto = compute_rto()
@@ -3196,7 +3278,12 @@ END {
   print "TPC-C profile:            " trx_profile
   print "Trigger method:           " method
   print "Trigger UTC:              " (trigger_utc != "" ? trigger_utc : "N/A")
-  print "Trigger second:           " trigger " (from sysbench start)"
+  if (log_trigger != wall_trigger) {
+    print "Trigger second (wall):    " wall_trigger " (warmup + baseline, monitor alignment)"
+    print "Trigger second (log):     " log_trigger " (sysbench report timeline / graphs)"
+  } else {
+    print "Trigger second:           " log_trigger " (from sysbench start)"
+  }
   print "Target pod:               " (target_pod != "" ? target_pod : "N/A")
   print ""
   print "--- Timing ---"
@@ -3243,10 +3330,10 @@ END {
   printf "Write probe failures (poll count, connect_ok=1 & write_ok=0; not seconds — see note): %d\n", writes_failed
   print ""
   print "--- Load continuity ---"
-  printf "Sysbench data ends at sec:      %d (expect ~%d)\n", load_end_sec, trigger + stable
-  if (load_end_sec > 0 && load_end_sec < trigger + 10)
+  printf "Sysbench data ends at sec:      %d (expect ~%d)\n", load_end_sec, log_trigger + stable
+  if (load_end_sec > 0 && load_end_sec < log_trigger + 10)
     print "WARNING: Sysbench stopped early — reconnect metrics may be incomplete"
-  if (load_end_sec > 0 && load_end_sec < trigger)
+  if (load_end_sec > 0 && load_end_sec < log_trigger)
     print "WARNING: Load ended BEFORE trigger second — failover metrics invalid"
   if (fatal_count > 0)
     printf "FATAL errors in sysbench log:   %d\n", fatal_count
@@ -3258,7 +3345,7 @@ END {
   print "Set FAILOVER_RUN_TPCC_CHECK=1 to validate TPC-C invariants after failover."
   print ""
   print "--- Control plane ---"
-  if (trigger_log != "") print "Trigger log:              " trigger_log
+  if (trigger_log_file != "") print "Trigger log:              " trigger_log_file
   if (do_log != "") print "DO API events log:        " do_log
   if (k8s_log != "") {
     print "K8s events log:           " k8s_log
@@ -3395,17 +3482,19 @@ reanalyze_failover_scenario() {
   failover_defaults
 
   if [[ -f "${sysbench_log}" ]]; then
-    local trigger_second
-    trigger_second=$(failover_trigger_second)
+    local trigger_log
+    trigger_log=$(failover_trigger_log_second_from_timing "${timing_file}")
     if [[ -f "${timing_file}" ]]; then
       # shellcheck disable=SC1090
       source "${timing_file}" 2>/dev/null || true
-      trigger_second="${FAILOVER_TRIGGER_SECOND:-${trigger_second}}"
+      trigger_log=$(failover_trigger_log_second_from_timing "${timing_file}")
     fi
-    _failover_parse_sysbench_intervals "${sysbench_log}" "${trigger_second}" \
+    _failover_parse_sysbench_intervals "${sysbench_log}" "${trigger_log}" \
       "${FAILOVER_RECOVERY_THRESHOLD}" "${FAILOVER_RECOVERY_STABLE_SEC}" \
       "${FAILOVER_OUTAGE_TPS_RATIO}" "${FAILOVER_OBSERVE_SEC}" > "${parsed_file}"
   fi
+
+  export_failover_timeseries "${scenario_dir}" 2>/dev/null || true
 
   _failover_backfill_observability_artifacts "${scenario_dir}"
 
