@@ -128,6 +128,31 @@ tpcc_approx_data_size_label() {
   }'
 }
 
+# Copy mysql_runtime.env fields into per-scenario sysbench_timing.txt (if captured).
+_append_mysql_runtime_to_timing() {
+  local results_dir="${1:?results dir required}"
+  local timing_file="${results_dir}/sysbench_timing.txt"
+  local edition_dir="${results_dir}"
+  local base name runtime_file key
+
+  while [[ "${edition_dir}" != "/" ]]; do
+    base="$(basename "${edition_dir}")"
+    if [[ "${base}" == "advanced" || "${base}" == "standard" ]]; then
+      runtime_file="${edition_dir}/mysql_runtime.env"
+      if [[ -f "${runtime_file}" ]]; then
+        for key in BUFFER_POOL_GB REDO_LOG_CAPACITY_GB BUFFER_POOL_HIT_PCT \
+          BUFFER_POOL_DATA_RATIO REPLICA_PARALLEL_WORKERS \
+          GR_FLOW_CONTROL_CERTIFIER_THRESHOLD GR_FLOW_CONTROL_APPLIER_THRESHOLD; do
+          val=$(grep -E "^${key}=" "${runtime_file}" | tail -1 | cut -d= -f2- || true)
+          [[ -n "${val}" ]] && echo "${key}=${val}" >> "${timing_file}"
+        done
+      fi
+      return 0
+    fi
+    edition_dir="$(dirname "${edition_dir}")"
+  done
+}
+
 write_failover_benchmark_config() {
   local edition_dir="${1:?edition dir required}"
   local edition="${2:?edition required}"
@@ -532,7 +557,19 @@ SELECT @@hostname,
                 WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1),
        IFNULL((SELECT COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE
                  FROM performance_schema.replication_group_member_stats
-                WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1);"' 2>/dev/null || true
+                WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1),
+       IFNULL((SELECT COUNT_TRANSACTIONS_REMOTE_APPLIED
+                 FROM performance_schema.replication_group_member_stats
+                WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1),
+       IFNULL((SELECT COUNT_TRANSACTIONS_CHECKED
+                 FROM performance_schema.replication_group_member_stats
+                WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1),
+       IFNULL((SELECT COUNT_CONFLICTS_DETECTED
+                 FROM performance_schema.replication_group_member_stats
+                WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1),
+       IFNULL((SELECT MEMBER_WEIGHT FROM performance_schema.replication_group_members
+               WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1),
+       IFNULL(CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(@@GLOBAL.gtid_executed, '\'':'\'', -1), '\''-'\'', -1) AS UNSIGNED), 0);"' 2>/dev/null || true
 }
 
 _failover_poll_k8s_mysql_pods_once() {
@@ -601,7 +638,7 @@ start_gr_pod_monitor() {
   start_epoch=$(python3 -c "import time; print('%.3f' % time.time())")
 
   : > "${out_file}"
-  echo -e "timestamp_utc\telapsed_sec\tpod\tconnect_ok\thostname\tgr_member_role\tgr_member_state\tcert_queue\tapplier_queue" >> "${out_file}"
+  echo -e "timestamp_utc\telapsed_sec\tpod\tconnect_ok\thostname\tgr_member_role\tgr_member_state\tcert_queue\tapplier_queue\tremote_applied\ttx_checked\tconflicts\tmember_weight\tgtid_seq" >> "${out_file}"
   {
     echo "GR_POD_MONITOR_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "GR_POD_MONITOR_START_EPOCH=${start_epoch}"
@@ -612,6 +649,7 @@ start_gr_pod_monitor() {
 
   (
     local tick=0 target_epoch elapsed ts due_tick pod line host role state cert_q applier_q
+    local remote_applied tx_checked conflicts member_weight gtid_seq
     while true; do
       due_tick=$(python3 -c "
 import math, time
@@ -633,17 +671,15 @@ print(int(math.floor((time.time() - start) / interval)))
         [[ -n "${pod}" ]] || continue
         line=$(_failover_poll_gr_pod_once "${kubeconfig}" "${ns}" "${pod}")
         if [[ "${line}" == *$'\t'* ]]; then
-          host=${line%%$'\t'*}
-          rest=${line#*$'\t'}
-          role=${rest%%$'\t'*}
-          rest=${rest#*$'\t'}
-          state=${rest%%$'\t'*}
-          rest=${rest#*$'\t'}
-          cert_q=${rest%%$'\t'*}
-          applier_q=${rest#*$'\t'}
-          echo -e "${ts}\t${elapsed}\t${pod}\t1\t${host}\t${role}\t${state}\t${cert_q}\t${applier_q}" >> "${out_file}"
+          IFS=$'\t' read -r host role state cert_q applier_q remote_applied tx_checked conflicts member_weight gtid_seq <<< "${line}"
+          remote_applied="${remote_applied:--1}"
+          tx_checked="${tx_checked:--1}"
+          conflicts="${conflicts:--1}"
+          member_weight="${member_weight:--1}"
+          gtid_seq="${gtid_seq:-0}"
+          echo -e "${ts}\t${elapsed}\t${pod}\t1\t${host}\t${role}\t${state}\t${cert_q}\t${applier_q}\t${remote_applied}\t${tx_checked}\t${conflicts}\t${member_weight}\t${gtid_seq}" >> "${out_file}"
         else
-          echo -e "${ts}\t${elapsed}\t${pod}\t0\tERROR\tERROR\tERROR\t-1\t-1" >> "${out_file}"
+          echo -e "${ts}\t${elapsed}\t${pod}\t0\tERROR\tERROR\tERROR\t-1\t-1\t-1\t-1\t-1\t-1\t0" >> "${out_file}"
         fi
       done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
 
@@ -1476,6 +1512,7 @@ run_tpcc_failover_load() {
   echo "TPCC_TABLES=${TPCC_TABLES:-10}" >> "${results_dir}/sysbench_timing.txt"
   echo "TPCC_THREADS=${FAILOVER_THREADS}" >> "${results_dir}/sysbench_timing.txt"
   echo "PREP_THREADS=${PREP_THREADS:-16}" >> "${results_dir}/sysbench_timing.txt"
+  _append_mysql_runtime_to_timing "${results_dir}"
 
   : > "${log_file}"
 
@@ -2116,6 +2153,11 @@ analyze_failover_metrics() {
   write_failover_extended_metrics "${results_dir}"
   write_failover_kpi "${results_dir}"
   write_failover_promotion_breakdown "${results_dir}"
+
+  if [[ -f "${BENCH_ROOT}/scripts/generate_failover_graphs.py" ]]; then
+    python3 "${BENCH_ROOT}/scripts/generate_failover_graphs.py" --gr-pre-failover "${results_dir}" \
+      2>/dev/null || true
+  fi
 
   echo "Analysis written: ${analysis_file}"
   echo "Metrics CSV:      ${csv_file}"

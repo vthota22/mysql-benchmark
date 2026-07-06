@@ -221,6 +221,13 @@ run_failover_edition() {
     || { echo "Aborting ${edition}: cannot connect"; return 1; }
   echo ""
 
+  write_failover_benchmark_config "${edition_dir}" "${edition}"
+
+  echo "--- MySQL runtime metadata (caching / GR) ---"
+  capture_mysql_runtime_metadata "${edition}" "${edition_dir}" \
+    "${TPCC_TABLES:-10}" "${TPCC_SCALE:-100}" || true
+  echo ""
+
   if [[ "${edition}" == "advanced" ]]; then
     ensure_pmm_integration "${edition_dir}" \
       || { echo "Aborting ${edition}: PMM integration check/apply failed"; return 1; }
@@ -229,8 +236,6 @@ run_failover_edition() {
       || { echo "Aborting ${edition}: HAProxy health check apply failed"; return 1; }
     echo ""
   fi
-
-  write_failover_benchmark_config "${edition_dir}" "${edition}"
 
   if [[ "${SKIP_PREPARE:-0}" != "1" ]]; then
     echo "--- Prepare TPC-C data (threads=${PREP_THREADS:-16}) ---"

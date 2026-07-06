@@ -54,6 +54,24 @@ mysql_connectivity_check "${EDITION}" "${RESULTS_ROOT}/mysql_info.txt" \
   || { echo "ERROR: cannot connect to ${EDITION} cluster"; exit 1; }
 echo ""
 
+echo "--- MySQL runtime metadata (caching / GR) ---"
+capture_mysql_runtime_metadata "${EDITION}" "${RESULTS_ROOT}" \
+  "${TPCC_TABLES:-10}" "${TPCC_SCALE:-100}" || true
+if [[ -f "${RESULTS_ROOT}/mysql_runtime.env" ]]; then
+  # shellcheck disable=SC1090
+  source "${RESULTS_ROOT}/mysql_runtime.env" 2>/dev/null || true
+  {
+    echo "BUFFER_POOL_GB=${BUFFER_POOL_GB:-N/A}"
+    echo "REDO_LOG_CAPACITY_GB=${REDO_LOG_CAPACITY_GB:-N/A}"
+    echo "BUFFER_POOL_HIT_PCT=${BUFFER_POOL_HIT_PCT:-N/A}"
+    echo "BUFFER_POOL_DATA_RATIO=${BUFFER_POOL_DATA_RATIO:-N/A}"
+    echo "REPLICA_PARALLEL_WORKERS=${REPLICA_PARALLEL_WORKERS:-N/A}"
+    echo "GR_FLOW_CONTROL_CERTIFIER_THRESHOLD=${GR_FLOW_CONTROL_CERTIFIER_THRESHOLD:-N/A}"
+    echo "GR_FLOW_CONTROL_APPLIER_THRESHOLD=${GR_FLOW_CONTROL_APPLIER_THRESHOLD:-N/A}"
+  } >> "${META_FILE}"
+fi
+echo ""
+
 echo "--- Cleanup (ignore errors if empty) ---"
 export TPCC_THREADS="${PREP_THREADS:-16}"
 run_tpcc_command cleanup 2>&1 | tee "${RESULTS_ROOT}/cleanup.log" || true
@@ -62,18 +80,31 @@ echo ""
 echo "--- Prepare (tables=${TPCC_TABLES:-10}, scale=${TPCC_SCALE:-100}, threads=${PREP_THREADS:-16}) ---"
 PREP_START=$(date +%s)
 run_tpcc_command prepare 2>&1 | tee "${PREPARE_LOG}"
+prep_rc=${PIPESTATUS[0]}
 PREP_END=$(date +%s)
 echo "Prepare duration: $((PREP_END - PREP_START))s"
+if (( prep_rc != 0 )); then
+  echo "ERROR: sysbench prepare failed (exit ${prep_rc}) — see ${PREPARE_LOG}" >&2
+  echo "PREPARE_CHECK_OK=0" >> "${META_FILE}"
+  exit 1
+fi
+if grep -qE 'FATAL:|ERROR.*prepare' "${PREPARE_LOG}" 2>/dev/null; then
+  echo "ERROR: sysbench prepare reported FATAL errors — see ${PREPARE_LOG}" >&2
+  echo "PREPARE_CHECK_OK=0" >> "${META_FILE}"
+  exit 1
+fi
 echo ""
 
 echo "--- Check ---"
-if run_tpcc_command check 2>&1 | tee "${CHECK_LOG}"; then
-  echo "PREPARE_CHECK_OK=1" >> "${META_FILE}"
-else
+run_tpcc_command check 2>&1 | tee "${CHECK_LOG}"
+check_rc=${PIPESTATUS[0]}
+if (( check_rc != 0 )) || grep -qE 'FATAL:|SQL error' "${CHECK_LOG}" 2>/dev/null; then
   echo "PREPARE_CHECK_OK=0" >> "${META_FILE}"
-  echo "ERROR: TPC-C check failed after prepare" >&2
+  echo "ERROR: TPC-C check failed after prepare (exit ${check_rc}) — see ${CHECK_LOG}" >&2
+  echo "Hint: tables missing usually means prepare did not finish — review ${PREPARE_LOG}" >&2
   exit 1
 fi
+echo "PREPARE_CHECK_OK=1" >> "${META_FILE}"
 echo ""
 
 echo "PREPARE_FINISHED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${META_FILE}"

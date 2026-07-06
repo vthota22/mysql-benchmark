@@ -334,3 +334,191 @@ run_mysql_settings_check() {
   fi
   echo ""
 }
+
+# Capture InnoDB/GR runtime settings + buffer pool hit rate before benchmark/prepare.
+# Writes mysql_variables.tsv, mysql_status_at_start.tsv, mysql_runtime.env and
+# merges key fields into benchmark_config.env (when present).
+capture_mysql_runtime_metadata() {
+  local edition="${1:?edition required}"
+  local dest_dir="${2:?dest dir required}"
+  local tables="${3:-${TPCC_TABLES:-10}}"
+  local scale="${4:-${TPCC_SCALE:-100}}"
+
+  set_mysql_env_for_edition "${edition}"
+
+  local vars_tsv="${dest_dir}/mysql_variables.tsv"
+  local status_tsv="${dest_dir}/mysql_status_at_start.tsv"
+  local runtime_env="${dest_dir}/mysql_runtime.env"
+  local bench_cfg="${dest_dir}/benchmark_config.env"
+  local captured_utc
+  captured_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  mkdir -p "${dest_dir}"
+
+  {
+    echo "# ${edition} — ${captured_utc}"
+    echo "# host=${MYSQL_HOST}:${MYSQL_PORT} db=${MYSQL_DB}"
+    mysql -h "${MYSQL_HOST}" -P "${MYSQL_PORT}" -u "${MYSQL_USER}" -p"${MYSQL_PASSWORD}" \
+      --ssl-mode=REQUIRED "${MYSQL_DB}" -N -B \
+      -e "SHOW GLOBAL VARIABLES WHERE Variable_name IN (
+        'innodb_buffer_pool_size',
+        'innodb_redo_log_capacity',
+        'innodb_log_file_size',
+        'innodb_log_files_in_group',
+        'replica_parallel_workers',
+        'group_replication_flow_control_certifier_threshold',
+        'group_replication_flow_control_applier_threshold'
+      ) ORDER BY Variable_name;"
+  } > "${vars_tsv}" 2>&1 || true
+
+  {
+    echo "# ${edition} — ${captured_utc}"
+    echo "# host=${MYSQL_HOST}:${MYSQL_PORT} db=${MYSQL_DB}"
+    mysql -h "${MYSQL_HOST}" -P "${MYSQL_PORT}" -u "${MYSQL_USER}" -p"${MYSQL_PASSWORD}" \
+      --ssl-mode=REQUIRED "${MYSQL_DB}" -N -B \
+      -e "SHOW GLOBAL STATUS WHERE Variable_name IN (
+        'Innodb_buffer_pool_read_requests',
+        'Innodb_buffer_pool_reads'
+      ) ORDER BY Variable_name;"
+  } > "${status_tsv}" 2>&1 || true
+
+  MYSQL_RUNTIME_TABLES="${tables}" MYSQL_RUNTIME_SCALE="${scale}" \
+  python3 - "${vars_tsv}" "${status_tsv}" "${runtime_env}" "${bench_cfg}" "${captured_utc}" \
+    "${edition}" "${MYSQL_HOST}" "${MYSQL_PORT}" "${MYSQL_DB}" <<'PY'
+import os
+import sys
+
+vars_tsv, status_tsv, runtime_env, bench_cfg, captured_utc, edition, host, port, db = sys.argv[1:10]
+tables = float(os.environ.get("MYSQL_RUNTIME_TABLES", "10"))
+scale = float(os.environ.get("MYSQL_RUNTIME_SCALE", "100"))
+
+
+def read_tsv(path):
+    out = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t", 1)
+                if len(parts) == 2:
+                    out[parts[0]] = parts[1]
+    except OSError:
+        pass
+    return out
+
+
+def to_int(val):
+    try:
+        return int(str(val).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def fmt_gb(num_bytes):
+    if num_bytes is None or num_bytes <= 0:
+        return "N/A"
+    gb = num_bytes / (1024 ** 3)
+    if abs(gb - round(gb)) < 0.05:
+        return f"{int(round(gb))} GB"
+    return f"{gb:.2f} GB"
+
+
+def fmt_ratio(bp_bytes, data_gb):
+    if bp_bytes is None or bp_bytes <= 0 or data_gb <= 0:
+        return "N/A"
+    ratio = (bp_bytes / (1024 ** 3)) / data_gb
+    return f"{ratio:.3f}x"
+
+
+def fmt_hit_pct(read_requests, reads):
+    if read_requests is None or read_requests <= 0:
+        return "N/A"
+    reads = reads or 0
+    hit = max(0.0, min(100.0, (1.0 - (reads / read_requests)) * 100.0))
+    return f"{hit:.2f}%"
+
+
+vars_map = read_tsv(vars_tsv)
+status_map = read_tsv(status_tsv)
+
+bp_bytes = to_int(vars_map.get("innodb_buffer_pool_size"))
+redo_bytes = to_int(vars_map.get("innodb_redo_log_capacity"))
+if redo_bytes is None:
+    log_size = to_int(vars_map.get("innodb_log_file_size"))
+    log_files = to_int(vars_map.get("innodb_log_files_in_group")) or 2
+    if log_size is not None:
+        redo_bytes = log_size * log_files
+
+data_gb = scale * tables * 0.1
+read_requests = to_int(status_map.get("Innodb_buffer_pool_read_requests"))
+reads = to_int(status_map.get("Innodb_buffer_pool_reads"))
+
+replica_workers = vars_map.get("replica_parallel_workers", "N/A") or "N/A"
+gr_cert = vars_map.get("group_replication_flow_control_certifier_threshold", "N/A") or "N/A"
+gr_apply = vars_map.get("group_replication_flow_control_applier_threshold", "N/A") or "N/A"
+
+fields = {
+    "MYSQL_RUNTIME_CAPTURED_UTC": captured_utc,
+    "MYSQL_RUNTIME_EDITION": edition,
+    "MYSQL_RUNTIME_HOST": f"{host}:{port}",
+    "MYSQL_RUNTIME_DB": db,
+    "BUFFER_POOL_BYTES": str(bp_bytes if bp_bytes is not None else ""),
+    "BUFFER_POOL_GB": fmt_gb(bp_bytes),
+    "REDO_LOG_CAPACITY_BYTES": str(redo_bytes if redo_bytes is not None else ""),
+    "REDO_LOG_CAPACITY_GB": fmt_gb(redo_bytes),
+    "BUFFER_POOL_HIT_PCT": fmt_hit_pct(read_requests, reads),
+    "BUFFER_POOL_DATA_RATIO": fmt_ratio(bp_bytes, data_gb),
+    "TPCC_DATA_SIZE_GB": f"{data_gb:.1f}",
+    "REPLICA_PARALLEL_WORKERS": str(replica_workers),
+    "GR_FLOW_CONTROL_CERTIFIER_THRESHOLD": str(gr_cert),
+    "GR_FLOW_CONTROL_APPLIER_THRESHOLD": str(gr_apply),
+}
+
+lines = [f"{k}={v}" for k, v in fields.items()]
+with open(runtime_env, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines) + "\n")
+
+merge_keys = (
+    "BUFFER_POOL_GB",
+    "REDO_LOG_CAPACITY_GB",
+    "BUFFER_POOL_HIT_PCT",
+    "BUFFER_POOL_DATA_RATIO",
+    "REPLICA_PARALLEL_WORKERS",
+    "GR_FLOW_CONTROL_CERTIFIER_THRESHOLD",
+    "GR_FLOW_CONTROL_APPLIER_THRESHOLD",
+    "MYSQL_RUNTIME_CAPTURED_UTC",
+)
+if os.path.isfile(bench_cfg):
+    existing = {}
+    with open(bench_cfg, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            existing[key] = val
+    for key in merge_keys:
+        existing[key] = fields[key]
+    with open(bench_cfg, "w", encoding="utf-8") as f:
+        for key, val in existing.items():
+            f.write(f"{key}={val}\n")
+PY
+
+  if [[ -f "${runtime_env}" ]]; then
+    echo "Captured MySQL runtime metadata: ${runtime_env}"
+    # shellcheck disable=SC1090
+    source "${runtime_env}" 2>/dev/null || true
+    echo "  Buffer pool:              ${BUFFER_POOL_GB:-N/A}"
+    echo "  Redo log capacity:        ${REDO_LOG_CAPACITY_GB:-N/A}"
+    echo "  Buffer pool hit %:        ${BUFFER_POOL_HIT_PCT:-N/A}"
+    echo "  Buffer pool / data ratio: ${BUFFER_POOL_DATA_RATIO:-N/A}"
+    echo "  replica_parallel_workers: ${REPLICA_PARALLEL_WORKERS:-N/A}"
+    echo "  GR flow control cert/appl: ${GR_FLOW_CONTROL_CERTIFIER_THRESHOLD:-N/A} / ${GR_FLOW_CONTROL_APPLIER_THRESHOLD:-N/A}"
+    return 0
+  fi
+
+  echo "WARNING: Failed to capture MySQL runtime metadata for ${edition}" >&2
+  return 1
+}

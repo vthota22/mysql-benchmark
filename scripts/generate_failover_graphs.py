@@ -66,14 +66,43 @@ def load_metadata(path: Path) -> dict[str, str]:
 def load_benchmark_config(edition_dir: Path, meta: dict[str, str]) -> dict[str, str]:
     """Merge edition + scenario benchmark config for HTML metadata."""
     cfg: dict[str, str] = {}
-    edition_cfg = edition_dir.parent / "benchmark_config.env"
+    edition_root = parent_edition_dir(edition_dir) or edition_dir
+    edition_cfg = edition_root / "benchmark_config.env"
     if edition_cfg.exists():
         cfg.update(load_metadata(edition_cfg))
+    runtime_cfg = edition_root / "mysql_runtime.env"
+    if runtime_cfg.exists():
+        cfg.update(load_metadata(runtime_cfg))
     timing = edition_dir / "sysbench_timing.txt"
     if timing.exists():
         cfg.update(load_metadata(timing))
     cfg.update(meta)
     return cfg
+
+
+def _mysql_runtime_meta_rows(cfg: dict[str, str]) -> list[tuple[str, str]]:
+    """Key InnoDB / GR settings captured before the run."""
+    rows: list[tuple[str, str]] = []
+    mapping = (
+        ("Buffer pool", "BUFFER_POOL_GB"),
+        ("Redo log capacity", "REDO_LOG_CAPACITY_GB"),
+        ("Buffer pool hit % (at start)", "BUFFER_POOL_HIT_PCT"),
+        ("Buffer pool / data ratio", "BUFFER_POOL_DATA_RATIO"),
+        ("replica_parallel_workers", "REPLICA_PARALLEL_WORKERS"),
+        (
+            "GR flow control certifier threshold",
+            "GR_FLOW_CONTROL_CERTIFIER_THRESHOLD",
+        ),
+        (
+            "GR flow control applier threshold",
+            "GR_FLOW_CONTROL_APPLIER_THRESHOLD",
+        ),
+    )
+    for label, key in mapping:
+        val = _cfg_value(cfg, key)
+        if val != "N/A":
+            rows.append((label, val))
+    return rows
 
 
 def _format_data_size(cfg: dict[str, str]) -> str:
@@ -254,7 +283,9 @@ def load_scenario_bundle(scenario_dir: Path) -> dict:
 
 
 def load_edition_benchmark_config(edition_dir: Path) -> dict[str, str]:
-    return load_metadata(edition_dir / "benchmark_config.env")
+    cfg = load_metadata(edition_dir / "benchmark_config.env")
+    cfg.update(load_metadata(edition_dir / "mysql_runtime.env"))
+    return cfg
 
 
 def _parse_space_list(value: str) -> list[str]:
@@ -581,6 +612,7 @@ def _meta_rows_for_bundle(bundle: dict) -> list[tuple[str, str]]:
         ("Data size", _format_data_size(bench)),
         ("TPCC_SCALE", _cfg_value(bench, "TPCC_SCALE")),
         ("TPCC_THREADS", _cfg_value(bench, "TPCC_THREADS", "PREP_THREADS")),
+        *_mysql_runtime_meta_rows(bench),
         ("Sysbench start (UTC)", meta.get("SYSBENCH_START_UTC", "N/A")),
         ("Failover trigger (UTC)", event.get("FAILOVER_TRIGGER_UTC", "N/A")),
         ("Trigger second", str(int(trigger)) if trigger else "N/A"),
@@ -646,9 +678,6 @@ def load_primary_monitor(scenario_dir: Path) -> list[dict[str, str | float]]:
     return rows
 
 
-    return rows
-
-
 def _monitor_sysbench_offset_from_meta(
     scenario_dir: Path, meta_filename: str, start_key: str
 ) -> float:
@@ -695,9 +724,248 @@ def load_gr_pod_monitor(scenario_dir: Path) -> list[dict[str, str | float]]:
                 "gr_state": parts[6],
                 "cert_queue": parts[7] if len(parts) > 7 else "-1",
                 "applier_queue": parts[8] if len(parts) > 8 else "-1",
+                "remote_applied": parts[9] if len(parts) > 9 else "-1",
+                "tx_checked": parts[10] if len(parts) > 10 else "-1",
+                "conflicts": parts[11] if len(parts) > 11 else "-1",
+                "member_weight": parts[12] if len(parts) > 12 else "-1",
+                "gtid_seq": parts[13] if len(parts) > 13 else "0",
             }
         )
     return rows
+
+
+GR_PRE_FAILOVER_WINDOW_SEC = 30.0
+
+
+def _monitor_float(val: object, default: float = -1.0) -> float:
+    try:
+        return float(val)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _flow_control_thresholds(scenario_dir: Path) -> dict[str, float | None]:
+    edition_root = parent_edition_dir(scenario_dir) or scenario_dir
+    cfg: dict[str, str] = {}
+    for path in (
+        edition_root / "mysql_runtime.env",
+        edition_root / "benchmark_config.env",
+        scenario_dir / "sysbench_timing.txt",
+    ):
+        if path.exists():
+            cfg.update(load_metadata(path))
+    out: dict[str, float | None] = {}
+    for key, cfg_key in (
+        ("certifier", "GR_FLOW_CONTROL_CERTIFIER_THRESHOLD"),
+        ("applier", "GR_FLOW_CONTROL_APPLIER_THRESHOLD"),
+    ):
+        val = _monitor_float(cfg.get(cfg_key, ""), -1)
+        out[key] = val if val >= 0 else None
+    return out
+
+
+def _promotion_event_markers(
+    scenario_dir: Path, trigger: float, gr_rows: list[dict[str, str | float]]
+) -> dict[str, object]:
+    markers: dict[str, object] = {
+        "gr_primary_sec": None,
+        "write_ok_sec": None,
+        "gr_primary_pod": "",
+    }
+    best: tuple[float, str] | None = None
+    for row in gr_rows:
+        sec = float(row["sysbench_sec"])
+        if sec < trigger or row["connect_ok"] != "1":
+            continue
+        if row["gr_role"] == "PRIMARY" and row["gr_state"] in ("ONLINE", "PRIMARY"):
+            if best is None or sec < best[0]:
+                best = (sec, str(row["pod"]))
+    if best:
+        markers["gr_primary_sec"] = best[0]
+        markers["gr_primary_pod"] = best[1]
+
+    for row in load_primary_monitor(scenario_dir):
+        sec = float(row["sysbench_sec"])
+        if sec < trigger:
+            continue
+        if row.get("write_ok") == "1" and row.get("connect_ok") == "1":
+            markers["write_ok_sec"] = sec
+            break
+    return markers
+
+
+def _build_queue_point(
+    row: dict[str, str | float],
+    prev_row: dict[str, str | float] | None,
+    queue_key: str,
+) -> dict[str, object]:
+    y = _monitor_float(row.get(queue_key))
+    if y < 0:
+        return {}
+    sec = float(row["sysbench_sec"])
+    pt: dict[str, object] = {
+        "x": sec,
+        "y": y,
+        "role": str(row.get("gr_role", "")),
+        "state": str(row.get("gr_state", "")),
+        "cert_queue": _monitor_float(row.get("cert_queue")),
+        "applier_queue": _monitor_float(row.get("applier_queue")),
+        "member_weight": _monitor_float(row.get("member_weight")),
+        "conflicts": _monitor_float(row.get("conflicts")),
+        "gtid_seq": _monitor_float(row.get("gtid_seq"), 0),
+    }
+    if prev_row is not None:
+        prev_y = _monitor_float(prev_row.get(queue_key))
+        if prev_y >= 0:
+            pt["delta_queue"] = round(y - prev_y, 1)
+        prev_applied = _monitor_float(prev_row.get("remote_applied"))
+        cur_applied = _monitor_float(row.get("remote_applied"))
+        dt = sec - float(prev_row["sysbench_sec"])
+        if prev_applied >= 0 and cur_applied >= 0 and dt > 0 and cur_applied >= prev_applied:
+            pt["apply_rate"] = round((cur_applied - prev_applied) / dt, 2)
+    return pt
+
+
+def build_gr_pre_failover_summary(
+    scenario_dir: Path, trigger: float, window: float = GR_PRE_FAILOVER_WINDOW_SEC
+) -> dict[str, object]:
+    gr_rows = load_gr_pod_monitor(scenario_dir)
+    if not gr_rows:
+        return {}
+
+    primary_after = load_metadata(scenario_dir / "primary_change.env").get("PRIMARY_AFTER", "")
+    t0 = trigger - window
+    pre = [
+        r
+        for r in gr_rows
+        if t0 <= float(r["sysbench_sec"]) < trigger and r["connect_ok"] == "1"
+    ]
+    by_pod: dict[str, list[dict[str, str | float]]] = {}
+    for row in pre:
+        by_pod.setdefault(str(row["pod"]), []).append(row)
+
+    pods_summary: list[dict[str, object]] = []
+    for pod, rows in sorted(by_pod.items()):
+        appliers = [_monitor_float(r.get("applier_queue")) for r in rows]
+        appliers_ok = [a for a in appliers if a >= 0]
+        certs = [_monitor_float(r.get("cert_queue")) for r in rows]
+        certs_ok = [c for c in certs if c >= 0]
+        apply_rates: list[float] = []
+        sorted_rows = sorted(rows, key=lambda r: float(r["sysbench_sec"]))
+        for i in range(1, len(sorted_rows)):
+            prev = sorted_rows[i - 1]
+            cur = sorted_rows[i]
+            prev_applied = _monitor_float(prev.get("remote_applied"))
+            cur_applied = _monitor_float(cur.get("remote_applied"))
+            dt = float(cur["sysbench_sec"]) - float(prev["sysbench_sec"])
+            if prev_applied >= 0 and cur_applied >= 0 and dt > 0 and cur_applied >= prev_applied:
+                apply_rates.append((cur_applied - prev_applied) / dt)
+        weight_vals = [_monitor_float(r.get("member_weight")) for r in rows]
+        weights_ok = [w for w in weight_vals if w >= 0]
+        pods_summary.append(
+            {
+                "pod": pod,
+                "samples": len(rows),
+                "avg_applier": round(sum(appliers_ok) / len(appliers_ok), 2) if appliers_ok else None,
+                "max_applier": max(appliers_ok) if appliers_ok else None,
+                "avg_cert": round(sum(certs_ok) / len(certs_ok), 2) if certs_ok else None,
+                "avg_apply_rate": round(sum(apply_rates) / len(apply_rates), 2) if apply_rates else None,
+                "member_weight": weights_ok[-1] if weights_ok else None,
+            }
+        )
+
+    ranked = sorted(
+        pods_summary,
+        key=lambda p: (p["max_applier"] is None, -(p["max_applier"] or 0)),
+    )
+    for idx, pod_row in enumerate(ranked, 1):
+        pod_row["rank"] = idx
+
+    lag_leader = str(ranked[0]["pod"]) if ranked else ""
+    promoted_was_lag_leader = bool(primary_after and lag_leader and primary_after == lag_leader)
+    note = ""
+    if promoted_was_lag_leader and lag_leader:
+        max_a = ranked[0].get("max_applier")
+        note = (
+            f"Promoted primary {primary_after} had the highest pre-trigger applier queue "
+            f"(max {max_a} in {window:.0f}s window). Apply backlog on the new primary may "
+            f"contribute to slow VIP promotion even after GR election."
+        )
+    elif primary_after and lag_leader and not promoted_was_lag_leader:
+        note = (
+            f"Pre-trigger applier lag leader was {lag_leader}; promoted primary was {primary_after}. "
+            f"Election may reflect member_weight/operator label rather than lowest queue depth."
+        )
+
+    return {
+        "window_sec": window,
+        "trigger_sec": trigger,
+        "pods": ranked,
+        "lag_leader_pod": lag_leader,
+        "promoted_primary": primary_after,
+        "promoted_was_lag_leader": promoted_was_lag_leader,
+        "note": note,
+    }
+
+
+def write_gr_pre_failover_artifacts(scenario_dir: Path, trigger: float | None = None) -> Path | None:
+    if trigger is None:
+        trigger = _scenario_trigger_sec(scenario_dir)
+    summary = build_gr_pre_failover_summary(scenario_dir, trigger)
+    if not summary:
+        return None
+
+    txt_path = scenario_dir / "gr_pod_pre_failover_summary.txt"
+    env_path = scenario_dir / "gr_pod_pre_failover.env"
+    lines = [
+        "=== GR pre-failover lag summary ===",
+        f"Window: {summary['window_sec']:.0f}s before trigger (sysbench sec {summary['trigger_sec']:.0f})",
+        f"Promoted primary (after): {summary.get('promoted_primary') or 'N/A'}",
+        f"Pre-trigger applier lag leader: {summary.get('lag_leader_pod') or 'N/A'}",
+        f"Promoted pod was lag leader: {'yes' if summary.get('promoted_was_lag_leader') else 'no'}",
+        "",
+        f"{'Rank':<5} {'Pod':<35} {'AvgAppl':<10} {'MaxAppl':<10} {'AvgCert':<10} {'ApplyRate':<10} {'Weight':<8}",
+    ]
+    for pod_row in summary.get("pods") or []:
+        lines.append(
+            f"{pod_row.get('rank', ''):<5} "
+            f"{str(pod_row.get('pod', '')):<35} "
+            f"{pod_row.get('avg_applier', 'N/A')!s:<10} "
+            f"{pod_row.get('max_applier', 'N/A')!s:<10} "
+            f"{pod_row.get('avg_cert', 'N/A')!s:<10} "
+            f"{pod_row.get('avg_apply_rate', 'N/A')!s:<10} "
+            f"{pod_row.get('member_weight', 'N/A')!s:<8}"
+        )
+    if summary.get("note"):
+        lines.extend(["", str(summary["note"])])
+    txt_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    env_lines = [
+        f"GR_PRE_FAILOVER_WINDOW_SEC={summary['window_sec']:.0f}",
+        f"GR_PRE_FAILOVER_LAG_LEADER={summary.get('lag_leader_pod', '')}",
+        f"GR_PROMOTED_WAS_LAG_LEADER={'yes' if summary.get('promoted_was_lag_leader') else 'no'}",
+    ]
+    if summary.get("note"):
+        env_lines.append(f"GR_PRE_FAILOVER_NOTE={summary['note']}")
+    env_path.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
+
+    promo_txt = scenario_dir / "failover_promotion_breakdown.txt"
+    if promo_txt.exists() and summary.get("note"):
+        existing = promo_txt.read_text(encoding="utf-8")
+        marker = "--- Pre-failover GR applier lag ---"
+        if marker not in existing:
+            with promo_txt.open("a", encoding="utf-8") as f:
+                f.write("\n" + marker + "\n")
+                f.write(str(summary["note"]) + "\n")
+    return txt_path
+
+
+def _scenario_trigger_sec(scenario_dir: Path) -> float:
+    timing = load_metadata(scenario_dir / "sysbench_timing.txt")
+    try:
+        return float(timing.get("FAILOVER_TRIGGER_SECOND", 120))
+    except ValueError:
+        return 120.0
 
 
 def load_k8s_pods_monitor(scenario_dir: Path) -> list[dict[str, str | float]]:
@@ -852,6 +1120,7 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
 
     gr_state_datasets: list[dict] = []
     applier_datasets: list[dict] = []
+    cert_datasets: list[dict] = []
     k8s_state_datasets: list[dict] = []
 
     gr_pods = sorted({str(r["pod"]) for r in gr_rows})
@@ -862,16 +1131,20 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
             key=lambda r: float(r["sysbench_sec"]),
         )
         state_points = []
-        applier_points = []
+        applier_points: list[dict] = []
+        cert_points: list[dict] = []
         prev_label: str | None = None
+        prev_row: dict[str, str | float] | None = None
         for row in pod_rows:
             sec = float(row["sysbench_sec"])
-            try:
-                applier = float(row["applier_queue"])
-            except ValueError:
-                applier = None
-            if applier is not None and applier >= 0:
-                applier_points.append({"x": sec, "y": applier})
+            applier_pt = _build_queue_point(row, prev_row, "applier_queue")
+            if applier_pt:
+                applier_points.append(applier_pt)
+            cert_pt = _build_queue_point(row, prev_row, "cert_queue")
+            if cert_pt:
+                cert_points.append(cert_pt)
+            prev_row = row
+
             role = str(row["gr_role"])
             gr_state = str(row["gr_state"])
             connect_ok = str(row["connect_ok"])
@@ -897,6 +1170,9 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
         )
         applier_datasets.append(
             {"label": pod, "data": applier_points, "borderColor": color, "backgroundColor": color}
+        )
+        cert_datasets.append(
+            {"label": pod, "data": cert_points, "borderColor": color, "backgroundColor": color}
         )
 
     k8s_pods = sorted({str(r["pod"]) for r in k8s_rows})
@@ -951,6 +1227,10 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
             }
         )
 
+    pre_failover = build_gr_pre_failover_summary(scenario_dir, trigger)
+    flow_thresholds = _flow_control_thresholds(scenario_dir)
+    event_markers = _promotion_event_markers(scenario_dir, trigger, gr_rows)
+
     return {
         "has_gr": bool(gr_rows),
         "has_k8s": bool(k8s_rows),
@@ -958,7 +1238,12 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
         "target_pod": target_pod,
         "gr_state_datasets": gr_state_datasets,
         "applier_datasets": applier_datasets,
+        "cert_datasets": cert_datasets,
         "has_applier_queue": any(ds.get("data") for ds in applier_datasets),
+        "has_cert_queue": any(ds.get("data") for ds in cert_datasets),
+        "flow_thresholds": flow_thresholds,
+        "event_markers": event_markers,
+        "pre_failover_summary": pre_failover,
         "gr_state_lanes": gr_pods,
         "gr_state_levels": list(GR_STATE_LEVELS),
         "k8s_state_datasets": k8s_state_datasets,
@@ -991,7 +1276,50 @@ def _cluster_k8s_state_table_html(data: dict) -> str:
     )
 
 
+def _cluster_gr_pre_failover_table_html(data: dict) -> str:
+    summary = data.get("pre_failover_summary") or {}
+    pods = summary.get("pods") or []
+    if not pods:
+        return ""
+    window = summary.get("window_sec", GR_PRE_FAILOVER_WINDOW_SEC)
+    body = []
+    for row in pods:
+        promoted = summary.get("promoted_primary") == row.get("pod")
+        leader = summary.get("lag_leader_pod") == row.get("pod")
+        flags = []
+        if promoted:
+            flags.append("promoted")
+        if leader:
+            flags.append("lag leader")
+        flag_txt = f" ({', '.join(flags)})" if flags else ""
+        body.append(
+            f"<tr><td>{html.escape(str(row.get('pod', '')) + flag_txt)}</td>"
+            f"<td>{html.escape(str(row.get('rank', '')))}</td>"
+            f"<td>{html.escape(str(row.get('avg_applier', 'N/A')))}</td>"
+            f"<td>{html.escape(str(row.get('max_applier', 'N/A')))}</td>"
+            f"<td>{html.escape(str(row.get('avg_cert', 'N/A')))}</td>"
+            f"<td>{html.escape(str(row.get('avg_apply_rate', 'N/A')))}</td>"
+            f"<td>{html.escape(str(row.get('member_weight', 'N/A')))}</td></tr>"
+        )
+    note = summary.get("note")
+    note_html = (
+        f'<p class="monitor-subhead">{html.escape(str(note))}</p>' if note else ""
+    )
+    return (
+        f'<p class="monitor-subhead">Pre-trigger window: {window:.0f}s before failover trigger. '
+        f"Higher applier queue = slower apply vs siblings (same certified stream).</p>"
+        + note_html
+        + '<table class="cluster-table"><thead><tr>'
+        "<th>Pod</th><th>Rank</th><th>Avg applier</th><th>Max applier</th>"
+        "<th>Avg cert</th><th>Apply rate (txn/s)</th><th>member_weight</th>"
+        "</tr></thead><tbody>"
+        + "".join(body)
+        + "</tbody></table>"
+    )
+
+
 def _cluster_monitors_html(scenario_dir: Path, trigger: float, *, panel_id: str = "") -> str:
+    write_gr_pre_failover_artifacts(scenario_dir, trigger)
     data = build_cluster_monitor_chart_data(scenario_dir, trigger)
     if not data:
         return (
@@ -1015,12 +1343,31 @@ def _cluster_monitors_html(scenario_dir: Path, trigger: float, *, panel_id: str 
     ]
 
     if data.get("has_gr"):
+        pre_table = _cluster_gr_pre_failover_table_html(data)
+        if pre_table:
+            sections.extend(
+                [
+                    "<h3>Pre-failover GR queue summary</h3>",
+                    pre_table,
+                ]
+            )
+        if data.get("has_cert_queue"):
+            sections.extend(
+                [
+                    "<h3>GR certifier queue depth</h3>",
+                    '<p class="monitor-subhead">Transactions waiting certification / conflict check '
+                    "(<code>COUNT_TRANSACTIONS_IN_QUEUE</code>). Flow-control certifier threshold shown when configured.</p>",
+                    '<div class="chart-wrap chart-wrap-sm">'
+                    f'<canvas id="grCertQueueChart{suffix}"></canvas></div>',
+                ]
+            )
         if data.get("has_applier_queue"):
             sections.extend(
                 [
                     "<h3>GR applier queue depth</h3>",
                     '<p class="monitor-subhead">Remote transactions waiting in the applier queue '
-                    "on each pod (<code>COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE</code>).</p>",
+                    "(<code>COUNT_TRANSACTIONS_REMOTE_IN_APPLIER_QUEUE</code>). "
+                    "Hover for role/state, cert queue, apply rate, and member_weight.</p>",
                     '<div class="chart-wrap chart-wrap-sm">'
                     f'<canvas id="grApplierQueueChart{suffix}"></canvas></div>',
                 ]
@@ -1067,15 +1414,66 @@ CLUSTER_CHARTS_CSS = """
 
 
 CLUSTER_CHARTS_JS = """
-    function clusterTriggerAnnotations(triggerSec) {
+    function clusterChartAnnotations(triggerSec, clusterData, thresholdKey) {
+      const ann = {
+        trigger: {
+          type: "line", xMin: triggerSec, xMax: triggerSec,
+          borderColor: "#f87171", borderWidth: 2, borderDash: [6, 4],
+          label: { display: true, content: "failover trigger", color: "#fca5a5", backgroundColor: "rgba(30,41,59,0.8)" }
+        }
+      };
+      const markers = (clusterData && clusterData.event_markers) || {};
+      if (markers.gr_primary_sec != null) {
+        ann.gr_primary = {
+          type: "line", xMin: markers.gr_primary_sec, xMax: markers.gr_primary_sec,
+          borderColor: "#34d399", borderWidth: 2, borderDash: [4, 3],
+          label: {
+            display: true,
+            content: "GR PRIMARY" + (markers.gr_primary_pod ? (" " + markers.gr_primary_pod) : ""),
+            color: "#6ee7b7", backgroundColor: "rgba(30,41,59,0.85)"
+          }
+        };
+      }
+      if (markers.write_ok_sec != null) {
+        ann.write_ok = {
+          type: "line", xMin: markers.write_ok_sec, xMax: markers.write_ok_sec,
+          borderColor: "#60a5fa", borderWidth: 2, borderDash: [2, 2],
+          label: { display: true, content: "VIP write_ok", color: "#93c5fd", backgroundColor: "rgba(30,41,59,0.85)" }
+        };
+      }
+      const thresholds = (clusterData && clusterData.flow_thresholds) || {};
+      const thVal = thresholds[thresholdKey];
+      if (thVal != null && thVal >= 0) {
+        ann.flow_threshold = {
+          type: "line", yMin: thVal, yMax: thVal,
+          borderColor: "#fbbf24", borderWidth: 1.5, borderDash: [8, 4],
+          label: { display: true, content: "flow control " + thresholdKey, color: "#fcd34d", backgroundColor: "rgba(30,41,59,0.8)" }
+        };
+      }
+      return { annotation: { annotations: ann } };
+    }
+
+    function queueChartTooltip() {
       return {
-        annotation: {
-          annotations: {
-            trigger: {
-              type: "line", xMin: triggerSec, xMax: triggerSec,
-              borderColor: "#f87171", borderWidth: 2, borderDash: [6, 4],
-              label: { display: true, content: "failover trigger", color: "#fca5a5", backgroundColor: "rgba(30,41,59,0.8)" }
-            }
+        mode: "nearest",
+        intersect: false,
+        callbacks: {
+          title: function(items) {
+            if (!items || !items.length) return "";
+            return "t = " + Number(items[0].parsed.x).toFixed(1) + " s";
+          },
+          label: function(ctx) {
+            const pt = ctx.raw || {};
+            const lines = [(ctx.dataset.label || "") + ": queue " + pt.y];
+            if (pt.role) lines.push("  " + pt.role + " / " + pt.state);
+            if (pt.cert_queue >= 0) lines.push("  cert queue: " + pt.cert_queue);
+            if (pt.applier_queue >= 0) lines.push("  applier queue: " + pt.applier_queue);
+            if (pt.delta_queue != null) lines.push("  delta queue: " + pt.delta_queue);
+            if (pt.apply_rate != null) lines.push("  apply rate: " + pt.apply_rate + " txn/s");
+            if (pt.member_weight >= 0) lines.push("  member_weight: " + pt.member_weight);
+            if (pt.conflicts >= 0) lines.push("  conflicts: " + pt.conflicts);
+            if (pt.gtid_seq >= 0) lines.push("  gtid seq tail: " + pt.gtid_seq);
+            return lines;
           }
         }
       };
@@ -1127,7 +1525,7 @@ CLUSTER_CHARTS_JS = """
       const triggerSec = clusterData.trigger_sec;
       const laneHeight = clusterData.state_lane_height || 6;
 
-      function lineOpts(yTitle, lanes, levelNames) {
+      function lineOpts(yTitle, lanes, levelNames, clusterData, thresholdKey) {
         const scales = {
           x: { type: "linear", title: { display: true, text: "Elapsed time (s from sysbench start)" } },
           y: { title: { display: true, text: yTitle }, beginAtZero: true }
@@ -1137,14 +1535,19 @@ CLUSTER_CHARTS_JS = """
           scales.y.max = lanes.length * laneHeight - 0.5;
           scales.y.ticks = stateTimelineYTicks(lanes, levelNames || [], laneHeight);
         }
+        const plugins = Object.assign(
+          {},
+          clusterChartAnnotations(triggerSec, clusterData, thresholdKey),
+          chartZoomPlugin()
+        );
         return {
           responsive: true, maintainAspectRatio: false, interaction: { mode: "nearest", intersect: false },
-          plugins: Object.assign({}, clusterTriggerAnnotations(triggerSec), chartZoomPlugin()),
+          plugins,
           scales
         };
       }
 
-      function makeLineChart(id, datasets, yTitle, lanes, levelNames, stateTimeline) {
+      function makeLineChart(id, datasets, yTitle, lanes, levelNames, stateTimeline, clusterData, thresholdKey) {
         const el = document.getElementById(id);
         if (!el || !datasets || !datasets.length) return;
         datasets.forEach(ds => {
@@ -1157,16 +1560,18 @@ CLUSTER_CHARTS_JS = """
             ds.pointBackgroundColor = ds.borderColor;
           } else {
             ds.pointRadius = 0;
-            ds.pointHoverRadius = 4;
+            ds.pointHoverRadius = 5;
           }
           ds.borderWidth = ds.borderWidth || 1.5;
           ds.stepped = stateTimeline ? "before" : false;
           ds.fill = false;
           ds.tension = 0;
         });
-        const opts = lineOpts(yTitle, lanes, levelNames);
+        const opts = lineOpts(yTitle, lanes, levelNames, clusterData, thresholdKey);
         if (stateTimeline) {
           opts.plugins.tooltip = stateTimelineTooltip();
+        } else {
+          opts.plugins.tooltip = queueChartTooltip();
         }
         const chart = new Chart(el, {
           type: "line",
@@ -1177,11 +1582,20 @@ CLUSTER_CHARTS_JS = """
       }
 
       if (clusterData.has_gr) {
+        if (clusterData.has_cert_queue) {
+          makeLineChart(
+            "grCertQueueChart" + suffix,
+            clusterData.cert_datasets,
+            "Certifier queue depth",
+            null, null, false, clusterData, "certifier"
+          );
+        }
         if (clusterData.has_applier_queue) {
           makeLineChart(
             "grApplierQueueChart" + suffix,
             clusterData.applier_datasets,
-            "Applier queue depth"
+            "Applier queue depth",
+            null, null, false, clusterData, "applier"
           );
         }
         makeLineChart(
@@ -1190,7 +1604,7 @@ CLUSTER_CHARTS_JS = """
           "GR role/state (one lane per pod)",
           clusterData.gr_state_lanes,
           clusterData.gr_state_levels,
-          true
+          true, clusterData, null
         );
       }
       if (clusterData.has_k8s) {
@@ -1200,7 +1614,7 @@ CLUSTER_CHARTS_JS = """
           "Pod phase/readiness (one lane per pod)",
           clusterData.k8s_state_lanes,
           clusterData.k8s_state_levels,
-          true
+          true, clusterData, null
         );
       }
     }
@@ -2333,6 +2747,7 @@ def generate_html_report(
         ("Data size", _format_data_size(bench)),
         ("TPCC_SCALE", _cfg_value(bench, "TPCC_SCALE")),
         ("TPCC_THREADS", _cfg_value(bench, "TPCC_THREADS", "PREP_THREADS")),
+        *_mysql_runtime_meta_rows(bench),
         ("Sysbench start (UTC)", meta.get("SYSBENCH_START_UTC", "N/A")),
         ("Failover trigger (UTC)", event.get("FAILOVER_TRIGGER_UTC", "N/A")),
         ("Trigger second", str(int(trigger)) if trigger else "N/A"),
@@ -3158,8 +3573,24 @@ def main() -> int:
     )
     parser.add_argument("--png-only", action="store_true", help="Generate PNG files only")
     parser.add_argument("--html-only", action="store_true", help="Generate HTML report only")
+    parser.add_argument(
+        "--gr-pre-failover",
+        action="store_true",
+        help="Write gr_pod_pre_failover_summary.txt for a scenario dir (requires gr_pod_monitor.tsv)",
+    )
     args = parser.parse_args()
     path: Path = args.path
+
+    if args.gr_pre_failover:
+        if (path / "gr_pod_monitor.tsv").exists():
+            out = write_gr_pre_failover_artifacts(path)
+            if out:
+                print(f"Wrote {out}")
+                return 0
+            print(f"No GR pre-failover summary for {path}", file=sys.stderr)
+            return 1
+        print(f"ERROR: missing gr_pod_monitor.tsv under {path}", file=sys.stderr)
+        return 1
 
     do_png = not args.html_only
     do_html = not args.png_only
