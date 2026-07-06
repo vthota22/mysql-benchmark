@@ -33,6 +33,12 @@ def _ensure_mpl() -> bool:
         return False
 
 
+# Upper bound (seconds after the trigger) for treating a monitor connect failure
+# as the failover detection. Keeps a stray late connection blip from being picked
+# up as the "first connect failure". Mirrors FAILOVER_DETECT_WINDOW_SEC on the
+# analysis side.
+_DETECT_WINDOW_SEC = 60.0
+
 METRIC_HELP = {
     "detect": (
         "Seconds from failover trigger until the primary monitor reports the first "
@@ -1051,8 +1057,60 @@ def write_gr_pre_failover_artifacts(scenario_dir: Path, trigger: float | None = 
     return txt_path
 
 
+def _scenario_trigger_epoch_rel(scenario_dir: Path) -> float | None:
+    """Sub-second offset from sysbench-ready to the actual trigger fire epoch.
+
+    Uses FAILOVER_TRIGGER_EPOCH (recorded at the real fire moment) minus
+    SYSBENCH_READY_EPOCH so detection/marking align to when the trigger truly
+    fired rather than the planned integer second. Returns None for older runs
+    that predate either epoch (callers then fall back to the planned second).
+    """
+    trig_epoch: float | None = None
+    for path in (
+        scenario_dir / "failover_event.txt",
+        scenario_dir / "failover_timeseries_meta.txt",
+    ):
+        val = load_metadata(path).get("FAILOVER_TRIGGER_EPOCH")
+        if val:
+            try:
+                trig_epoch = float(val)
+                break
+            except ValueError:
+                pass
+    ready_epoch: float | None = None
+    for path in (
+        scenario_dir / "sysbench_timing.txt",
+        scenario_dir / "failover_timeseries_meta.txt",
+    ):
+        val = load_metadata(path).get("SYSBENCH_READY_EPOCH")
+        if val:
+            try:
+                ready_epoch = float(val)
+                break
+            except ValueError:
+                pass
+    if trig_epoch is None or ready_epoch is None:
+        return None
+    rel = trig_epoch - ready_epoch
+    return rel if rel > 0 else None
+
+
+def _scenario_warmup_sec(scenario_dir: Path) -> float:
+    for path in (scenario_dir / "failover_timeseries_meta.txt", scenario_dir / "sysbench_timing.txt"):
+        val = load_metadata(path).get("FAILOVER_WARMUP_SEC")
+        if val:
+            try:
+                return float(val)
+            except ValueError:
+                pass
+    return 0.0
+
+
 def _scenario_trigger_wall_sec(scenario_dir: Path) -> float:
     """Wall-clock sysbench second when failover fires (warmup + baseline); aligns monitors."""
+    rel = _scenario_trigger_epoch_rel(scenario_dir)
+    if rel is not None:
+        return rel
     for path in (scenario_dir / "failover_timeseries_meta.txt", scenario_dir / "sysbench_timing.txt"):
         timing = load_metadata(path)
         for key in ("FAILOVER_TRIGGER_WALL_SECOND", "FAILOVER_TRIGGER_SECOND"):
@@ -1067,6 +1125,12 @@ def _scenario_trigger_wall_sec(scenario_dir: Path) -> float:
 
 def _scenario_trigger_log_sec(scenario_dir: Path) -> float:
     """Sysbench report-interval second for TPS/QPS charts (excludes warmup silence)."""
+    # With no warmup silence the log axis equals the wall axis, so prefer the
+    # actual sub-second fire epoch for accurate trigger marking on the charts.
+    if _scenario_warmup_sec(scenario_dir) <= 0:
+        rel = _scenario_trigger_epoch_rel(scenario_dir)
+        if rel is not None:
+            return rel
     for path in (scenario_dir / "failover_timeseries_meta.txt", scenario_dir / "sysbench_timing.txt"):
         timing = load_metadata(path)
         val = timing.get("FAILOVER_TRIGGER_LOG_SECOND")
@@ -1804,6 +1868,10 @@ def _select_monitor_transition_rows(
 
     connect_fail_row: dict[str, str | float] | None = None
     for row in post:
+        # Don't let an unrelated late connection blip masquerade as the failover
+        # detection: only consider failures within the plausible detection window.
+        if float(row["sysbench_sec"]) - trigger > _DETECT_WINDOW_SEC:
+            break
         if row["connect_ok"] == "0":
             connect_fail_row = row
             break

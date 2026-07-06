@@ -319,6 +319,30 @@ failover_trigger_wall_second_from_timing() {
   failover_trigger_second
 }
 
+# Sub-second wall trigger, in "seconds since sysbench ready", computed from the
+# actual recorded fire epoch (FAILOVER_TRIGGER_EPOCH) rather than the planned
+# integer trigger second. This aligns detection/marking to when the trigger truly
+# fired. Falls back to the planned integer wall second for older runs that predate
+# FAILOVER_TRIGGER_EPOCH / SYSBENCH_READY_EPOCH.
+failover_trigger_wall_subsec() {
+  local results_dir="${1:?results dir required}"
+  local timing_file="${2:?timing file required}"
+  local event_file="${results_dir}/failover_event.txt"
+  local trig_epoch="" ready_epoch=""
+  [[ -f "${event_file}" ]] && trig_epoch=$(grep -E '^FAILOVER_TRIGGER_EPOCH=' "${event_file}" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  [[ -f "${timing_file}" ]] && ready_epoch=$(grep -E '^SYSBENCH_READY_EPOCH=' "${timing_file}" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  if [[ -n "${trig_epoch}" && -n "${ready_epoch}" ]]; then
+    local rel
+    rel=$(python3 -c "print('%.3f' % (float('${trig_epoch}') - float('${ready_epoch}')))" 2>/dev/null || true)
+    # Guard against malformed/negative values (clock skew, missing sysbench start).
+    if [[ -n "${rel}" ]] && python3 -c "import sys; sys.exit(0 if float('${rel}') > 0 else 1)" 2>/dev/null; then
+      echo "${rel}"
+      return 0
+    fi
+  fi
+  failover_trigger_wall_second_from_timing "${timing_file}"
+}
+
 _failover_tee_linebuffer() {
   if command -v stdbuf >/dev/null 2>&1; then
     stdbuf -oL -eL tee "$@"
@@ -2353,6 +2377,9 @@ write_failover_kpi() {
     fi
   fi
 
+  # Prefer the actual sub-second fire epoch over the planned integer trigger second.
+  trigger_wall=$(failover_trigger_wall_subsec "${results_dir}" "${timing_file}")
+
   local primary_before="N/A"
   if [[ -f "${monitor}" ]]; then
     primary_before=$(analyze_primary_change "${monitor}" "${trigger_utc}" 2>/dev/null \
@@ -2383,6 +2410,8 @@ write_failover_kpi() {
       -v observe_sec="${FAILOVER_OBSERVE_SEC}" \
       -v monitor="${monitor}" \
       -v monitor_offset="${monitor_offset}" \
+      -v detect_guard="$(python3 -c "print('%.3f' % (1.5 * float('${FAILOVER_MONITOR_INTERVAL}')))" 2>/dev/null || echo 1.5)" \
+      -v detect_window="${FAILOVER_DETECT_WINDOW_SEC:-60}" \
       -v primary_before="${primary_before}" \
       -v tpcc_check="${tpcc_check}" \
       -v sysbench_max_lat="${sysbench_max_lat}" \
@@ -2423,15 +2452,24 @@ function load_timeseries(    line, f, sec) {
   observe_end = log_trigger + observe_sec
   if (load_end > observe_end) observe_end = load_end
 }
-function detect_connect_failure_ttd(    sysbench_sec) {
+function detect_connect_failure_ttd(    sysbench_sec, rel, guard, window) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
   close(monitor)
+  guard = (detect_guard == "" ? 0 : detect_guard + 0)
+  window = (detect_window == "" ? 0 : detect_window + 0)
   while ((getline line < monitor) > 0) {
     split(line, f, "\t")
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
-    if (sysbench_sec < wall_trigger) continue
-    if (f[3] != "1") return sysbench_sec - wall_trigger
+    rel = sysbench_sec - wall_trigger
+    # Ignore polls well before the trigger (outside the guard band). A failing
+    # poll inside the guard band (just before the boundary) is a real trigger
+    # detection that landed a fraction of a poll early — clamp it to 0.
+    if (rel < -guard) continue
+    # Stop once past the plausible detection window so an unrelated late
+    # connection blip cannot masquerade as the failover detection.
+    if (window > 0 && rel > window) break
+    if (f[3] != "1") return (rel < 0 ? 0 : rel)
   }
   close(monitor)
   return -1
@@ -2653,6 +2691,9 @@ write_failover_promotion_breakdown() {
       monitor_offset=$(python3 -c "print('%.3f' % (float('${sysbench_ready}') - float('${monitor_start}')))")
     fi
   fi
+
+  # Prefer the actual sub-second fire epoch over the planned integer trigger second.
+  trigger_wall=$(failover_trigger_wall_subsec "${results_dir}" "${timing_file}")
 
   local primary_before="N/A"
   primary_before=$(analyze_primary_change "${monitor}" "" 2>/dev/null \
@@ -2993,6 +3034,9 @@ write_failover_extended_metrics() {
     fi
   fi
 
+  # Prefer the actual sub-second fire epoch over the planned integer trigger second.
+  trigger_wall=$(failover_trigger_wall_subsec "${results_dir}" "${timing_file}")
+
   awk -v log_trigger="${trigger_log}" \
       -v wall_trigger="${trigger_wall}" \
       -v trigger_utc="${trigger_utc}" \
@@ -3008,6 +3052,8 @@ write_failover_extended_metrics() {
       -v parsed_env="${parsed_env}" \
       -v monitor="${monitor}" \
       -v monitor_offset="${monitor_offset}" \
+      -v detect_guard="$(python3 -c "print('%.3f' % (1.5 * float('${FAILOVER_MONITOR_INTERVAL}')))" 2>/dev/null || echo 1.5)" \
+      -v detect_window="${FAILOVER_DETECT_WINDOW_SEC:-60}" \
       -v primary_before="${primary_before}" \
       -v primary_after="${primary_after}" \
       -v primary_changed="${primary_changed}" \
@@ -3136,15 +3182,24 @@ function compute_rto(    sec, stable_count, computed) {
   }
   return computed
 }
-function detect_connect_failure_ttd(    sysbench_sec) {
+function detect_connect_failure_ttd(    sysbench_sec, rel, guard, window) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
   close(monitor)
+  guard = (detect_guard == "" ? 0 : detect_guard + 0)
+  window = (detect_window == "" ? 0 : detect_window + 0)
   while ((getline line < monitor) > 0) {
     split(line, f, "\t")
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
-    if (sysbench_sec < wall_trigger) continue
-    if (f[3] != "1") return sysbench_sec - wall_trigger
+    rel = sysbench_sec - wall_trigger
+    # Ignore polls well before the trigger (outside the guard band). A failing
+    # poll inside the guard band (just before the boundary) is a real trigger
+    # detection that landed a fraction of a poll early — clamp it to 0.
+    if (rel < -guard) continue
+    # Stop once past the plausible detection window so an unrelated late
+    # connection blip cannot masquerade as the failover detection.
+    if (window > 0 && rel > window) break
+    if (f[3] != "1") return (rel < 0 ? 0 : rel)
   }
   close(monitor)
   return -1

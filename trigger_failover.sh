@@ -87,6 +87,7 @@ trigger_standard_failover() {
   local method="${FAILOVER_STANDARD_TRIGGER_METHOD:-install_update}"
   echo "FAILOVER_METHOD=${method}" >> "${RESULTS_DIR}/failover_event.txt"
   echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${RESULTS_DIR}/failover_event.txt"
+  echo "FAILOVER_TRIGGER_EPOCH=$(python3 -c 'import time; print("%.3f" % time.time())')" >> "${RESULTS_DIR}/failover_event.txt"
 
   local uuid="${STANDARD_CLUSTER_UUID:-}"
   : "${uuid:?Set STANDARD_CLUSTER_UUID in benchmark.conf}"
@@ -324,6 +325,7 @@ _advanced_failover_delete_pod() {
   fi
 
   echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
+  echo "FAILOVER_TRIGGER_EPOCH=$(python3 -c 'import time; print("%.3f" % time.time())')" >> "${EVENT_FILE}"
   echo "FAILOVER_POD_DELETE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
 
   "${kubectl[@]}" "${delete_args[@]}" \
@@ -357,6 +359,7 @@ _advanced_failover_kill_mysqld() {
     >> "${TRIGGER_LOG}"
 
   echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
+  echo "FAILOVER_TRIGGER_EPOCH=$(python3 -c 'import time; print("%.3f" % time.time())')" >> "${EVENT_FILE}"
   echo "FAILOVER_MYSQLD_KILL_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
 
   "${kubectl[@]}" exec -n "${ns}" "${pod}" -c "${container}" -- \
