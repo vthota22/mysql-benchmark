@@ -226,6 +226,9 @@ run_failover_edition() {
   echo "--- MySQL runtime metadata (caching / GR) ---"
   capture_mysql_runtime_metadata "${edition}" "${edition_dir}" \
     "${TPCC_TABLES:-10}" "${TPCC_SCALE:-100}" || true
+  if [[ "${edition}" == "advanced" ]]; then
+    capture_mysql_pod_buffer_pool_metadata "${edition_dir}" || true
+  fi
   echo ""
 
   if [[ "${edition}" == "advanced" ]]; then

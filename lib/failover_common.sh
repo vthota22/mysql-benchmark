@@ -570,6 +570,69 @@ SELECT @@hostname,
        IFNULL(CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(@@GLOBAL.gtid_executed, '\'':'\'', -1), '\''-'\'', -1) AS UNSIGNED), 0);"' 2>/dev/null || true
 }
 
+_failover_poll_pod_buffer_pool_once() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local pod="${3:?pod required}"
+  local -a kubectl
+  local exec_timeout="${FAILOVER_MONITOR_OP_TIMEOUT:-2}"
+  (( exec_timeout < 5 )) && exec_timeout=5
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+  _failover_run_timeout "${exec_timeout}" "${kubectl[@]}" exec -n "${ns}" "${pod}" -c mysql -- \
+    sh -c 'mysql -umonitor -p"$(tr -d "\n" </etc/mysql/mysql-users-secret/monitor)" -N -B -e "
+SELECT @@hostname,
+       @@innodb_buffer_pool_size,
+       IFNULL((SELECT VARIABLE_VALUE FROM performance_schema.global_status
+               WHERE VARIABLE_NAME = '\''Innodb_buffer_pool_bytes_data'\'' LIMIT 1), 0),
+       IFNULL((SELECT MEMBER_ROLE FROM performance_schema.replication_group_members
+               WHERE MEMBER_ID = @@server_uuid LIMIT 1), '\''N/A'\'');"' 2>/dev/null || true
+}
+
+# One-shot per-pod buffer pool snapshot (limit + bytes_data + GR role) for report metadata.
+capture_mysql_pod_buffer_pool_metadata() {
+  local edition_dir="${1:?edition dir required}"
+  local kubeconfig=""
+  local ns="${ADVANCED_K8S_NAMESPACE:-}"
+  local out_tsv="${edition_dir}/mysql_pod_buffer_pool.tsv"
+  local captured_utc
+  captured_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  [[ -n "${ns}" ]] || {
+    echo "MySQL pod buffer pool: skipped (ADVANCED_K8S_NAMESPACE unset)" >&2
+    return 0
+  }
+  if ! kubeconfig="$(_failover_resolve_kubeconfig "${edition_dir}")"; then
+    echo "MySQL pod buffer pool: skipped (no kubeconfig — set ADVANCED_KUBECONFIG_PATH)" >&2
+    return 0
+  fi
+
+  {
+    echo "# captured_utc=${captured_utc}"
+    echo "# namespace=${ns} kubeconfig=${kubeconfig}"
+    echo -e "pod\thostname\tbp_limit_bytes\tbp_data_bytes\tbp_used_pct\tgr_role"
+    local pod line hostname bp_limit bp_data gr_role bp_used_pct
+    while IFS= read -r pod; do
+      [[ -n "${pod}" ]] || continue
+      line="$(_failover_poll_pod_buffer_pool_once "${kubeconfig}" "${ns}" "${pod}")"
+      [[ -n "${line}" ]] || continue
+      IFS=$'\t' read -r hostname bp_limit bp_data gr_role <<< "${line}"
+      bp_used_pct="N/A"
+      if [[ -n "${bp_limit}" && -n "${bp_data}" && "${bp_limit}" =~ ^[0-9]+$ && "${bp_data}" =~ ^[0-9]+$ && "${bp_limit}" -gt 0 ]]; then
+        bp_used_pct="$(awk "BEGIN { printf \"%.1f\", (${bp_data} / ${bp_limit}) * 100 }")"
+      fi
+      echo -e "${pod}\t${hostname}\t${bp_limit}\t${bp_data}\t${bp_used_pct}\t${gr_role}"
+    done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
+  } > "${out_tsv}"
+
+  if [[ "$(wc -l < "${out_tsv}" | tr -d ' ')" -le 2 ]]; then
+    echo "WARNING: MySQL pod buffer pool capture returned no pod rows" >&2
+    return 1
+  fi
+
+  echo "Captured MySQL pod buffer pool metadata: ${out_tsv}"
+  return 0
+}
+
 _failover_poll_k8s_mysql_pods_once() {
   local kubeconfig="${1:?kubeconfig required}"
   local ns="${2:?namespace required}"

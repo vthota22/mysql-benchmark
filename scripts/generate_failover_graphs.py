@@ -84,7 +84,9 @@ def _mysql_runtime_meta_rows(cfg: dict[str, str]) -> list[tuple[str, str]]:
     """Key InnoDB / GR settings captured before the run."""
     rows: list[tuple[str, str]] = []
     mapping = (
-        ("Buffer pool", "BUFFER_POOL_GB"),
+        ("Buffer pool limit (VIP)", "BUFFER_POOL_GB"),
+        ("Buffer pool used (VIP)", "BUFFER_POOL_USED_GB"),
+        ("Buffer pool used % (VIP)", "BUFFER_POOL_USED_PCT"),
         ("Redo log capacity", "REDO_LOG_CAPACITY_GB"),
         ("Buffer pool hit % (at start)", "BUFFER_POOL_HIT_PCT"),
         ("Buffer pool / data ratio", "BUFFER_POOL_DATA_RATIO"),
@@ -103,6 +105,73 @@ def _mysql_runtime_meta_rows(cfg: dict[str, str]) -> list[tuple[str, str]]:
         if val != "N/A":
             rows.append((label, val))
     return rows
+
+
+def load_mysql_pod_buffer_pool(edition_dir: Path) -> list[dict[str, str]]:
+    path = edition_dir / "mysql_pod_buffer_pool.tsv"
+    if not path.exists():
+        return []
+    rows: list[dict[str, str]] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("pod\t"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 6:
+            continue
+        rows.append(
+            {
+                "pod": parts[0],
+                "hostname": parts[1],
+                "bp_limit_bytes": parts[2],
+                "bp_data_bytes": parts[3],
+                "bp_used_pct": parts[4],
+                "gr_role": parts[5],
+            }
+        )
+    return rows
+
+
+def _fmt_bytes_gb(num_bytes: str | int | float | None) -> str:
+    try:
+        val = int(str(num_bytes).strip())
+    except (TypeError, ValueError):
+        return "N/A"
+    if val <= 0:
+        return "N/A"
+    gb = val / (1024**3)
+    if abs(gb - round(gb)) < 0.05:
+        return f"{int(round(gb))} GB"
+    return f"{gb:.2f} GB"
+
+
+def _mysql_pod_bp_meta_rows(edition_dir: Path) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    for pod_row in load_mysql_pod_buffer_pool(edition_dir):
+        pod = pod_row.get("pod", "")
+        limit_gb = _fmt_bytes_gb(pod_row.get("bp_limit_bytes"))
+        used_gb = _fmt_bytes_gb(pod_row.get("bp_data_bytes"))
+        used_pct = pod_row.get("bp_used_pct", "N/A")
+        gr_role = pod_row.get("gr_role", "")
+        if limit_gb == "N/A" and used_gb == "N/A":
+            continue
+        val = f"{used_gb} used / {limit_gb} limit"
+        if used_pct not in ("", "N/A"):
+            val += f" ({used_pct}%)"
+        if gr_role and gr_role != "N/A":
+            val += f" [{gr_role}]"
+        rows.append((f"Buffer pool ({pod})", val))
+    return rows
+
+
+def _edition_metadata_rows(edition_dir: Path, bench: dict[str, str]) -> list[tuple[str, str]]:
+    edition_root = parent_edition_dir(edition_dir) or edition_dir
+    return [
+        *_mysql_runtime_meta_rows(bench),
+        *_mysql_pod_bp_meta_rows(edition_root),
+    ]
 
 
 def _format_data_size(cfg: dict[str, str]) -> str:
@@ -612,7 +681,7 @@ def _meta_rows_for_bundle(bundle: dict) -> list[tuple[str, str]]:
         ("Data size", _format_data_size(bench)),
         ("TPCC_SCALE", _cfg_value(bench, "TPCC_SCALE")),
         ("TPCC_THREADS", _cfg_value(bench, "TPCC_THREADS", "PREP_THREADS")),
-        *_mysql_runtime_meta_rows(bench),
+        *_edition_metadata_rows(Path(bundle["dir"]), bench),
         ("Sysbench start (UTC)", meta.get("SYSBENCH_START_UTC", "N/A")),
         ("Failover trigger (UTC)", event.get("FAILOVER_TRIGGER_UTC", "N/A")),
         ("Trigger second", str(int(trigger)) if trigger else "N/A"),
@@ -2745,7 +2814,7 @@ def generate_html_report(
         ("Data size", _format_data_size(bench)),
         ("TPCC_SCALE", _cfg_value(bench, "TPCC_SCALE")),
         ("TPCC_THREADS", _cfg_value(bench, "TPCC_THREADS", "PREP_THREADS")),
-        *_mysql_runtime_meta_rows(bench),
+        *_edition_metadata_rows(edition_dir, bench),
         ("Sysbench start (UTC)", meta.get("SYSBENCH_START_UTC", "N/A")),
         ("Failover trigger (UTC)", event.get("FAILOVER_TRIGGER_UTC", "N/A")),
         ("Trigger second", str(int(trigger)) if trigger else "N/A"),

@@ -231,7 +231,7 @@ mysql_query_global_variables() {
     echo "# host=${MYSQL_HOST}:${MYSQL_PORT} db=${MYSQL_DB}"
     mysql -h "${MYSQL_HOST}" -P "${MYSQL_PORT}" -u "${MYSQL_USER}" -p"${MYSQL_PASSWORD}" \
       --ssl-mode=REQUIRED "${MYSQL_DB}" -N -B \
-      -e "SHOW GLOBAL VARIABLES WHERE Variable_name IN (${in_list}) ORDER BY Variable_name;"
+      -e "SHOW GLOBAL VARIABLES WHERE Variable_name IN (${in_list});"
   } > "${out_file}" 2>&1
 }
 
@@ -368,7 +368,7 @@ capture_mysql_runtime_metadata() {
         'replica_parallel_workers',
         'group_replication_flow_control_certifier_threshold',
         'group_replication_flow_control_applier_threshold'
-      ) ORDER BY Variable_name;"
+      );"
   } > "${vars_tsv}" 2>&1 || true
 
   {
@@ -378,8 +378,9 @@ capture_mysql_runtime_metadata() {
       --ssl-mode=REQUIRED "${MYSQL_DB}" -N -B \
       -e "SHOW GLOBAL STATUS WHERE Variable_name IN (
         'Innodb_buffer_pool_read_requests',
-        'Innodb_buffer_pool_reads'
-      ) ORDER BY Variable_name;"
+        'Innodb_buffer_pool_reads',
+        'Innodb_buffer_pool_bytes_data'
+      );"
   } > "${status_tsv}" 2>&1 || true
 
   MYSQL_RUNTIME_TABLES="${tables}" MYSQL_RUNTIME_SCALE="${scale}" \
@@ -454,6 +455,15 @@ if redo_bytes is None:
 data_gb = scale * tables * 0.1
 read_requests = to_int(status_map.get("Innodb_buffer_pool_read_requests"))
 reads = to_int(status_map.get("Innodb_buffer_pool_reads"))
+bp_data_bytes = to_int(status_map.get("Innodb_buffer_pool_bytes_data"))
+
+
+def fmt_used_pct(used_bytes, limit_bytes):
+    if used_bytes is None or limit_bytes is None or limit_bytes <= 0:
+        return "N/A"
+    pct = max(0.0, min(100.0, (used_bytes / limit_bytes) * 100.0))
+    return f"{pct:.1f}%"
+
 
 replica_workers = vars_map.get("replica_parallel_workers", "N/A") or "N/A"
 gr_cert = vars_map.get("group_replication_flow_control_certifier_threshold", "N/A") or "N/A"
@@ -466,6 +476,9 @@ fields = {
     "MYSQL_RUNTIME_DB": db,
     "BUFFER_POOL_BYTES": str(bp_bytes if bp_bytes is not None else ""),
     "BUFFER_POOL_GB": fmt_gb(bp_bytes),
+    "BUFFER_POOL_USED_BYTES": str(bp_data_bytes if bp_data_bytes is not None else ""),
+    "BUFFER_POOL_USED_GB": fmt_gb(bp_data_bytes),
+    "BUFFER_POOL_USED_PCT": fmt_used_pct(bp_data_bytes, bp_bytes),
     "REDO_LOG_CAPACITY_BYTES": str(redo_bytes if redo_bytes is not None else ""),
     "REDO_LOG_CAPACITY_GB": fmt_gb(redo_bytes),
     "BUFFER_POOL_HIT_PCT": fmt_hit_pct(read_requests, reads),
@@ -482,6 +495,8 @@ with open(runtime_env, "w", encoding="utf-8") as f:
 
 merge_keys = (
     "BUFFER_POOL_GB",
+    "BUFFER_POOL_USED_GB",
+    "BUFFER_POOL_USED_PCT",
     "REDO_LOG_CAPACITY_GB",
     "BUFFER_POOL_HIT_PCT",
     "BUFFER_POOL_DATA_RATIO",
@@ -510,7 +525,8 @@ PY
     echo "Captured MySQL runtime metadata: ${runtime_env}"
     # shellcheck disable=SC1090
     source "${runtime_env}" 2>/dev/null || true
-    echo "  Buffer pool:              ${BUFFER_POOL_GB:-N/A}"
+    echo "  Buffer pool limit:        ${BUFFER_POOL_GB:-N/A}"
+    echo "  Buffer pool used (VIP):   ${BUFFER_POOL_USED_GB:-N/A} (${BUFFER_POOL_USED_PCT:-N/A})"
     echo "  Redo log capacity:        ${REDO_LOG_CAPACITY_GB:-N/A}"
     echo "  Buffer pool hit %:        ${BUFFER_POOL_HIT_PCT:-N/A}"
     echo "  Buffer pool / data ratio: ${BUFFER_POOL_DATA_RATIO:-N/A}"
