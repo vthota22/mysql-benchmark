@@ -412,7 +412,7 @@ def generate_summary(
             )
             # Flag high queue (potential lag during failover)
             high_queue = [(r.timestamp, r.gr_queue) for r in pod_rows
-                          if r.gr_queue not in ("?", "") and int(r.gr_queue) > 100]
+                          if r.gr_queue not in ("?", "") and r.gr_queue.isdigit() and int(r.gr_queue) > 100]
             if high_queue:
                 lines.append(f"    HIGH QUEUE (>100 txns): {len(high_queue)} occurrence(s)")
                 for ts, q in high_queue[:5]:

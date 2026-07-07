@@ -330,9 +330,11 @@ def _parse_scale_header(timing: ScaleTiming, run_dir_name: str) -> dict[str, str
     desc = timing.scale_description or timing.scale_types or run_dir_name
     scale_type = desc
     from_size = timing.initial_size
-    to_size = timing.target_size
+    to_size = timing.target_size or timing.initial_size
     initial_storage = timing.initial_storage_gib
     target_storage = timing.target_storage_gib or timing.initial_storage_gib
+    initial_nodes = timing.initial_nodes
+    target_nodes = timing.target_nodes or timing.initial_nodes
 
     m = re.match(r"^([^(]+?)\s*\(([^)]+)\)\s*$", desc)
     if m:
@@ -340,10 +342,23 @@ def _parse_scale_header(timing: ScaleTiming, run_dir_name: str) -> dict[str, str
         transition = m.group(2).strip()
         parts = re.split(r"\s*->\s*", transition)
         if len(parts) == 2:
-            from_size, to_size = parts[0].strip(), parts[1].strip()
+            # Only override from_size/to_size for vertical scale (slug transitions)
+            if "vertical" in scale_type:
+                from_size, to_size = parts[0].strip(), parts[1].strip()
 
-    from_label = _append_disk_to_label(_format_size_slug(from_size) or from_size, initial_storage)
-    to_label = _append_disk_to_label(_format_size_slug(to_size) or to_size, target_storage)
+    slug_label = _format_size_slug(from_size) or from_size
+    is_horizontal = "horizontal" in scale_type
+    is_storage = "storage" in scale_type
+
+    if is_horizontal:
+        from_label = f"{slug_label} · {initial_nodes} node{'s' if initial_nodes != 1 else ''} · {initial_storage} GiB disk"
+        to_label = f"{slug_label} · {target_nodes} node{'s' if target_nodes != 1 else ''} · {target_storage} GiB disk"
+    elif is_storage:
+        from_label = f"{slug_label} · {initial_nodes} node{'s' if initial_nodes != 1 else ''} · {initial_storage} GiB disk"
+        to_label = f"{slug_label} · {initial_nodes} node{'s' if initial_nodes != 1 else ''} · {target_storage} GiB disk"
+    else:
+        from_label = _append_disk_to_label(_format_size_slug(from_size) or from_size, initial_storage)
+        to_label = _append_disk_to_label(_format_size_slug(to_size) or to_size, target_storage)
 
     return {
         "scale_type": scale_type.replace("_", " ").title(),
@@ -2721,6 +2736,7 @@ def generate_report(run_dir: Path, output_path: Path | None = None) -> Path:
   {render_temporal_breakdown(activities)}
 
   {build_k8s_status_bars(k8s_rows, timing, run_dir, metrics)}
+  {render_vertical_scale_timeline(k8s_rows, timing, run_dir)}
   {render_node_join_timeline(k8s_rows, timing)}
   {render_pvc_timeline(k8s_rows)}
   </div>
