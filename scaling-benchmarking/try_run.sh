@@ -69,6 +69,15 @@ apply_mysql_host_override "${CONFIG}"
 : "${MYSQL_USER:?Set MYSQL_USER in benchmark.conf or provide CLUSTER_ID + DO_API_TOKEN}"
 : "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in benchmark.conf or provide CLUSTER_ID + DO_API_TOKEN}"
 
+host_source="benchmark.conf"
+if [[ -n "${OVERRIDE_MYSQL_HOST:-}" ]]; then
+  host_source="OVERRIDE_MYSQL_HOST"
+elif [[ -n "${DO_API_TOKEN:-}" ]]; then
+  host_source="doctl (auto-fetched)"
+fi
+log_phase "0_CONFIG" "effective MYSQL_HOST=${MYSQL_HOST} (source: ${host_source})"
+log_phase "0_CONFIG" "effective MYSQL_PORT=${MYSQL_PORT} MYSQL_USER=${MYSQL_USER}"
+
 export ENGINE MYSQL_HOST MYSQL_PORT MYSQL_USER MYSQL_PASSWORD MYSQL_DB
 
 export TPCC_TABLES="${TPCC_TABLES:-10}"
