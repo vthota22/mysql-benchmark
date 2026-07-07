@@ -327,6 +327,15 @@ require_config() {
   : "${MYSQL_USER:?Set MYSQL_USER in benchmark.conf or provide DO_API_TOKEN to auto-fetch}"
   : "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in benchmark.conf or provide DO_API_TOKEN to auto-fetch}"
 
+  local host_source="benchmark.conf"
+  if [[ -n "${OVERRIDE_MYSQL_HOST:-}" ]]; then
+    host_source="OVERRIDE_MYSQL_HOST"
+  elif [[ -n "${DO_API_TOKEN:-}" ]]; then
+    host_source="doctl (auto-fetched)"
+  fi
+  log_phase "0_CONFIG" "effective MYSQL_HOST=${MYSQL_HOST} (source: ${host_source})"
+  log_phase "0_CONFIG" "effective MYSQL_PORT=${MYSQL_PORT} MYSQL_USER=${MYSQL_USER}"
+
   if ! scaling_enabled; then
     return 0
   fi
