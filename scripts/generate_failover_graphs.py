@@ -330,8 +330,7 @@ def load_scenario_bundle(scenario_dir: Path) -> dict:
     trigger_wall = _scenario_trigger_wall_sec(scenario_dir)
     baseline = float(parsed.get("BASELINE_TPS", "0"))
     recovery = float(parsed.get("RECOVERY_THRESHOLD", str(baseline * 0.9 if baseline else 0)))
-    outage_start = float(parsed.get("OUTAGE_START", trigger_log))
-    outage_end = float(parsed.get("OUTAGE_END", trigger_log))
+    outage_start, outage_end = _derive_outage_bounds(rows, trigger_log, baseline)
     cluster_data = build_cluster_monitor_chart_data(scenario_dir, trigger_wall)
     return {
         "dir": str(scenario_dir),
@@ -1124,13 +1123,21 @@ def _scenario_trigger_wall_sec(scenario_dir: Path) -> float:
 
 
 def _scenario_trigger_log_sec(scenario_dir: Path) -> float:
-    """Sysbench report-interval second for TPS/QPS charts (excludes warmup silence)."""
-    # With no warmup silence the log axis equals the wall axis, so prefer the
-    # actual sub-second fire epoch for accurate trigger marking on the charts.
-    if _scenario_warmup_sec(scenario_dir) <= 0:
-        rel = _scenario_trigger_epoch_rel(scenario_dir)
-        if rel is not None:
-            return rel
+    """Sysbench report-interval second where the failover actually fires.
+
+    The TPS/QPS log axis starts after the warmup phase, so the real fire lands at
+    ``(trigger_epoch - sysbench_ready_epoch) - warmup`` on that axis. Deriving it
+    from the recorded epochs — rather than the *planned* FAILOVER_TRIGGER_LOG_SECOND
+    (which is just the baseline second) — keeps the marker correct even when the
+    trigger is delayed past the plan, e.g. a GR readiness-gate wait between
+    back-to-back iterations. The result may legitimately fall beyond the end of
+    the sysbench window (trigger fired after the run stopped); callers handle
+    that. Falls back to the planned second only for older runs missing epochs.
+    """
+    rel = _scenario_trigger_epoch_rel(scenario_dir)
+    if rel is not None:
+        log_sec = rel - _scenario_warmup_sec(scenario_dir)
+        return log_sec if log_sec > 0 else rel
     for path in (scenario_dir / "failover_timeseries_meta.txt", scenario_dir / "sysbench_timing.txt"):
         timing = load_metadata(path)
         val = timing.get("FAILOVER_TRIGGER_LOG_SECOND")
@@ -1164,6 +1171,55 @@ def _scenario_trigger_log_sec(scenario_dir: Path) -> float:
 def _scenario_trigger_sec(scenario_dir: Path) -> float:
     """Log-axis trigger for throughput charts (backward-compatible alias)."""
     return _scenario_trigger_log_sec(scenario_dir)
+
+
+def _derive_outage_bounds(
+    rows: list[dict[str, float]],
+    trigger_log: float,
+    baseline_tps: float,
+) -> tuple[float, float]:
+    """Outage window (start, end) on the TPS log axis for chart shading.
+
+    Anchors to the corrected trigger second and finds the throughput collapse
+    that follows it, instead of trusting OUTAGE_START/OUTAGE_END from the KPI:
+    those are keyed off the *planned* trigger second and get widened to end-of-run
+    by low-level background err/s (the awk outage predicate includes ``err>0``).
+
+    Returns ``(trigger_log, trigger_log)`` — a zero-width (invisible) box — when
+    no collapse follows the trigger within a short window: a (near) zero-downtime
+    failover, or a trigger that fired after the sysbench window closed. Only TPS
+    is used (not err/s) so persistent background errors never inflate the box.
+    """
+    if not rows or baseline_tps <= 0:
+        return trigger_log, trigger_log
+    low = baseline_tps * 0.2
+    recover = baseline_tps * 0.5
+    ordered = sorted(rows, key=lambda r: r["elapsed_sec"])
+    # A few seconds of slack before the trigger absorbs detection latency; cap
+    # the forward search so an unrelated late stall is never mistaken for the
+    # failover outage of a low-impact promotion.
+    search_from = trigger_log - 3
+    search_to = trigger_log + 60
+    start: float | None = None
+    for r in ordered:
+        e = r["elapsed_sec"]
+        if e < search_from:
+            continue
+        if e > search_to:
+            break
+        if r["tps"] <= low:
+            start = e
+            break
+    if start is None:
+        return trigger_log, trigger_log
+    end = start
+    for r in ordered:
+        if r["elapsed_sec"] < start:
+            continue
+        if r["tps"] >= recover:
+            break
+        end = r["elapsed_sec"]
+    return start, end
 
 
 def load_k8s_pods_monitor(scenario_dir: Path) -> list[dict[str, str | float]]:
@@ -2922,8 +2978,7 @@ def generate_html_report(
     enrich_cluster_metadata(bench, edition)
     baseline_tps, baseline_qps, baseline_lat = _resolve_baseline_metrics(parsed, rows, trigger_log)
     recovery = float(parsed.get("RECOVERY_THRESHOLD", str(baseline_tps * 0.9 if baseline_tps else 0)))
-    outage_start = float(parsed.get("OUTAGE_START", trigger_log))
-    outage_end = float(parsed.get("OUTAGE_END", trigger_log))
+    outage_start, outage_end = _derive_outage_bounds(rows, trigger_log, baseline_tps)
 
     elapsed = [r["elapsed_sec"] for r in rows]
     chart_data = {
@@ -3612,17 +3667,13 @@ def generate_png_for_edition(
     meta: dict[str, str],
     parsed: dict[str, str],
 ) -> list[Path]:
-    trigger = float(
-        meta.get("FAILOVER_TRIGGER_LOG_SECOND")
-        or meta.get("FAILOVER_TRIGGER_SECOND", "0")
-    )
-    if trigger <= 0:
-        trigger = _scenario_trigger_log_sec(edition_dir)
+    # Authoritative log-axis trigger (epoch-derived); the recorded
+    # FAILOVER_TRIGGER_LOG_SECOND in meta is only the planned second.
+    trigger = _scenario_trigger_log_sec(edition_dir)
     edition = meta.get("FAILOVER_EDITION", edition_dir.name)
     baseline = float(parsed.get("BASELINE_TPS", "0"))
     recovery = float(parsed.get("RECOVERY_THRESHOLD", str(baseline * 0.9)))
-    outage_start = float(parsed.get("OUTAGE_START", trigger))
-    outage_end = float(parsed.get("OUTAGE_END", trigger))
+    outage_start, outage_end = _derive_outage_bounds(rows, trigger, baseline)
     title_base = f"Failover — {edition}"
 
     graphs_dir = edition_dir / "graphs"
