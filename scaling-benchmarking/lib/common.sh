@@ -489,6 +489,54 @@ gr_tuning_enabled() {
   return 0
 }
 
+# Snapshot the Percona CR (ps or pxc) spec to a file in the run directory.
+# Non-fatal: logs a warning and continues if kubectl or CR detection fails.
+snapshot_cr_config() {
+  local output_dir="${1:-${RUN_DIR:-}}"
+
+  if ! gr_tuning_enabled; then
+    log_phase "CR_SNAPSHOT" "skipped (K8S_KUBECONFIG not set or kubectl not found)"
+    return 0
+  fi
+
+  local ns="${K8S_NAMESPACE:-percona}"
+  local cr_type
+  cr_type="$(_gr_detect_cr_type)" || {
+    log_phase "CR_SNAPSHOT" "WARNING: could not detect CR type — skipping snapshot"
+    return 0
+  }
+
+  local cluster_name="${PXC_CLUSTER_NAME:-}"
+  if [[ -z "${cluster_name}" ]]; then
+    cluster_name="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" \
+      get "${cr_type}" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+  fi
+  if [[ -z "${cluster_name}" ]]; then
+    log_phase "CR_SNAPSHOT" "WARNING: could not determine cluster name — skipping snapshot"
+    return 0
+  fi
+
+  log_phase "CR_SNAPSHOT" "capturing ${cr_type}/${cluster_name} spec from namespace ${ns}"
+
+  local cr_yaml
+  cr_yaml="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" \
+    get "${cr_type}" "${cluster_name}" -o yaml 2>&1)" || {
+    log_phase "CR_SNAPSHOT" "WARNING: kubectl get ${cr_type}/${cluster_name} failed — ${cr_yaml}"
+    return 0
+  }
+
+  if [[ -n "${output_dir}" && -d "${output_dir}" ]]; then
+    local snapshot_file="${output_dir}/cr_snapshot_${cr_type}_${cluster_name}.yaml"
+    echo "${cr_yaml}" > "${snapshot_file}"
+    log_phase "CR_SNAPSHOT" "saved to ${snapshot_file}"
+  else
+    log_phase "CR_SNAPSHOT" "CR spec (${cr_type}/${cluster_name}):"
+    while IFS= read -r line; do
+      log_phase "CR_SNAPSHOT" "  ${line}"
+    done <<< "${cr_yaml}"
+  fi
+}
+
 _gr_detect_cr_type() {
   local ns="${K8S_NAMESPACE:-percona}"
   local name="${PXC_CLUSTER_NAME:-}"

@@ -294,6 +294,7 @@ phase2_run_with_scaling() {
   local tpcc_max_time="${TPCC_MAX_TIME:-${TPCC_TOTAL_TIME:-3600}}"
   export TPCC_MAX_TIME="${tpcc_max_time}"
 
+  snapshot_cr_config
   check_group_replication_settings
   gr_apply_without_scaling
 

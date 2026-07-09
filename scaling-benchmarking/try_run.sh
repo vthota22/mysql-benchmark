@@ -128,6 +128,8 @@ fi
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] TPC-C tables verified"
 echo ""
 
+snapshot_cr_config
+
 # Check Group Replication settings before workload
 log_phase "GR_CHECK" "querying Group Replication flow-control and exit-state settings"
 gr_vars="$(mysql_admin -e "
