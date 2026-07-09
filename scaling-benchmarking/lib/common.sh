@@ -475,33 +475,59 @@ ensure_database_exists() {
 # These functions require K8S_KUBECONFIG to be set and valid.
 
 gr_tuning_enabled() {
-  [[ -n "${K8S_KUBECONFIG:-}" && -f "${K8S_KUBECONFIG:-/nonexistent}" ]]
+  if [[ -z "${K8S_KUBECONFIG:-}" ]]; then
+    return 1
+  fi
+  if [[ ! -f "${K8S_KUBECONFIG}" ]]; then
+    log_phase "GR_TUNE" "K8S_KUBECONFIG=${K8S_KUBECONFIG} — file not found"
+    return 1
+  fi
+  if ! command -v kubectl >/dev/null 2>&1; then
+    log_phase "GR_TUNE" "kubectl not found in PATH"
+    return 1
+  fi
+  return 0
 }
 
 _gr_detect_cr_type() {
   local ns="${K8S_NAMESPACE:-percona}"
   local name="${PXC_CLUSTER_NAME:-}"
+  local err
 
   if [[ -n "${name}" ]]; then
     if kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get ps "${name}" >/dev/null 2>&1; then
-      echo "ps"
-    elif kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get pxc "${name}" >/dev/null 2>&1; then
-      echo "pxc"
+      echo "ps"; return
     fi
+    if kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get pxc "${name}" >/dev/null 2>&1; then
+      echo "pxc"; return
+    fi
+    log_phase "GR_TUNE" "cluster '${name}' not found as ps or pxc in namespace ${ns}" >&2
   else
     name="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get ps -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
     if [[ -n "${name}" ]]; then
-      echo "ps"
-      return
+      log_phase "GR_TUNE" "auto-detected ps cluster: ${name}" >&2
+      echo "ps"; return
     fi
     name="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get pxc -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
     if [[ -n "${name}" ]]; then
-      echo "pxc"
+      log_phase "GR_TUNE" "auto-detected pxc cluster: ${name}" >&2
+      echo "pxc"; return
+    fi
+    log_phase "GR_TUNE" "no ps or pxc cluster found in namespace ${ns}" >&2
+    # Try listing what CRDs exist for debugging
+    err="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get all -o name 2>&1 | head -20)" || true
+    if [[ -n "${err}" ]]; then
+      log_phase "GR_TUNE" "resources in namespace ${ns}:" >&2
+      while IFS= read -r line; do
+        log_phase "GR_TUNE" "  ${line}" >&2
+      done <<< "${err}"
     fi
   fi
 }
 
 # Print running MySQL pod names, one per line.
+# First line of output is the container name; subsequent lines are pod names.
+# All log messages go to stderr (stdout is reserved for the caller to capture).
 _gr_get_mysql_pods() {
   local ns="${K8S_NAMESPACE:-percona}"
   local cluster="${PXC_CLUSTER_NAME:-}"
@@ -512,7 +538,7 @@ _gr_get_mysql_pods() {
     ps)  component="database"; container="mysql" ;;
     pxc) component="pxc";      container="pxc" ;;
     *)
-      log_phase "GR_TUNE" "ERROR: cannot detect CR type (ps/pxc) in namespace ${ns}"
+      log_phase "GR_TUNE" "ERROR: cannot detect CR type (ps/pxc) — K8S_NAMESPACE=${ns} PXC_CLUSTER_NAME=${PXC_CLUSTER_NAME:-<empty>}" >&2
       return 1
       ;;
   esac
@@ -522,12 +548,30 @@ _gr_get_mysql_pods() {
       ps)  cluster="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get ps -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" ;;
       pxc) cluster="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get pxc -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" ;;
     esac
+    if [[ -z "${cluster}" ]]; then
+      log_phase "GR_TUNE" "ERROR: could not auto-detect cluster name for CR type ${cr_type}" >&2
+      return 1
+    fi
   fi
 
-  echo "${container}"  # first line = container name
-  kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get pods \
-    -l "app.kubernetes.io/instance=${cluster},app.kubernetes.io/component=${component}" \
-    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null
+  log_phase "GR_TUNE" "cluster=${cluster} cr_type=${cr_type} container=${container} component=${component} ns=${ns}" >&2
+
+  local label="app.kubernetes.io/instance=${cluster},app.kubernetes.io/component=${component}"
+  local pod_list
+  pod_list="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get pods \
+    -l "${label}" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>&1)" || {
+    log_phase "GR_TUNE" "ERROR: kubectl get pods failed: ${pod_list}" >&2
+    return 1
+  }
+
+  if [[ -z "${pod_list}" ]]; then
+    log_phase "GR_TUNE" "ERROR: no running pods matched label: ${label}" >&2
+    return 1
+  fi
+
+  echo "${container}"
+  echo "${pod_list}"
 }
 
 # Get MySQL root password for kubectl exec (reuses K8s monitor credentials).
@@ -550,8 +594,14 @@ _gr_get_password() {
     fi
     secret="${cluster}-secrets"
   fi
-  kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get secret "${secret}" \
-    -o jsonpath='{.data.root}' 2>/dev/null | base64 -d 2>/dev/null || true
+  log_phase "GR_TUNE" "fetching password from secret ${secret} in namespace ${ns}" >&2
+  local pass
+  pass="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get secret "${secret}" \
+    -o jsonpath='{.data.root}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+  if [[ -z "${pass}" ]]; then
+    log_phase "GR_TUNE" "WARNING: could not read password from secret ${secret}" >&2
+  fi
+  echo "${pass}"
 }
 
 # Run a MySQL statement on a single pod via kubectl exec.
@@ -572,12 +622,15 @@ gr_set_on_all_pods() {
   local phase="${1}" var_name="${2}" value="${3}"
 
   if ! gr_tuning_enabled; then
-    log_phase "${phase}" "skipped (K8S_KUBECONFIG not set)"
+    log_phase "${phase}" "skipped (K8S_KUBECONFIG not set or kubectl not found)"
     return 0
   fi
 
   local pod_info password container
-  pod_info="$(_gr_get_mysql_pods)" || return 1
+  pod_info="$(_gr_get_mysql_pods)" || {
+    log_phase "${phase}" "ERROR: failed to discover MySQL pods — cannot set ${var_name}"
+    return 1
+  }
   container="$(echo "${pod_info}" | head -1)"
   password="$(_gr_get_password)"
 
@@ -597,26 +650,26 @@ gr_set_on_all_pods() {
     return 1
   fi
 
-  log_phase "${phase}" "setting ${var_name}=${value} on ${#pods[@]} pod(s)"
+  log_phase "${phase}" "setting ${var_name}=${value} on ${#pods[@]} pod(s): ${pods[*]}"
 
   local failed=0
   for pod in "${pods[@]}"; do
-    if _gr_mysql_in_pod "${pod}" "${container}" "${password}" \
-        "SET GLOBAL ${var_name} = ${value};" 2>/dev/null; then
+    local set_err
+    if set_err="$(_gr_mysql_in_pod "${pod}" "${container}" "${password}" \
+        "SET GLOBAL ${var_name} = ${value};" 2>&1)"; then
       log_phase "${phase}" "  ${pod}: SET OK"
     else
-      log_phase "${phase}" "  ${pod}: SET FAILED"
+      log_phase "${phase}" "  ${pod}: SET FAILED — ${set_err}"
       failed=1
     fi
   done
 
-  # Verify on every pod
   log_phase "${phase}" "verifying ${var_name} on all pods"
   local all_ok=1
   for pod in "${pods[@]}"; do
     local actual
     actual="$(_gr_mysql_in_pod "${pod}" "${container}" "${password}" \
-      "SELECT @@GLOBAL.${var_name};" 2>/dev/null)" || true
+      "SELECT @@GLOBAL.${var_name};" 2>&1)" || true
     actual="$(echo "${actual}" | tr -d '[:space:]')"
     local expected_trimmed
     expected_trimmed="$(echo "${value}" | tr -d "'" | tr -d '[:space:]')"
