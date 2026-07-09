@@ -183,12 +183,75 @@ def _mysql_pod_bp_meta_rows(edition_dir: Path) -> list[tuple[str, str]]:
     return rows
 
 
-def _edition_metadata_rows(edition_dir: Path, bench: dict[str, str]) -> list[tuple[str, str]]:
+def _gr_pre_failover_applier_meta_rows(scenario_dir: Path) -> list[tuple[str, str]]:
+    """Per-pod applier queue at trigger time (preferred) or 30s pre-trigger window."""
+    rows: list[tuple[str, str]] = []
+    env_path = scenario_dir / "gr_pre_failover_applier.env"
+    tsv_path = scenario_dir / "gr_pre_failover_applier.tsv"
+
+    if env_path.exists():
+        env = load_metadata(env_path)
+        captured = env.get("GR_PRE_FAILOVER_APPLIER_CAPTURED_UTC", "")
+        if captured:
+            rows.append(("Applier snapshot (UTC)", captured))
+        lag_leader = env.get("GR_PRE_FAILOVER_LAG_LEADER_POD", "")
+        if lag_leader:
+            rows.append(("Pre-trigger lag leader", lag_leader))
+        for key, val in sorted(env.items()):
+            if not key.startswith("GR_PRE_FAILOVER_POD_APPLIER_"):
+                continue
+            pod = key.removeprefix("GR_PRE_FAILOVER_POD_APPLIER_")
+            if not pod or val in ("", "N/A"):
+                continue
+            rows.append((f"Applier queue ({pod})", val))
+        if rows:
+            return rows
+
+    if tsv_path.exists():
+        for line in tsv_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("pod\t"):
+                continue
+            parts = line.split("\t")
+            if len(parts) < 7:
+                continue
+            pod, connect_ok, _host, role, state, _cert, applier = parts[:7]
+            if connect_ok != "1":
+                rows.append((f"Applier queue ({pod})", "unreachable"))
+            else:
+                suffix = f" [{role}/{state}]" if role not in ("", "ERROR", "N/A") else ""
+                rows.append((f"Applier queue ({pod})", f"{applier}{suffix}"))
+        if rows:
+            return rows
+
+    trigger = _scenario_trigger_wall_sec(scenario_dir)
+    summary = build_gr_pre_failover_summary(scenario_dir, trigger)
+    if not summary:
+        return []
+    lag_leader = str(summary.get("lag_leader_pod") or "")
+    if lag_leader:
+        rows.append(("Pre-trigger lag leader (30s window)", lag_leader))
+    for pod_row in summary.get("pods") or []:
+        pod = str(pod_row.get("pod") or "")
+        max_a = pod_row.get("max_applier")
+        if pod and max_a is not None:
+            rows.append((f"Applier queue max ({pod})", str(max_a)))
+    return rows
+
+
+def _edition_metadata_rows(
+    edition_dir: Path,
+    bench: dict[str, str],
+    scenario_dir: Path | None = None,
+) -> list[tuple[str, str]]:
     edition_root = parent_edition_dir(edition_dir) or edition_dir
-    return [
+    rows = [
         *_mysql_runtime_meta_rows(bench),
-        *_mysql_pod_bp_meta_rows(edition_root),
     ]
+    if scenario_dir is not None:
+        rows.extend(_gr_pre_failover_applier_meta_rows(scenario_dir))
+    rows.extend(_mysql_pod_bp_meta_rows(edition_root))
+    return rows
 
 
 def _format_data_size(cfg: dict[str, str]) -> str:
@@ -708,7 +771,7 @@ def _meta_rows_for_bundle(bundle: dict) -> list[tuple[str, str]]:
         ("Data size", _format_data_size(bench)),
         ("TPCC_SCALE", _cfg_value(bench, "TPCC_SCALE")),
         ("TPCC_THREADS", _cfg_value(bench, "TPCC_THREADS", "PREP_THREADS")),
-        *_edition_metadata_rows(Path(bundle["dir"]), bench),
+        *_edition_metadata_rows(Path(bundle["dir"]), bench, Path(bundle["dir"])),
         ("Sysbench start (UTC)", meta.get("SYSBENCH_START_UTC", "N/A")),
         ("Failover trigger (UTC)", event.get("FAILOVER_TRIGGER_UTC", "N/A")),
         *trigger_rows,
@@ -2370,6 +2433,16 @@ def _metrics_summary_html(
     )
 
 
+def _metrics_with_promote_split_html(
+    kpi: dict[str, str],
+    extended: dict[str, str],
+    primary: dict[str, str],
+    parsed: dict[str, str],
+    scenario_dir: Path,
+) -> str:
+    return _metrics_summary_html(kpi, extended, primary, parsed) + _promote_three_phase_html(scenario_dir)
+
+
 def load_promotion_breakdown(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         return []
@@ -2421,7 +2494,99 @@ HA_CONVERGENCE_DEFINITION = (
     "Time for HAProxy to probe the new primary and update the routing pool. "
     "Traffic cannot resume until the proxy sees the new primary is ready."
 )
-PROMOTION_BREAKDOWN_TITLE = "Time to promote new primary and accept writes breakdown"
+PROMOTE_PHASE_DEFINITIONS: list[tuple[str, str, str]] = [
+    (
+        "promote_gr_election_after_ttd",
+        "GR election",
+        "mysqld log: A new primary was elected (fallback: gr_pod_monitor PRIMARY+ONLINE)",
+    ),
+    (
+        "promote_ha_routing_after_ttd",
+        "HAProxy route update",
+        "haproxy_stats_monitor: first mysql-primary UP on elected server (fallback: VIP hostname change)",
+    ),
+    (
+        "promote_replication_lag_after_ttd",
+        "Replication / apply lag",
+        "HA routing ready (stats UP) -> write probe OK on client VIP (internal apply: mysqld working-as-primary log)",
+    ),
+    (
+        "promote_total",
+        "Time to promote (total)",
+        "TTD -> write probe OK (sum of three phases above)",
+    ),
+]
+
+
+def _promote_three_phase_html(scenario_dir: Path) -> str:
+    breakdown_rows = load_promotion_breakdown(scenario_dir / "failover_promotion_breakdown.csv")
+    if not breakdown_rows:
+        return ""
+    by_phase = {row.get("phase", ""): row for row in breakdown_rows}
+    total_row = by_phase.get("promote_total", {})
+    total_dur = _breakdown_cell_duration(total_row.get("duration_from_ttd_sec", "N/A"))
+    if total_dur == "N/A":
+        return ""
+
+    env = load_metadata(scenario_dir / "gr_election_internal.env")
+    ha_env = load_metadata(scenario_dir / "haproxy_primary_up.env")
+    sources: list[str] = []
+    if env.get("GR_ELECTION_SOURCE") == "mysql_pod_logs":
+        sources.append("GR election: mysqld pod logs (A new primary was elected)")
+    elif (scenario_dir / "gr_pod_monitor.tsv").exists():
+        sources.append("GR election: gr_pod_monitor.tsv fallback")
+    if env.get("GR_WRITABLE_SOURCE") == "mysql_pod_logs":
+        sources.append("Apply lag note: mysqld working-as-primary log on elected pod")
+    if ha_env.get("HAPROXY_PRIMARY_UP_SOURCE") == "haproxy_stats_monitor":
+        server = ha_env.get("HAPROXY_PRIMARY_UP_SERVER", "elected server")
+        sources.append(f"HA routing: haproxy_stats_monitor ({server} UP in mysql-primary backend)")
+    else:
+        sources.append("HA routing: primary_monitor.tsv hostname change on client VIP (stats monitor fallback)")
+    internal_apply_note = ""
+    election_sec = _parse_metric_sec(env.get("GR_ELECTION_FROM_TRIGGER_SEC"))
+    writable_sec = _parse_metric_sec(env.get("GR_WRITABLE_FROM_TRIGGER_SEC"))
+    if election_sec is not None and writable_sec is not None and writable_sec > election_sec:
+        internal_apply_note = (
+            f'<p class="muted" style="margin:0.5rem 0 0;font-size:0.82rem">'
+            f"<strong>Internal apply lag (mysqld logs):</strong> "
+            f"{html.escape(_format_duration_sec(writable_sec - election_sec))} "
+            f"(elected → working-as-primary on {html.escape(env.get('GR_ELECTION_POD', 'elected pod'))}). "
+            f"May exceed client-visible replication phase when VIP is down until the new host accepts connections."
+            f"</p>"
+        )
+    source_note = " · ".join(sources)
+
+    body: list[str] = []
+    accounted = 0.0
+    for phase_key, title, help_text in PROMOTE_PHASE_DEFINITIONS:
+        row = by_phase.get(phase_key, {})
+        dur_raw = row.get("duration_from_ttd_sec", "N/A")
+        dur = _breakdown_cell_duration(dur_raw)
+        at_trig = _breakdown_cell_time(row.get("time_from_trigger_sec", "N/A"))
+        row_class = ' class="row-total"' if phase_key == "promote_total" else ""
+        if phase_key != "promote_total":
+            parsed = _parse_metric_sec(dur_raw)
+            if parsed is not None:
+                accounted += max(0.0, parsed)
+        body.append(
+            f"<tr{row_class}><td class=\"phase-name-cell\"><div class=\"metric-title\">{html.escape(title)}</div>"
+            f'<div class="metric-help">{html.escape(help_text)}</div></td>'
+            f'<td class="num">{html.escape(dur)}</td>'
+            f'<td class="num">{html.escape(at_trig)}</td></tr>'
+        )
+
+    return f"""
+      <h3 style="font-size:0.92rem;color:var(--accent);margin:1rem 0 0.5rem">Time to promote and accept writes</h3>
+      <p class="muted" style="margin:0 0 0.75rem;font-size:0.85rem">
+        Three phases from first connect failure (TTD) to write probe OK on the client VIP.
+      </p>
+      <table class="metrics promotion-breakdown" style="margin-bottom:0.75rem">
+        <thead><tr><th>Phase</th><th>Duration (from TTD)</th><th>At (from trigger)</th></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table>
+      <p class="muted" style="margin:0;font-size:0.82rem"><strong>Sources:</strong> {html.escape(source_note)}</p>
+      {internal_apply_note}
+    """
 
 
 def _parse_utc_timestamp(raw: str) -> datetime | None:
@@ -3019,7 +3184,7 @@ def generate_html_report(
         ("Data size", _format_data_size(bench)),
         ("TPCC_SCALE", _cfg_value(bench, "TPCC_SCALE")),
         ("TPCC_THREADS", _cfg_value(bench, "TPCC_THREADS", "PREP_THREADS")),
-        *_edition_metadata_rows(edition_dir, bench),
+        *_edition_metadata_rows(edition_dir, bench, edition_dir),
         ("Sysbench start (UTC)", meta.get("SYSBENCH_START_UTC", "N/A")),
         ("Failover trigger (UTC)", event.get("FAILOVER_TRIGGER_UTC", "N/A")),
         *trigger_meta_rows,
@@ -3167,7 +3332,7 @@ def generate_html_report(
       </div>
       <div class="card">
         <h2>Failover metrics</h2>
-        {_metrics_summary_html(kpi, extended, primary, parsed)}
+        {_metrics_with_promote_split_html(kpi, extended, primary, parsed, edition_dir)}
       </div>
       <div class="card">
         <h2>Errors &amp; reconnects</h2>
@@ -3332,8 +3497,8 @@ def generate_combined_sweep_html_report(
         hidden = "" if (sweep_id == default_sweep and scenario == default_scenario) else ' style="display:none"'
         bundle = bundles[key]
         meta_html = _meta_table_html(_meta_rows_for_bundle(bundle))
-        metrics_html = _metrics_summary_html(
-            bundle["kpi"], bundle["extended"], bundle["primary"], bundle["parsed"]
+        metrics_html = _metrics_with_promote_split_html(
+            bundle["kpi"], bundle["extended"], bundle["primary"], bundle["parsed"], Path(bundle["dir"])
         )
         monitor_html = _monitor_trigger_table_html(Path(bundle["dir"]), bundle)
         compare_html = _before_after_throughput_table_html(bundle)

@@ -25,11 +25,18 @@ failover_defaults() {
   : "${FAILOVER_MONITOR_HOSTNAME:=0}"
   : "${FAILOVER_MONITOR_PRIMARY:=1}"
   : "${FAILOVER_MONITOR_WRITE_PROBE:=1}"
+  # Legacy fallback when the split intervals below are unset.
   : "${FAILOVER_MONITOR_INTERVAL:=1}"
+  # VIP/client-path monitor (primary_monitor.tsv); sub-second default for promote KPI accuracy.
+  : "${FAILOVER_PRIMARY_MONITOR_INTERVAL:=}"
+  # Shared by GR pod + K8s pod monitors (kubectl); keep >= 1s to avoid exec backlog.
+  : "${FAILOVER_CLUSTER_MONITOR_INTERVAL:=}"
   : "${FAILOVER_MONITOR_CONNECT_TIMEOUT:=1}"
   : "${FAILOVER_MONITOR_OP_TIMEOUT:=1}"
   : "${FAILOVER_GR_POD_MONITOR:=1}"
   : "${FAILOVER_K8S_POD_MONITOR:=1}"
+  : "${FAILOVER_HAPROXY_STATS_MONITOR:=1}"
+  : "${FAILOVER_HAPROXY_STATS_MONITOR_INTERVAL:=0.5}"
   # Block failover trigger until all GR members are ONLINE and none RECOVERING
   : "${FAILOVER_GR_READINESS_GATE:=1}"
   : "${FAILOVER_GR_READINESS_POLL_SEC:=2}"
@@ -495,6 +502,24 @@ if delay > 0:
 "
 }
 
+# Primary (VIP) poll grid. Defaults to 0.25s when unset; falls back to FAILOVER_MONITOR_INTERVAL.
+_failover_primary_monitor_interval() {
+  if [[ -n "${FAILOVER_PRIMARY_MONITOR_INTERVAL}" ]]; then
+    echo "${FAILOVER_PRIMARY_MONITOR_INTERVAL}"
+  else
+    echo "${FAILOVER_MONITOR_INTERVAL:-0.25}"
+  fi
+}
+
+# GR + K8s pod poll grid. Defaults to 1s when unset; falls back to FAILOVER_MONITOR_INTERVAL.
+_failover_cluster_monitor_interval() {
+  if [[ -n "${FAILOVER_CLUSTER_MONITOR_INTERVAL}" ]]; then
+    echo "${FAILOVER_CLUSTER_MONITOR_INTERVAL}"
+  else
+    echo "${FAILOVER_MONITOR_INTERVAL:-1}"
+  fi
+}
+
 _failover_monitor_append_row() {
   local out_file="${1:?out file required}"
   local ts="${2:?timestamp required}"
@@ -532,7 +557,8 @@ start_primary_monitor() {
   local pid_file="${results_dir}/primary_monitor.pid"
   local out_file="${results_dir}/primary_monitor.tsv"
   local meta_file="${results_dir}/primary_monitor_meta.txt"
-  local interval="${FAILOVER_MONITOR_INTERVAL}"
+  local interval
+  interval="$(_failover_primary_monitor_interval)"
   local connect_timeout="${FAILOVER_MONITOR_CONNECT_TIMEOUT}"
   local op_timeout="${FAILOVER_MONITOR_OP_TIMEOUT}"
   local start_epoch
@@ -544,6 +570,7 @@ start_primary_monitor() {
     echo "MONITOR_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "MONITOR_START_EPOCH=${start_epoch}"
     echo "MONITOR_INTERVAL_SEC=${interval}"
+    echo "PRIMARY_MONITOR_INTERVAL_SEC=${interval}"
     echo "MONITOR_SCHEDULE=fixed_interval"
     echo "MONITOR_SESSION=single_connection"
     echo "MONITOR_CONNECT_TIMEOUT_SEC=${connect_timeout}"
@@ -716,6 +743,78 @@ capture_mysql_pod_buffer_pool_metadata() {
   return 0
 }
 
+# One-shot per-pod GR applier queue snapshot immediately before failover trigger.
+capture_gr_pre_failover_applier_snapshot() {
+  local results_dir="${1:?results dir required}"
+  local kubeconfig=""
+  local ns="${ADVANCED_K8S_NAMESPACE:-}"
+  local out_tsv="${results_dir}/gr_pre_failover_applier.tsv"
+  local out_env="${results_dir}/gr_pre_failover_applier.env"
+  local captured_utc
+  captured_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  command -v kubectl >/dev/null 2>&1 || {
+    echo "GR pre-failover applier: skipped (kubectl not found)" >&2
+    return 0
+  }
+  [[ -n "${ns}" ]] || {
+    echo "GR pre-failover applier: skipped (ADVANCED_K8S_NAMESPACE unset)" >&2
+    return 0
+  }
+  if ! kubeconfig="$(_failover_resolve_kubeconfig "${results_dir}")"; then
+    echo "GR pre-failover applier: skipped (no kubeconfig)" >&2
+    return 0
+  fi
+
+  local pod line hostname role state cert_q applier_q
+  local -a pod_rows=()
+  local lag_leader="" lag_leader_q=-1
+
+  {
+    echo "# captured_utc=${captured_utc}"
+    echo "# namespace=${ns} kubeconfig=${kubeconfig}"
+    echo -e "pod\tconnect_ok\thostname\tgr_role\tgr_member_state\tcert_queue\tapplier_queue"
+    while IFS= read -r pod; do
+      [[ -n "${pod}" ]] || continue
+      line="$(_failover_poll_gr_pod_once "${kubeconfig}" "${ns}" "${pod}")"
+      if [[ "${line}" == *$'\t'* ]]; then
+        IFS=$'\t' read -r hostname role state cert_q applier_q _rest <<< "${line}"
+        cert_q="${cert_q:--1}"
+        applier_q="${applier_q:--1}"
+        echo -e "${pod}\t1\t${hostname}\t${role}\t${state}\t${cert_q}\t${applier_q}"
+        pod_rows+=("${pod}"$'\t'"${applier_q}")
+        if [[ "${applier_q}" =~ ^-?[0-9]+$ ]] && (( applier_q >= lag_leader_q )); then
+          lag_leader_q="${applier_q}"
+          lag_leader="${pod}"
+        fi
+      else
+        echo -e "${pod}\t0\tERROR\tERROR\tERROR\t-1\t-1"
+      fi
+    done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
+  } > "${out_tsv}"
+
+  if [[ "$(wc -l < "${out_tsv}" | tr -d ' ')" -le 2 ]]; then
+    echo "WARNING: GR pre-failover applier capture returned no pod rows" >&2
+    return 1
+  fi
+
+  {
+    echo "GR_PRE_FAILOVER_APPLIER_CAPTURED_UTC=${captured_utc}"
+    echo "GR_PRE_FAILOVER_APPLIER_NAMESPACE=${ns}"
+    echo "GR_PRE_FAILOVER_LAG_LEADER_POD=${lag_leader}"
+    while IFS=$'\t' read -r pod applier_q; do
+      [[ -n "${pod}" ]] || continue
+      echo "GR_PRE_FAILOVER_POD_APPLIER_${pod}=${applier_q}"
+    done < <(printf '%s\n' "${pod_rows[@]}")
+  } > "${out_env}"
+
+  echo "Captured GR pre-failover applier queues: ${out_tsv}"
+  if [[ -n "${lag_leader}" ]]; then
+    echo "  Pre-trigger applier lag leader: ${lag_leader} (queue=${lag_leader_q})"
+  fi
+  return 0
+}
+
 _failover_poll_k8s_mysql_pods_once() {
   local kubeconfig="${1:?kubeconfig required}"
   local ns="${2:?namespace required}"
@@ -780,7 +879,8 @@ start_gr_pod_monitor() {
   kubeconfig="$(_failover_resolve_kubeconfig "${results_dir}")" || return 0
   [[ -n "${ns}" ]] || return 0
 
-  local interval="${FAILOVER_MONITOR_INTERVAL}"
+  local interval
+  interval="$(_failover_cluster_monitor_interval)"
   local start_epoch
   start_epoch=$(python3 -c "import time; print('%.3f' % time.time())")
 
@@ -790,6 +890,7 @@ start_gr_pod_monitor() {
     echo "GR_POD_MONITOR_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "GR_POD_MONITOR_START_EPOCH=${start_epoch}"
     echo "GR_POD_MONITOR_INTERVAL_SEC=${interval}"
+    echo "CLUSTER_MONITOR_INTERVAL_SEC=${interval}"
     echo "GR_POD_MONITOR_NAMESPACE=${ns}"
     echo "GR_POD_MONITOR_KUBECONFIG=${kubeconfig}"
   } > "${meta_file}"
@@ -876,7 +977,8 @@ start_k8s_pods_monitor() {
     target_pod="${FAILOVER_TARGET_POD:-}"
   fi
 
-  local interval="${FAILOVER_MONITOR_INTERVAL}"
+  local interval
+  interval="$(_failover_cluster_monitor_interval)"
   local start_epoch
   start_epoch=$(python3 -c "import time; print('%.3f' % time.time())")
 
@@ -886,6 +988,7 @@ start_k8s_pods_monitor() {
     echo "K8S_PODS_MONITOR_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "K8S_PODS_MONITOR_START_EPOCH=${start_epoch}"
     echo "K8S_PODS_MONITOR_INTERVAL_SEC=${interval}"
+    echo "CLUSTER_MONITOR_INTERVAL_SEC=${interval}"
     echo "K8S_PODS_MONITOR_NAMESPACE=${ns}"
     echo "K8S_PODS_MONITOR_KUBECONFIG=${kubeconfig}"
     echo "K8S_PODS_MONITOR_TARGET_POD=${target_pod}"
@@ -964,6 +1067,249 @@ stop_k8s_pods_monitor() {
   fi
 }
 
+_failover_haproxy_stats_monitor_interval() {
+  if [[ -n "${FAILOVER_HAPROXY_STATS_MONITOR_INTERVAL}" ]]; then
+    echo "${FAILOVER_HAPROXY_STATS_MONITOR_INTERVAL}"
+  else
+    echo "0.5"
+  fi
+}
+
+_failover_list_haproxy_pods() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local -a kubectl
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+  "${kubectl[@]}" get pods -n "${ns}" --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null \
+    | grep -E 'haproxy-[0-9]+$' | sort || true
+}
+
+_failover_poll_haproxy_stats_once() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local haproxy_pod="${3:?haproxy pod required}"
+  local -a kubectl
+  local exec_timeout="${FAILOVER_MONITOR_OP_TIMEOUT:-2}"
+  (( exec_timeout < 5 )) && exec_timeout=5
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+  _failover_run_timeout "${exec_timeout}" "${kubectl[@]}" exec -n "${ns}" "${haproxy_pod}" -c haproxy -- \
+    sh -c 'echo show stat | socat stdio /etc/haproxy/mysql/haproxy.sock 2>/dev/null' 2>/dev/null \
+    | python3 -c '
+import sys
+for raw in sys.stdin:
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    parts = line.split(",")
+    if len(parts) < 20:
+        continue
+    px, sv = parts[0], parts[1]
+    if px != "mysql-primary" or sv in ("FRONTEND", "BACKEND"):
+        continue
+    status = parts[17]
+    act = parts[19] if len(parts) > 19 else ""
+    bck = parts[20] if len(parts) > 20 else ""
+    lastchg = parts[24] if len(parts) > 24 else ""
+    check_status = parts[36] if len(parts) > 36 else ""
+    print(f"{sv}\t{status}\t{check_status}\t{lastchg}\t{act}\t{bck}")
+'
+}
+
+start_haproxy_stats_monitor() {
+  local results_dir="${1:?results dir required}"
+  local pid_file="${results_dir}/haproxy_stats_monitor.pid"
+  local out_file="${results_dir}/haproxy_stats_monitor.tsv"
+  local meta_file="${results_dir}/haproxy_stats_monitor_meta.txt"
+  local kubeconfig=""
+  local ns="${ADVANCED_K8S_NAMESPACE:-}"
+
+  command -v kubectl >/dev/null 2>&1 || return 0
+  kubeconfig="$(_failover_resolve_kubeconfig "${results_dir}")" || return 0
+  [[ -n "${ns}" ]] || return 0
+
+  local interval
+  interval="$(_failover_haproxy_stats_monitor_interval)"
+  local start_epoch
+  start_epoch=$(python3 -c "import time; print('%.3f' % time.time())")
+
+  : > "${out_file}"
+  echo -e "timestamp_utc\telapsed_sec\thaproxy_pod\tpoll_ok\tserver\tstatus\tcheck_status\tlastchg_sec\tact\tbck" >> "${out_file}"
+  {
+    echo "HAPROXY_STATS_MONITOR_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "HAPROXY_STATS_MONITOR_START_EPOCH=${start_epoch}"
+    echo "HAPROXY_STATS_MONITOR_INTERVAL_SEC=${interval}"
+    echo "HAPROXY_STATS_MONITOR_NAMESPACE=${ns}"
+    echo "HAPROXY_STATS_MONITOR_KUBECONFIG=${kubeconfig}"
+    echo "HAPROXY_STATS_SOCKET=/etc/haproxy/mysql/haproxy.sock"
+    echo "HAPROXY_STATS_BACKEND=mysql-primary"
+  } > "${meta_file}"
+
+  (
+    local tick=0 target_epoch elapsed ts haproxy_pod line poll_ok
+    local server status check_status lastchg act bck
+    while true; do
+      due_tick=$(python3 -c "
+import math, time
+start = float('${start_epoch}')
+interval = float('${interval}')
+print(int(math.floor((time.time() - start) / interval)))
+")
+      while (( tick < due_tick )); do
+        tick=$((tick + 1))
+      done
+
+      target_epoch=$(python3 -c "print(float('${start_epoch}') + ${tick} * float('${interval}'))")
+      _failover_monitor_sleep_until "${target_epoch}"
+
+      elapsed=$(python3 -c "print('%.3f' % (float('${target_epoch}') - float('${start_epoch}')))")
+      ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+      while IFS= read -r haproxy_pod; do
+        [[ -n "${haproxy_pod}" ]] || continue
+        poll_ok=0
+        while IFS= read -r line; do
+          [[ -n "${line}" ]] || continue
+          poll_ok=1
+          IFS=$'\t' read -r server status check_status lastchg act bck <<< "${line}"
+          echo -e "${ts}\t${elapsed}\t${haproxy_pod}\t1\t${server}\t${status}\t${check_status}\t${lastchg}\t${act}\t${bck}" >> "${out_file}"
+        done < <(_failover_poll_haproxy_stats_once "${kubeconfig}" "${ns}" "${haproxy_pod}")
+        if [[ "${poll_ok}" -eq 0 ]]; then
+          echo -e "${ts}\t${elapsed}\t${haproxy_pod}\t0\tERROR\tERROR\tERROR\t-1\t0\t0" >> "${out_file}"
+        fi
+      done < <(_failover_list_haproxy_pods "${kubeconfig}" "${ns}")
+
+      tick=$((tick + 1))
+    done
+  ) &
+
+  echo $! > "${pid_file}"
+  echo "HAProxy stats monitor started (pid=$(cat "${pid_file}"), ${interval}s grid, show stat on mysql-primary pool)"
+}
+
+stop_haproxy_stats_monitor() {
+  local results_dir="${1:?results dir required}"
+  local pid_file="${results_dir}/haproxy_stats_monitor.pid"
+
+  if [[ -f "${pid_file}" ]]; then
+    local pid
+    pid=$(cat "${pid_file}")
+    if kill -0 "${pid}" 2>/dev/null; then
+      pkill -TERM -P "${pid}" 2>/dev/null || true
+      kill "${pid}" 2>/dev/null || true
+      wait "${pid}" 2>/dev/null || true
+    fi
+    rm -f "${pid_file}"
+  fi
+  if [[ -f "${results_dir}/haproxy_stats_monitor_meta.txt" ]]; then
+    echo "HAPROXY_STATS_MONITOR_END_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${results_dir}/haproxy_stats_monitor_meta.txt"
+  fi
+}
+
+_failover_haproxy_stat_server_for_pod() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local pod="${3:?pod required}"
+  local -a kubectl ip
+
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+  ip=$("${kubectl[@]}" get pod -n "${ns}" "${pod}" -o jsonpath='{.status.podIP}' 2>/dev/null || true)
+  [[ -n "${ip}" ]] || return 1
+  echo "${ip//./-}"
+}
+
+_failover_parse_haproxy_stats_primary_up() {
+  local results_dir="${1:?results dir required}"
+  local elected_pod="${2:-}"
+  local out_env="${results_dir}/haproxy_primary_up.env"
+  local stats_file="${results_dir}/haproxy_stats_monitor.tsv"
+  local meta_file="${results_dir}/haproxy_stats_monitor_meta.txt"
+  local timing_file="${results_dir}/sysbench_timing.txt"
+
+  [[ -f "${stats_file}" ]] || return 1
+
+  local kubeconfig="" ns="" monitor_offset=0 wall_trigger=0
+  if [[ -f "${meta_file}" ]]; then
+    # shellcheck disable=SC1090
+    source "${meta_file}" 2>/dev/null || true
+    kubeconfig="${HAPROXY_STATS_MONITOR_KUBECONFIG:-}"
+    ns="${HAPROXY_STATS_MONITOR_NAMESPACE:-}"
+    local monitor_start="" sysbench_ready=""
+    monitor_start=$(grep -E '^HAPROXY_STATS_MONITOR_START_EPOCH=' "${meta_file}" | cut -d= -f2- || true)
+    if [[ -f "${timing_file}" ]]; then
+      sysbench_ready=$(grep -E '^SYSBENCH_READY_EPOCH=' "${timing_file}" | cut -d= -f2- || true)
+    fi
+    if [[ -n "${monitor_start}" && -n "${sysbench_ready}" ]]; then
+      monitor_offset=$(python3 -c "print('%.3f' % (float('${sysbench_ready}') - float('${monitor_start}')))")
+    fi
+  fi
+  wall_trigger=$(failover_trigger_wall_subsec "${results_dir}" "${timing_file}")
+
+  if [[ -z "${elected_pod}" && -f "${results_dir}/gr_election_internal.env" ]]; then
+    # shellcheck disable=SC1090
+    source "${results_dir}/gr_election_internal.env" 2>/dev/null || true
+    elected_pod="${GR_ELECTION_POD:-}"
+  fi
+  if [[ -z "${elected_pod}" && -f "${results_dir}/primary_change.env" ]]; then
+    elected_pod=$(grep -E '^PRIMARY_AFTER=' "${results_dir}/primary_change.env" | cut -d= -f2- || true)
+  fi
+
+  local target_server=""
+  if [[ -n "${elected_pod}" && -n "${kubeconfig}" && -n "${ns}" ]]; then
+    target_server="$(_failover_haproxy_stat_server_for_pod "${kubeconfig}" "${ns}" "${elected_pod}" 2>/dev/null || true)"
+  fi
+
+  python3 - "${stats_file}" "${out_env}" "${monitor_offset}" "${wall_trigger}" "${target_server}" "${elected_pod}" <<'PY'
+import sys
+from pathlib import Path
+
+stats_path = Path(sys.argv[1])
+out_env = Path(sys.argv[2])
+monitor_offset = float(sys.argv[3])
+wall_trigger = float(sys.argv[4])
+target_server = sys.argv[5].strip()
+elected_pod = sys.argv[6].strip()
+
+best = None
+for line in stats_path.read_text(encoding="utf-8", errors="replace").splitlines():
+    if not line or line.startswith("timestamp_utc"):
+        continue
+    parts = line.split("\t")
+    if len(parts) < 7:
+        continue
+    _ts, elapsed_s, haproxy_pod, poll_ok, server, status = parts[:6]
+    if poll_ok != "1" or status != "UP":
+        continue
+    if target_server and server != target_server:
+        continue
+    try:
+        elapsed = float(elapsed_s) - monitor_offset
+    except ValueError:
+        continue
+    rel = elapsed - wall_trigger
+    if rel < 0:
+        continue
+    key = (rel, haproxy_pod, server)
+    if best is None or key < best[0]:
+        best = (key, haproxy_pod, server)
+
+if best is None:
+    sys.exit(1)
+
+rel, haproxy_pod, server = best[0][0], best[0][1], best[0][2]
+lines = [
+    f"HAPROXY_PRIMARY_UP_FROM_TRIGGER_SEC={rel:.3f}",
+    f"HAPROXY_PRIMARY_UP_FROM_TRIGGER_MS={int(round(rel * 1000))}",
+    f"HAPROXY_PRIMARY_UP_SERVER={server}",
+    f"HAPROXY_PRIMARY_UP_POD={haproxy_pod}",
+    "HAPROXY_PRIMARY_UP_SOURCE=haproxy_stats_monitor",
+]
+if elected_pod:
+    lines.append(f"HAPROXY_PRIMARY_UP_ELECTED_POD={elected_pod}")
+out_env.write_text("\n".join(lines) + "\n", encoding="utf-8")
+print(f"Parsed HAProxy primary UP: {rel:.3f}s on {server} ({haproxy_pod})")
+PY
+}
+
 # Restart GR + K8s pod monitors after kubeconfig is available (Advanced prepare step).
 failover_start_advanced_cluster_monitors() {
   local results_dir="${1:?results dir required}"
@@ -981,14 +1327,18 @@ failover_start_advanced_cluster_monitors() {
     kubeconfig="${results_dir}/kubeconfig"
   fi
 
-  echo "--- Starting Advanced cluster monitors (GR pod + K8s readiness) ---"
+  echo "--- Starting Advanced cluster monitors (GR pod + K8s readiness + HAProxy stats) ---"
   stop_gr_pod_monitor "${results_dir}"
   stop_k8s_pods_monitor "${results_dir}"
+  stop_haproxy_stats_monitor "${results_dir}"
   if [[ "${FAILOVER_GR_POD_MONITOR:-1}" == "1" ]]; then
     start_gr_pod_monitor "${results_dir}"
   fi
   if [[ "${FAILOVER_K8S_POD_MONITOR:-1}" == "1" ]]; then
     start_k8s_pods_monitor "${results_dir}"
+  fi
+  if [[ "${FAILOVER_HAPROXY_STATS_MONITOR:-1}" == "1" ]]; then
+    start_haproxy_stats_monitor "${results_dir}"
   fi
 }
 
@@ -1448,20 +1798,29 @@ out_env = Path(sys.argv[3])
 trigger = datetime.fromisoformat(trigger_utc.replace("Z", "+00:00"))
 
 ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)")
-working_re = re.compile(r"This server is working as primary member", re.I)
+writable_re = re.compile(r"This server is working as primary member", re.I)
 elected_re = re.compile(r"A new primary with address (\S+) was elected", re.I)
 
-best_ts = None
-best_pod = ""
+
+def pod_hint_from_path(log_path: Path) -> str:
+    hint = log_path.name.replace("mysql_gr_election_", "").replace(".log", "")
+    return "" if hint == "mysql_gr_election" else hint
+
+
+def pod_matches(hint: str, target: str) -> bool:
+    if not hint or not target:
+        return False
+    return hint in target or target in hint
+
+
+election_ts = None
+election_pod = ""
+writable_ts = None
 
 for log_path in sorted(results_dir.glob("mysql_gr_election*.log")):
-    pod_hint = log_path.name.replace("mysql_gr_election_", "").replace(".log", "")
-    if pod_hint == "mysql_gr_election":
-        pod_hint = ""
+    hint = pod_hint_from_path(log_path)
     with log_path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            if not (working_re.search(line) or elected_re.search(line)):
-                continue
             match = ts_re.match(line)
             if not match:
                 continue
@@ -1469,33 +1828,66 @@ for log_path in sorted(results_dir.glob("mysql_gr_election*.log")):
             if ts < trigger:
                 continue
             elected = elected_re.search(line)
-            pod = pod_hint
             if elected:
                 pod = elected.group(1).split(".")[0]
-            if best_ts is None or ts < best_ts:
-                best_ts = ts
-                best_pod = pod
+                if election_ts is None or ts < election_ts:
+                    election_ts = ts
+                    election_pod = pod
 
-if best_ts is None:
+if election_ts is None:
     sys.exit(1)
 
-rel = (best_ts - trigger).total_seconds()
-ms = int(round(rel * 1000))
-election_utc = best_ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{best_ts.microsecond // 1000:03d}Z"
-out_env.write_text(
-    "\n".join(
-        [
-            f"GR_ELECTION_FROM_TRIGGER_SEC={rel:.3f}",
-            f"GR_ELECTION_FROM_TRIGGER_MS={ms}",
-            f"GR_ELECTION_UTC={election_utc}",
-            f"GR_ELECTION_POD={best_pod}",
-            "GR_ELECTION_SOURCE=mysql_pod_logs",
-            "",
-        ]
-    ),
-    encoding="utf-8",
+for log_path in sorted(results_dir.glob("mysql_gr_election*.log")):
+    hint = pod_hint_from_path(log_path)
+    if election_pod and hint and not pod_matches(hint, election_pod):
+        continue
+    with log_path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if not writable_re.search(line):
+                continue
+            match = ts_re.match(line)
+            if not match:
+                continue
+            ts = datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
+            if ts < trigger:
+                continue
+            if writable_ts is None or ts < writable_ts:
+                writable_ts = ts
+
+election_rel = (election_ts - trigger).total_seconds()
+election_ms = int(round(election_rel * 1000))
+election_utc = election_ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + (
+    f"{election_ts.microsecond // 1000:03d}Z"
 )
-print(f"Parsed GR election: {rel:.3f}s ({ms} ms) on {best_pod or 'unknown'}")
+
+lines = [
+    f"GR_ELECTION_FROM_TRIGGER_SEC={election_rel:.3f}",
+    f"GR_ELECTION_FROM_TRIGGER_MS={election_ms}",
+    f"GR_ELECTION_UTC={election_utc}",
+    f"GR_ELECTION_POD={election_pod}",
+    "GR_ELECTION_SOURCE=mysql_pod_logs",
+]
+if writable_ts is not None:
+    writable_rel = (writable_ts - trigger).total_seconds()
+    writable_ms = int(round(writable_rel * 1000))
+    writable_utc = writable_ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + (
+        f"{writable_ts.microsecond // 1000:03d}Z"
+    )
+    lines.extend(
+        [
+            f"GR_WRITABLE_FROM_TRIGGER_SEC={writable_rel:.3f}",
+            f"GR_WRITABLE_FROM_TRIGGER_MS={writable_ms}",
+            f"GR_WRITABLE_UTC={writable_utc}",
+            "GR_WRITABLE_SOURCE=mysql_pod_logs",
+        ]
+    )
+
+out_env.write_text("\n".join(lines) + "\n", encoding="utf-8")
+print(
+    f"Parsed GR election: {election_rel:.3f}s ({election_ms} ms) on {election_pod or 'unknown'}"
+)
+if writable_ts is not None:
+    print(f"Parsed GR writable primary: {writable_rel:.3f}s ({writable_ms} ms)")
 PY
 }
 
@@ -1515,21 +1907,29 @@ _failover_backfill_observability_artifacts() {
     _failover_snapshot_operator_logs "${results_dir}" "${trigger_utc}"
   fi
 
-  if [[ ! -f "${results_dir}/gr_pod_monitor.tsv" ]]; then
-    local have_mysql_logs=0
-    for _f in "${results_dir}"/mysql_gr_election*.log; do
-      [[ -f "${_f}" ]] && have_mysql_logs=1 && break
-    done
-    if [[ "${have_mysql_logs}" -eq 0 ]]; then
-      echo "--- Backfilling mysql GR pod logs since ${trigger_utc} ---"
-      _failover_snapshot_mysql_gr_logs "${results_dir}" "${trigger_utc}"
-    fi
-    if _failover_parse_gr_election_from_mysql_logs "${results_dir}" "${trigger_utc}"; then
-      :
-    else
-      echo "WARNING: could not parse GR election from mysql pod logs" >&2
-    fi
+  local have_mysql_logs=0
+  for _f in "${results_dir}"/mysql_gr_election*.log; do
+    [[ -f "${_f}" ]] && have_mysql_logs=1 && break
+  done
+  if [[ "${have_mysql_logs}" -eq 0 ]]; then
+    echo "--- Backfilling mysql GR pod logs since ${trigger_utc} ---"
+    _failover_snapshot_mysql_gr_logs "${results_dir}" "${trigger_utc}"
   fi
+  if _failover_parse_gr_election_from_mysql_logs "${results_dir}" "${trigger_utc}"; then
+    :
+  else
+    echo "WARNING: could not parse GR election from mysql pod logs" >&2
+  fi
+}
+
+_failover_collect_gr_timing_artifacts() {
+  local results_dir="${1:?results dir required}"
+  local trigger_utc="${2:-}"
+
+  [[ -n "${trigger_utc}" ]] || return 0
+  _failover_snapshot_mysql_gr_logs "${results_dir}" "${trigger_utc}" || true
+  _failover_parse_gr_election_from_mysql_logs "${results_dir}" "${trigger_utc}" \
+    || echo "WARNING: GR election timing not parsed from mysql pod logs" >&2
 }
 
 _failover_snapshot_k8s_events() {
@@ -1584,6 +1984,9 @@ start_failover_watchers() {
       if [[ "${FAILOVER_K8S_POD_MONITOR:-1}" == "1" ]]; then
         start_k8s_pods_monitor "${results_dir}"
       fi
+      if [[ "${FAILOVER_HAPROXY_STATS_MONITOR:-1}" == "1" ]]; then
+        start_haproxy_stats_monitor "${results_dir}"
+      fi
     fi
   fi
 }
@@ -1594,6 +1997,7 @@ stop_failover_watchers() {
   stop_k8s_event_collector "${results_dir}"
   stop_gr_pod_monitor "${results_dir}"
   stop_k8s_pods_monitor "${results_dir}"
+  stop_haproxy_stats_monitor "${results_dir}"
   if failover_monitor_enabled; then
     stop_primary_monitor "${results_dir}"
   fi
@@ -2399,6 +2803,10 @@ write_failover_kpi() {
     return 1
   fi
 
+  local primary_monitor_interval detect_guard_sec
+  primary_monitor_interval="$(_failover_primary_monitor_interval)"
+  detect_guard_sec="$(python3 -c "print('%.3f' % (1.5 * float('${primary_monitor_interval}')))" 2>/dev/null || echo 0.375)"
+
   awk -v log_trigger="${trigger_log}" \
       -v wall_trigger="${trigger_wall}" \
       -v edition="${edition}" \
@@ -2410,7 +2818,7 @@ write_failover_kpi() {
       -v observe_sec="${FAILOVER_OBSERVE_SEC}" \
       -v monitor="${monitor}" \
       -v monitor_offset="${monitor_offset}" \
-      -v detect_guard="$(python3 -c "print('%.3f' % (1.5 * float('${FAILOVER_MONITOR_INTERVAL}')))" 2>/dev/null || echo 1.5)" \
+      -v detect_guard="${detect_guard_sec}" \
       -v detect_window="${FAILOVER_DETECT_WINDOW_SEC:-60}" \
       -v primary_before="${primary_before}" \
       -v tpcc_check="${tpcc_check}" \
@@ -2702,12 +3110,30 @@ write_failover_promotion_breakdown() {
   local gr_election_override="-1"
   local gr_election_override_pod=""
   local gr_election_source=""
-  if [[ ! -f "${gr_monitor}" && -f "${results_dir}/gr_election_internal.env" ]]; then
+  local gr_writable_override="-1"
+  local gr_writable_source=""
+  if [[ -f "${results_dir}/gr_election_internal.env" ]]; then
     # shellcheck disable=SC1090
     source "${results_dir}/gr_election_internal.env" 2>/dev/null || true
     gr_election_override="${GR_ELECTION_FROM_TRIGGER_SEC:--1}"
     gr_election_override_pod="${GR_ELECTION_POD:-}"
     gr_election_source="${GR_ELECTION_SOURCE:-mysql_pod_logs}"
+    gr_writable_override="${GR_WRITABLE_FROM_TRIGGER_SEC:--1}"
+    gr_writable_source="${GR_WRITABLE_SOURCE:-}"
+  fi
+
+  _failover_parse_haproxy_stats_primary_up "${results_dir}" "${gr_election_override_pod}" 2>/dev/null || true
+  local ha_stats_up_override="-1"
+  local ha_stats_up_server=""
+  local ha_stats_up_pod=""
+  local ha_stats_up_source=""
+  if [[ -f "${results_dir}/haproxy_primary_up.env" ]]; then
+    # shellcheck disable=SC1090
+    source "${results_dir}/haproxy_primary_up.env" 2>/dev/null || true
+    ha_stats_up_override="${HAPROXY_PRIMARY_UP_FROM_TRIGGER_SEC:--1}"
+    ha_stats_up_server="${HAPROXY_PRIMARY_UP_SERVER:-}"
+    ha_stats_up_pod="${HAPROXY_PRIMARY_UP_POD:-}"
+    ha_stats_up_source="${HAPROXY_PRIMARY_UP_SOURCE:-haproxy_stats_monitor}"
   fi
 
   awk -v wall_trigger="${trigger_wall}" \
@@ -2719,6 +3145,12 @@ write_failover_promotion_breakdown() {
       -v gr_election_override="${gr_election_override}" \
       -v gr_election_override_pod="${gr_election_override_pod}" \
       -v gr_election_source="${gr_election_source}" \
+      -v gr_writable_override="${gr_writable_override}" \
+      -v gr_writable_source="${gr_writable_source}" \
+      -v ha_stats_up_override="${ha_stats_up_override}" \
+      -v ha_stats_up_server="${ha_stats_up_server}" \
+      -v ha_stats_up_pod="${ha_stats_up_pod}" \
+      -v ha_stats_up_source="${ha_stats_up_source}" \
       -v txt_out="${txt_out}" \
       -v csv_out="${csv_out}" \
       -f - <<'AWK'
@@ -2730,6 +3162,20 @@ function monitor_gr_role(f) {
 function monitor_write_ok(f) {
   if (length(f) >= 10 && f[9] != "" && f[9] != "ERROR") return f[9] + 0
   return -1
+}
+function is_gr_primary_visible(f,    role, gr) {
+  if (f[3] != "1") return 0
+  role = monitor_gr_role(f)
+  gr = monitor_gr_state(f)
+  if (edition == "advanced") {
+    return (role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY"))
+  }
+  return 0
+}
+function phase_start_after(gr_rel, ttd_rel) {
+  if (ttd_rel < 0) return -1
+  if (gr_rel < 0) return ttd_rel
+  return (gr_rel > ttd_rel) ? gr_rel : ttd_rel
 }
 function is_primary_elected(f,    wo, role, gr) {
   if (f[3] != "1") return 0
@@ -2784,7 +3230,7 @@ function scan_ha_monitor(    line, f, sysbench_sec, host, wo) {
       vip_connect_only = sysbench_sec - wall_trigger
     if (new_host < 0 && f[3] == "1" && host != "ERROR" && primary_before != "N/A" && host != primary_before)
       new_host = sysbench_sec - wall_trigger
-    if (gr_on_vip < 0 && is_primary_elected(f))
+    if (gr_on_vip < 0 && is_gr_primary_visible(f))
       gr_on_vip = sysbench_sec - wall_trigger
     if (write_ok < 0 && is_primary_elected(f))
       write_ok = sysbench_sec - wall_trigger
@@ -2842,19 +3288,43 @@ BEGIN {
   scan_gr_pods()
   apply_gr_election_override()
 
+  gr_elect = gr_pod_primary
+  if (gr_election_override >= 0) gr_elect = gr_election_override + 0
+
+  ha_end = new_host
+  if (ha_stats_up_override >= 0) ha_end = ha_stats_up_override + 0
+  else if (ha_end < 0 && gr_on_vip >= 0) ha_end = gr_on_vip
+  else if (ha_end < 0 && vip_connect >= 0) ha_end = vip_connect
+
+  ha_stats_up = (ha_stats_up_override >= 0) ? ha_stats_up_override + 0 : -1
+
+  gr_writable = -1
+  if (gr_writable_override >= 0) gr_writable = gr_writable_override + 0
+
   promote_total = phase_duration(write_ok, ttd)
   vip_outage = phase_duration(vip_connect, ttd)
   host_switch = phase_duration(new_host, vip_connect)
   gr_on_vip_lag = phase_duration(gr_on_vip, (new_host >= 0 ? new_host : vip_connect))
   write_lag = phase_duration(write_ok, gr_on_vip)
-  gr_election = gr_pod_primary
-  ha_after_gr = phase_duration(vip_connect, gr_pod_primary)
+  gr_election = gr_elect
+  ha_after_gr = phase_duration(vip_connect, gr_elect)
+  apply_lag_internal = -1
+  if (gr_elect >= 0 && gr_writable >= 0 && gr_writable > gr_elect)
+    apply_lag_internal = gr_writable - gr_elect
+
   promote_gr_wait = -1
   promote_ha_route = -1
+  promote_repl_lag = -1
   if (ttd >= 0 && write_ok >= 0) {
-    if (gr_pod_primary >= 0) {
-      promote_gr_wait = (gr_pod_primary > ttd) ? gr_pod_primary - ttd : 0
-      promote_ha_route = write_ok - max_rel(gr_pod_primary, ttd)
+    if (gr_elect >= 0) {
+      promote_gr_wait = (gr_elect > ttd) ? gr_elect - ttd : 0
+      ha_start = phase_start_after(gr_elect, ttd)
+      if (ha_start >= 0 && ha_end >= 0 && ha_end > ha_start)
+        promote_ha_route = ha_end - ha_start
+      repl_start = ha_start
+      if (ha_end >= 0 && ha_end > repl_start) repl_start = ha_end
+      if (repl_start >= 0 && write_ok > repl_start)
+        promote_repl_lag = write_ok - repl_start
     }
   }
 
@@ -2863,12 +3333,31 @@ BEGIN {
     "VIP still routed to old primary with writes OK (after trigger, before sustained outage)")
   emit_csv_row("failure_detection_ttd", "trigger", ttd, 0,
     "First connect failure on client VIP (connect_ok=0)")
-  emit_csv_row("gr_election_internal", "trigger", gr_pod_primary, phase_duration(gr_pod_primary, ttd),
+  emit_csv_row("gr_election_internal", "trigger", gr_elect, phase_duration(gr_elect, ttd),
     (gr_election_source != "" ? "GR PRIMARY elected (" gr_election_source ")" : "First GR PRIMARY+ONLINE on any mysql pod (direct kubectl exec, bypasses VIP)"))
-  emit_csv_row("promote_gr_election_after_ttd", "ttd", gr_pod_primary, promote_gr_wait,
-    "Wait for GR PRIMARY after TTD (0 if GR elected before client detected failure)")
+  emit_csv_row("gr_writable_internal", "trigger", gr_writable, phase_duration(gr_writable, ttd),
+    (gr_writable_source != "" ? "Primary writable / applier caught up (" gr_writable_source ")" : "mysqld working-as-primary log not collected"))
+  emit_csv_row("haproxy_primary_up_internal", "trigger", ha_stats_up, phase_duration(ha_stats_up, ttd),
+    (ha_stats_up_source != "" ? "mysql-primary backend UP on elected server (" ha_stats_up_source ")" : "haproxy_stats_monitor.tsv not collected"))
+  emit_csv_row("promote_gr_election_after_ttd", "ttd", gr_elect, promote_gr_wait,
+    "GR election after TTD (mysqld elected log preferred; 0 if elected before client detected failure)")
+  ha_route_desc = "HAProxy route update after TTD"
+  if (ha_stats_up_source != "" && ha_stats_up >= 0)
+    ha_route_desc = ha_route_desc " (stats socket: mysql-primary UP"
+  else
+    ha_route_desc = ha_route_desc " (fallback: VIP hostname"
+  if (ha_stats_up_server != "")
+    ha_route_desc = ha_route_desc " on " ha_stats_up_server
+  ha_route_desc = ha_route_desc "; GR elected -> HA routing ready)"
+  emit_csv_row("promote_ha_routing_after_ttd", "ttd", ha_end, promote_ha_route, ha_route_desc)
+  repl_desc = "Replication / apply lag: HA routing ready -> write probe OK on client VIP"
+  if (ha_stats_up >= 0)
+    repl_desc = repl_desc " (stats UP -> write_ok)"
+  else
+    repl_desc = repl_desc " (VIP new host -> write_ok)"
+  emit_csv_row("promote_replication_lag_after_ttd", "ttd", write_ok, promote_repl_lag, repl_desc)
   emit_csv_row("promote_ha_routing_to_primary", "ttd", write_ok, promote_ha_route,
-    "HA/operator routing: GR ready -> client VIP writable PRIMARY + write probe OK")
+    "Legacy alias of promote_ha_routing_after_ttd (HA routing only, not apply lag)")
   emit_csv_row("vip_outage", "ttd", vip_connect, vip_outage,
     "Client VIP blackout (connect_ok=0 on HA endpoint)")
   emit_csv_row("vip_connect_restored", "ttd", vip_connect, vip_outage,
@@ -2900,23 +3389,37 @@ BEGIN {
     print "Stale HA routing (old primary still writable):  none detected" >> txt_out
   printf "TTD (first VIP connect failure):               %s\n", fmt_sec(ttd) >> txt_out
   print "" >> txt_out
-  print "--- Promote = GR election (after TTD) + HA routing (sum = time to promote) ---" >> txt_out
-  if (gr_pod_primary >= 0 && promote_gr_wait >= 0 && promote_ha_route >= 0) {
+  print "--- Promote = GR election + HA routing + replication lag (sum = time to promote) ---" >> txt_out
+  if (gr_elect >= 0 && promote_gr_wait >= 0 && promote_ha_route >= 0 && promote_repl_lag >= 0) {
     printf "  GR election after TTD:                       %s\n", fmt_phase(promote_gr_wait) >> txt_out
-    printf "  HA routing to writable primary on VIP:       %s\n", fmt_phase(promote_ha_route) >> txt_out
-    printf "  (GR PRIMARY at %s from trigger", fmt_sec(gr_pod_primary) >> txt_out
+    if (ha_stats_up >= 0) {
+      printf "  HAProxy route update (stats socket UP):      %s\n", fmt_phase(promote_ha_route) >> txt_out
+      if (ha_stats_up_server != "")
+        printf "    (mysql-primary %s UP at %s from trigger", ha_stats_up_server, fmt_sec(ha_stats_up) >> txt_out
+      else
+        printf "    (mysql-primary UP at %s from trigger", fmt_sec(ha_stats_up) >> txt_out
+      if (ha_stats_up_pod != "") printf " via %s", ha_stats_up_pod >> txt_out
+      print ")" >> txt_out
+    } else {
+      printf "  HAProxy route update (VIP new hostname):     %s\n", fmt_phase(promote_ha_route) >> txt_out
+      print "    (fallback: haproxy_stats_monitor.tsv not available)" >> txt_out
+    }
+    printf "  Replication / apply lag (route -> write):    %s\n", fmt_phase(promote_repl_lag) >> txt_out
+    printf "  (GR elected at %s from trigger", fmt_sec(gr_elect) >> txt_out
     if (gr_pod_primary_name != "") printf " on %s", gr_pod_primary_name >> txt_out
     print ")" >> txt_out
+    if (gr_writable >= 0)
+      printf "  (GR writable log at %s from trigger; internal apply %s)\n", fmt_sec(gr_writable), fmt_phase(apply_lag_internal) >> txt_out
   } else if (promote_total >= 0) {
-    print "  GR + HA split: NOT_COLLECTED (need gr_pod_monitor.tsv from Advanced run)" >> txt_out
+    print "  Three-phase split: NOT_COLLECTED (need primary_monitor + GR timing)" >> txt_out
     printf "  VIP-only promote window:                     %s\n", fmt_phase(promote_total) >> txt_out
   }
   print "" >> txt_out
   print "Sub-phases after TTD (detail):" >> txt_out
-  if (gr_pod_primary >= 0)
-    printf "  GR election (internal, any pod):             %s  (+%s from TTD)\n", fmt_sec(gr_pod_primary), fmt_phase(phase_duration(gr_pod_primary, ttd)) >> txt_out
+  if (gr_elect >= 0)
+    printf "  GR election (internal):                      %s  (+%s from TTD)\n", fmt_sec(gr_elect), fmt_phase(promote_gr_wait) >> txt_out
   else
-    print "  GR election (internal, any pod):             NOT_COLLECTED (enable FAILOVER_GR_POD_MONITOR=1)" >> txt_out
+    print "  GR election (internal):                      NOT_COLLECTED (enable mysql GR log snapshot)" >> txt_out
   if (ha_after_gr >= 0)
     printf "  Operator + HAProxy lag (GR -> VIP connect):  %s\n", fmt_phase(ha_after_gr) >> txt_out
   else if (gr_pod_primary >= 0 && vip_connect < 0)
@@ -3037,6 +3540,10 @@ write_failover_extended_metrics() {
   # Prefer the actual sub-second fire epoch over the planned integer trigger second.
   trigger_wall=$(failover_trigger_wall_subsec "${results_dir}" "${timing_file}")
 
+  local primary_monitor_interval detect_guard_sec
+  primary_monitor_interval="$(_failover_primary_monitor_interval)"
+  detect_guard_sec="$(python3 -c "print('%.3f' % (1.5 * float('${primary_monitor_interval}')))" 2>/dev/null || echo 0.375)"
+
   awk -v log_trigger="${trigger_log}" \
       -v wall_trigger="${trigger_wall}" \
       -v trigger_utc="${trigger_utc}" \
@@ -3052,7 +3559,7 @@ write_failover_extended_metrics() {
       -v parsed_env="${parsed_env}" \
       -v monitor="${monitor}" \
       -v monitor_offset="${monitor_offset}" \
-      -v detect_guard="$(python3 -c "print('%.3f' % (1.5 * float('${FAILOVER_MONITOR_INTERVAL}')))" 2>/dev/null || echo 1.5)" \
+      -v detect_guard="${detect_guard_sec}" \
       -v detect_window="${FAILOVER_DETECT_WINDOW_SEC:-60}" \
       -v primary_before="${primary_before}" \
       -v primary_after="${primary_after}" \

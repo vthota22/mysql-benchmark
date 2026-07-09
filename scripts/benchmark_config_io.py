@@ -32,6 +32,8 @@ _NUMERIC_KEYS = frozenset(
         "FAILOVER_MYSQLD_KILL_SIGNAL",
         "FAILOVER_TRIGGER_PREPARE_SEC",
         "FAILOVER_MONITOR_INTERVAL",
+        "FAILOVER_PRIMARY_MONITOR_INTERVAL",
+        "FAILOVER_CLUSTER_MONITOR_INTERVAL",
         "FAILOVER_MONITOR_CONNECT_TIMEOUT",
         "FAILOVER_MONITOR_OP_TIMEOUT",
         "FAILOVER_RECOVERY_STABLE_SEC",
@@ -126,8 +128,43 @@ def parse_config(text: str) -> ParsedConfig:
             continue
         match = _ASSIGNMENT_RE.match(stripped)
         if match:
+            # Last assignment wins (shell-style override semantics).
             values[match.group(1)] = parse_shell_value(match.group(2))
     return ParsedConfig(lines=lines, values=values)
+
+
+def dedupe_config(text: str) -> tuple[str, bool]:
+    """Remove duplicate KEY=value lines, keeping only the last assignment per key."""
+    lines = text.splitlines()
+    last_index: dict[str, int] = {}
+    assignment_count = 0
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = _ASSIGNMENT_RE.match(stripped)
+        if match:
+            last_index[match.group(1)] = index
+            assignment_count += 1
+
+    if assignment_count == len(last_index):
+        return text, False
+
+    out: list[str] = []
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            out.append(line)
+            continue
+        match = _ASSIGNMENT_RE.match(stripped)
+        if match and last_index.get(match.group(1)) != index:
+            continue
+        out.append(line)
+
+    merged = "\n".join(out)
+    if text.endswith("\n"):
+        merged += "\n"
+    return merged, True
 
 
 def get_keys(config: ParsedConfig, keys: list[str]) -> dict[str, str]:

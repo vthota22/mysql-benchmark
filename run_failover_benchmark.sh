@@ -137,6 +137,8 @@ run_failover_scenario() {
     else
       sleep_until_failover_trigger_final_gap
     fi
+    capture_gr_pre_failover_applier_snapshot "${scenario_dir}" \
+      2>&1 | tee -a "${scenario_dir}/failover_trigger.log" || true
     BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${scenario_dir}" fire \
       2>&1 | tee -a "${scenario_dir}/failover_trigger.log"
   else
@@ -151,6 +153,10 @@ run_failover_scenario() {
   trigger_utc=$(grep -E '^FAILOVER_TRIGGER_UTC=' "${scenario_dir}/failover_event.txt" 2>/dev/null \
     | tail -1 | cut -d= -f2- || true)
   _failover_snapshot_operator_logs "${scenario_dir}" "${trigger_utc}"
+  if [[ "${edition}" == "advanced" ]]; then
+    _failover_collect_gr_timing_artifacts "${scenario_dir}" "${trigger_utc}" \
+      2>&1 | tee -a "${scenario_dir}/failover_trigger.log" || true
+  fi
   log_failover_do_events "${scenario_dir}" "${edition}" "post_observe"
 
   echo "--- Stopping load ---"
