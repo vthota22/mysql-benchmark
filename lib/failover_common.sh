@@ -1258,7 +1258,16 @@ _failover_parse_haproxy_stats_primary_up() {
     target_server="$(_failover_haproxy_stat_server_for_pod "${kubeconfig}" "${ns}" "${elected_pod}" 2>/dev/null || true)"
   fi
 
-  python3 - "${stats_file}" "${out_env}" "${monitor_offset}" "${wall_trigger}" "${target_server}" "${elected_pod}" <<'PY'
+  local min_after_rel="0"
+  if [[ -f "${results_dir}/gr_election_internal.env" ]]; then
+    # shellcheck disable=SC1090
+    source "${results_dir}/gr_election_internal.env" 2>/dev/null || true
+    if [[ -n "${GR_ELECTION_FROM_TRIGGER_SEC:-}" ]]; then
+      min_after_rel="${GR_ELECTION_FROM_TRIGGER_SEC}"
+    fi
+  fi
+
+  python3 - "${stats_file}" "${out_env}" "${monitor_offset}" "${wall_trigger}" "${target_server}" "${elected_pod}" "${min_after_rel}" <<'PY'
 import sys
 from pathlib import Path
 
@@ -1268,8 +1277,12 @@ monitor_offset = float(sys.argv[3])
 wall_trigger = float(sys.argv[4])
 target_server = sys.argv[5].strip()
 elected_pod = sys.argv[6].strip()
+min_after = float(sys.argv[7]) if sys.argv[7] else 0.0
 
-best = None
+last_status: dict[str, str] = {}
+best_transition = None
+best_up = None
+
 for line in stats_path.read_text(encoding="utf-8", errors="replace").splitlines():
     if not line or line.startswith("timestamp_utc"):
         continue
@@ -1277,7 +1290,11 @@ for line in stats_path.read_text(encoding="utf-8", errors="replace").splitlines(
     if len(parts) < 7:
         continue
     _ts, elapsed_s, haproxy_pod, poll_ok, server, status = parts[:6]
-    if poll_ok != "1" or status != "UP":
+    if poll_ok != "1" or server in ("", "ERROR"):
+        continue
+    prev = last_status.get(server)
+    last_status[server] = status
+    if status != "UP":
         continue
     if target_server and server != target_server:
         continue
@@ -1286,27 +1303,32 @@ for line in stats_path.read_text(encoding="utf-8", errors="replace").splitlines(
     except ValueError:
         continue
     rel = elapsed - wall_trigger
-    if rel < 0:
+    if rel < min_after:
         continue
     key = (rel, haproxy_pod, server)
-    if best is None or key < best[0]:
-        best = (key, haproxy_pod, server)
+    if prev is not None and prev != "UP":
+        if best_transition is None or key < best_transition[0]:
+            best_transition = (key, haproxy_pod, server, "down_to_up")
+    if best_up is None or key < best_up[0]:
+        best_up = (key, haproxy_pod, server, "up")
 
-if best is None:
+pick = best_transition or best_up
+if pick is None:
     sys.exit(1)
 
-rel, haproxy_pod, server = best[0][0], best[0][1], best[0][2]
+rel, haproxy_pod, server, mode = pick[0][0], pick[0][1], pick[0][2], pick[3]
 lines = [
     f"HAPROXY_PRIMARY_UP_FROM_TRIGGER_SEC={rel:.3f}",
     f"HAPROXY_PRIMARY_UP_FROM_TRIGGER_MS={int(round(rel * 1000))}",
     f"HAPROXY_PRIMARY_UP_SERVER={server}",
     f"HAPROXY_PRIMARY_UP_POD={haproxy_pod}",
     "HAPROXY_PRIMARY_UP_SOURCE=haproxy_stats_monitor",
+    f"HAPROXY_PRIMARY_UP_MODE={mode}",
 ]
 if elected_pod:
     lines.append(f"HAPROXY_PRIMARY_UP_ELECTED_POD={elected_pod}")
 out_env.write_text("\n".join(lines) + "\n", encoding="utf-8")
-print(f"Parsed HAProxy primary UP: {rel:.3f}s on {server} ({haproxy_pod})")
+print(f"Parsed HAProxy primary UP: {rel:.3f}s on {server} ({haproxy_pod}, {mode})")
 PY
 }
 
@@ -1783,19 +1805,33 @@ _failover_snapshot_mysql_gr_logs() {
 
 _failover_parse_gr_election_from_mysql_logs() {
   local results_dir="${1:?results dir required}"
-  local trigger_utc="${2:?trigger utc required}"
   local out_env="${results_dir}/gr_election_internal.env"
+  local event_file="${results_dir}/failover_event.txt"
+  local trigger_epoch=""
 
-  python3 - "${trigger_utc}" "${results_dir}" "${out_env}" <<'PY'
+  if [[ -f "${event_file}" ]]; then
+    trigger_epoch=$(grep -E '^FAILOVER_TRIGGER_EPOCH=' "${event_file}" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+  fi
+  if [[ -z "${trigger_epoch}" ]]; then
+    local trigger_utc=""
+    trigger_utc=$(grep -E '^FAILOVER_TRIGGER_UTC=' "${event_file}" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+    [[ -n "${trigger_utc}" ]] || return 1
+    trigger_epoch=$(python3 -c "
+from datetime import datetime
+print(datetime.fromisoformat('${trigger_utc}'.replace('Z', '+00:00')).timestamp())
+" 2>/dev/null || true)
+    [[ -n "${trigger_epoch}" ]] || return 1
+  fi
+
+  python3 - "${trigger_epoch}" "${results_dir}" "${out_env}" <<'PY'
 import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-trigger_utc = sys.argv[1]
+trigger_epoch = float(sys.argv[1])
 results_dir = Path(sys.argv[2])
 out_env = Path(sys.argv[3])
-trigger = datetime.fromisoformat(trigger_utc.replace("Z", "+00:00"))
 
 ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)")
 writable_re = re.compile(r"This server is working as primary member", re.I)
@@ -1825,7 +1861,7 @@ for log_path in sorted(results_dir.glob("mysql_gr_election*.log")):
             if not match:
                 continue
             ts = datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
-            if ts < trigger:
+            if ts.timestamp() < trigger_epoch:
                 continue
             elected = elected_re.search(line)
             if elected:
@@ -1849,12 +1885,12 @@ for log_path in sorted(results_dir.glob("mysql_gr_election*.log")):
             if not match:
                 continue
             ts = datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
-            if ts < trigger:
+            if ts.timestamp() < trigger_epoch:
                 continue
             if writable_ts is None or ts < writable_ts:
                 writable_ts = ts
 
-election_rel = (election_ts - trigger).total_seconds()
+election_rel = election_ts.timestamp() - trigger_epoch
 election_ms = int(round(election_rel * 1000))
 election_utc = election_ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + (
     f"{election_ts.microsecond // 1000:03d}Z"
@@ -1868,7 +1904,7 @@ lines = [
     "GR_ELECTION_SOURCE=mysql_pod_logs",
 ]
 if writable_ts is not None:
-    writable_rel = (writable_ts - trigger).total_seconds()
+    writable_rel = writable_ts.timestamp() - trigger_epoch
     writable_ms = int(round(writable_rel * 1000))
     writable_utc = writable_ts.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + (
         f"{writable_ts.microsecond // 1000:03d}Z"
@@ -1915,7 +1951,7 @@ _failover_backfill_observability_artifacts() {
     echo "--- Backfilling mysql GR pod logs since ${trigger_utc} ---"
     _failover_snapshot_mysql_gr_logs "${results_dir}" "${trigger_utc}"
   fi
-  if _failover_parse_gr_election_from_mysql_logs "${results_dir}" "${trigger_utc}"; then
+  if _failover_parse_gr_election_from_mysql_logs "${results_dir}"; then
     :
   else
     echo "WARNING: could not parse GR election from mysql pod logs" >&2
@@ -1928,7 +1964,7 @@ _failover_collect_gr_timing_artifacts() {
 
   [[ -n "${trigger_utc}" ]] || return 0
   _failover_snapshot_mysql_gr_logs "${results_dir}" "${trigger_utc}" || true
-  _failover_parse_gr_election_from_mysql_logs "${results_dir}" "${trigger_utc}" \
+  _failover_parse_gr_election_from_mysql_logs "${results_dir}" \
     || echo "WARNING: GR election timing not parsed from mysql pod logs" >&2
 }
 
@@ -3122,6 +3158,17 @@ write_failover_promotion_breakdown() {
     gr_writable_source="${GR_WRITABLE_SOURCE:-}"
   fi
 
+  _failover_parse_gr_election_from_mysql_logs "${results_dir}" 2>/dev/null || true
+  if [[ -f "${results_dir}/gr_election_internal.env" ]]; then
+    # shellcheck disable=SC1090
+    source "${results_dir}/gr_election_internal.env" 2>/dev/null || true
+    gr_election_override="${GR_ELECTION_FROM_TRIGGER_SEC:--1}"
+    gr_election_override_pod="${GR_ELECTION_POD:-}"
+    gr_election_source="${GR_ELECTION_SOURCE:-mysql_pod_logs}"
+    gr_writable_override="${GR_WRITABLE_FROM_TRIGGER_SEC:--1}"
+    gr_writable_source="${GR_WRITABLE_SOURCE:-}"
+  fi
+
   _failover_parse_haproxy_stats_primary_up "${results_dir}" "${gr_election_override_pod}" 2>/dev/null || true
   local ha_stats_up_override="-1"
   local ha_stats_up_server=""
@@ -3134,6 +3181,15 @@ write_failover_promotion_breakdown() {
     ha_stats_up_server="${HAPROXY_PRIMARY_UP_SERVER:-}"
     ha_stats_up_pod="${HAPROXY_PRIMARY_UP_POD:-}"
     ha_stats_up_source="${HAPROXY_PRIMARY_UP_SOURCE:-haproxy_stats_monitor}"
+    if [[ "${ha_stats_up_override}" != "-1" && "${gr_election_override}" != "-1" ]]; then
+      if ! python3 -c "import sys; sys.exit(0 if float('${ha_stats_up_override}') >= float('${gr_election_override}') - 0.001 else 1)" 2>/dev/null; then
+        echo "WARNING: HAProxy stats UP (${ha_stats_up_override}s) precedes GR election (${gr_election_override}s); using VIP fallback for HA phase" >&2
+        ha_stats_up_override="-1"
+        ha_stats_up_server=""
+        ha_stats_up_pod=""
+        ha_stats_up_source=""
+      fi
+    fi
   fi
 
   awk -v wall_trigger="${trigger_wall}" \
@@ -3297,6 +3353,14 @@ BEGIN {
   else if (ha_end < 0 && vip_connect >= 0) ha_end = vip_connect
 
   ha_stats_up = (ha_stats_up_override >= 0) ? ha_stats_up_override + 0 : -1
+  ha_start_check = phase_start_after(gr_elect, ttd)
+  if (ha_stats_up >= 0 && ha_start_check >= 0 && ha_stats_up < ha_start_check) {
+    ha_stats_up = -1
+    if (new_host >= 0 && new_host > ha_start_check) ha_end = new_host
+    else if (gr_on_vip >= 0 && gr_on_vip > ha_start_check) ha_end = gr_on_vip
+    else if (vip_connect >= 0 && vip_connect > ha_start_check) ha_end = vip_connect
+    else ha_end = new_host
+  }
 
   gr_writable = -1
   if (gr_writable_override >= 0) gr_writable = gr_writable_override + 0
