@@ -2502,18 +2502,18 @@ PROMOTE_PHASE_DEFINITIONS: list[tuple[str, str, str]] = [
     ),
     (
         "promote_ha_routing_after_ttd",
-        "HAProxy route update",
-        "haproxy_stats_monitor: first mysql-primary UP on elected server (fallback: VIP hostname change)",
+        "HAProxy routable",
+        "GR elected → mysql-primary UP on elected server (applier/read_only wait + health check; stats socket, VIP hostname fallback)",
     ),
     (
-        "promote_replication_lag_after_ttd",
-        "Replication / apply lag",
-        "HA routing ready (stats UP) -> write probe OK on client VIP (internal apply: mysqld working-as-primary log)",
+        "promote_client_path_restore_after_ttd",
+        "Client path restore",
+        "HA backend UP → first write probe OK on client VIP",
     ),
     (
         "promote_total",
         "Time to promote (total)",
-        "TTD -> write probe OK (sum of three phases above)",
+        "TTD → write probe OK (sum of three phases above)",
     ),
 ]
 
@@ -2539,9 +2539,9 @@ def _promote_three_phase_html(scenario_dir: Path) -> str:
         sources.append("Apply lag note: mysqld working-as-primary log on elected pod")
     if ha_env.get("HAPROXY_PRIMARY_UP_SOURCE") == "haproxy_stats_monitor":
         server = ha_env.get("HAPROXY_PRIMARY_UP_SERVER", "elected server")
-        sources.append(f"HA routing: haproxy_stats_monitor ({server} UP in mysql-primary backend)")
+        sources.append(f"HAProxy routable: haproxy_stats_monitor ({server} UP in mysql-primary backend)")
     else:
-        sources.append("HA routing: primary_monitor.tsv hostname change on client VIP (stats monitor fallback)")
+        sources.append("HAProxy routable: primary_monitor.tsv hostname fallback")
     internal_apply_note = ""
     election_sec = _parse_metric_sec(env.get("GR_ELECTION_FROM_TRIGGER_SEC"))
     writable_sec = _parse_metric_sec(env.get("GR_WRITABLE_FROM_TRIGGER_SEC"))
@@ -2550,8 +2550,7 @@ def _promote_three_phase_html(scenario_dir: Path) -> str:
             f'<p class="muted" style="margin:0.5rem 0 0;font-size:0.82rem">'
             f"<strong>Internal apply lag (mysqld logs):</strong> "
             f"{html.escape(_format_duration_sec(writable_sec - election_sec))} "
-            f"(elected → working-as-primary on {html.escape(env.get('GR_ELECTION_POD', 'elected pod'))}). "
-            f"May exceed client-visible replication phase when VIP is down until the new host accepts connections."
+            f"(elected → working-as-primary on {html.escape(env.get('GR_ELECTION_POD', 'elected pod'))})."
             f"</p>"
         )
     source_note = " · ".join(sources)
@@ -2560,6 +2559,8 @@ def _promote_three_phase_html(scenario_dir: Path) -> str:
     accounted = 0.0
     for phase_key, title, help_text in PROMOTE_PHASE_DEFINITIONS:
         row = by_phase.get(phase_key, {})
+        if not row and phase_key == "promote_client_path_restore_after_ttd":
+            row = by_phase.get("promote_replication_lag_after_ttd", {})
         dur_raw = row.get("duration_from_ttd_sec", "N/A")
         dur = _breakdown_cell_duration(dur_raw)
         at_trig = _breakdown_cell_time(row.get("time_from_trigger_sec", "N/A"))

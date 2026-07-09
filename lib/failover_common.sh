@@ -3378,17 +3378,17 @@ BEGIN {
 
   promote_gr_wait = -1
   promote_ha_route = -1
-  promote_repl_lag = -1
+  promote_client_restore = -1
   if (ttd >= 0 && write_ok >= 0) {
     if (gr_elect >= 0) {
       promote_gr_wait = (gr_elect > ttd) ? gr_elect - ttd : 0
       ha_start = phase_start_after(gr_elect, ttd)
       if (ha_start >= 0 && ha_end >= 0 && ha_end > ha_start)
         promote_ha_route = ha_end - ha_start
-      repl_start = ha_start
-      if (ha_end >= 0 && ha_end > repl_start) repl_start = ha_end
-      if (repl_start >= 0 && write_ok > repl_start)
-        promote_repl_lag = write_ok - repl_start
+      client_start = ha_start
+      if (ha_end >= 0 && ha_end > client_start) client_start = ha_end
+      if (client_start >= 0 && write_ok > client_start)
+        promote_client_restore = write_ok - client_start
     }
   }
 
@@ -3405,23 +3405,25 @@ BEGIN {
     (ha_stats_up_source != "" ? "mysql-primary backend UP on elected server (" ha_stats_up_source ")" : "haproxy_stats_monitor.tsv not collected"))
   emit_csv_row("promote_gr_election_after_ttd", "ttd", gr_elect, promote_gr_wait,
     "GR election after TTD (mysqld elected log preferred; 0 if elected before client detected failure)")
-  ha_route_desc = "HAProxy route update after TTD"
+  ha_route_desc = "HAProxy routable after TTD (applier/read_only wait + health check)"
   if (ha_stats_up_source != "" && ha_stats_up >= 0)
-    ha_route_desc = ha_route_desc " (stats socket: mysql-primary UP"
+    ha_route_desc = ha_route_desc " via stats socket: mysql-primary UP"
   else
-    ha_route_desc = ha_route_desc " (fallback: VIP hostname"
+    ha_route_desc = ha_route_desc " via VIP hostname fallback"
   if (ha_stats_up_server != "")
     ha_route_desc = ha_route_desc " on " ha_stats_up_server
-  ha_route_desc = ha_route_desc "; GR elected -> HA routing ready)"
+  ha_route_desc = ha_route_desc " (GR elected -> backend UP)"
   emit_csv_row("promote_ha_routing_after_ttd", "ttd", ha_end, promote_ha_route, ha_route_desc)
-  repl_desc = "Replication / apply lag: HA routing ready -> write probe OK on client VIP"
+  client_desc = "Client path restore: HA backend UP -> write probe OK on client VIP"
   if (ha_stats_up >= 0)
-    repl_desc = repl_desc " (stats UP -> write_ok)"
+    client_desc = client_desc " (stats UP -> write_ok)"
   else
-    repl_desc = repl_desc " (VIP new host -> write_ok)"
-  emit_csv_row("promote_replication_lag_after_ttd", "ttd", write_ok, promote_repl_lag, repl_desc)
+    client_desc = client_desc " (VIP new host -> write_ok)"
+  emit_csv_row("promote_client_path_restore_after_ttd", "ttd", write_ok, promote_client_restore, client_desc)
+  emit_csv_row("promote_replication_lag_after_ttd", "ttd", write_ok, promote_client_restore,
+    "Legacy alias of promote_client_path_restore_after_ttd")
   emit_csv_row("promote_ha_routing_to_primary", "ttd", write_ok, promote_ha_route,
-    "Legacy alias of promote_ha_routing_after_ttd (HA routing only, not apply lag)")
+    "Legacy alias of promote_ha_routing_after_ttd")
   emit_csv_row("vip_outage", "ttd", vip_connect, vip_outage,
     "Client VIP blackout (connect_ok=0 on HA endpoint)")
   emit_csv_row("vip_connect_restored", "ttd", vip_connect, vip_outage,
@@ -3453,11 +3455,11 @@ BEGIN {
     print "Stale HA routing (old primary still writable):  none detected" >> txt_out
   printf "TTD (first VIP connect failure):               %s\n", fmt_sec(ttd) >> txt_out
   print "" >> txt_out
-  print "--- Promote = GR election + HA routing + replication lag (sum = time to promote) ---" >> txt_out
-  if (gr_elect >= 0 && promote_gr_wait >= 0 && promote_ha_route >= 0 && promote_repl_lag >= 0) {
+  print "--- Promote = GR election + HAProxy routable + client path restore (sum = time to promote) ---" >> txt_out
+  if (gr_elect >= 0 && promote_gr_wait >= 0 && promote_ha_route >= 0 && promote_client_restore >= 0) {
     printf "  GR election after TTD:                       %s\n", fmt_phase(promote_gr_wait) >> txt_out
     if (ha_stats_up >= 0) {
-      printf "  HAProxy route update (stats socket UP):      %s\n", fmt_phase(promote_ha_route) >> txt_out
+      printf "  HAProxy routable (stats socket UP):          %s\n", fmt_phase(promote_ha_route) >> txt_out
       if (ha_stats_up_server != "")
         printf "    (mysql-primary %s UP at %s from trigger", ha_stats_up_server, fmt_sec(ha_stats_up) >> txt_out
       else
@@ -3465,10 +3467,10 @@ BEGIN {
       if (ha_stats_up_pod != "") printf " via %s", ha_stats_up_pod >> txt_out
       print ")" >> txt_out
     } else {
-      printf "  HAProxy route update (VIP new hostname):     %s\n", fmt_phase(promote_ha_route) >> txt_out
+      printf "  HAProxy routable (VIP hostname fallback):    %s\n", fmt_phase(promote_ha_route) >> txt_out
       print "    (fallback: haproxy_stats_monitor.tsv not available)" >> txt_out
     }
-    printf "  Replication / apply lag (route -> write):    %s\n", fmt_phase(promote_repl_lag) >> txt_out
+    printf "  Client path restore (VIP write OK):          %s\n", fmt_phase(promote_client_restore) >> txt_out
     printf "  (GR elected at %s from trigger", fmt_sec(gr_elect) >> txt_out
     if (gr_pod_primary_name != "") printf " on %s", gr_pod_primary_name >> txt_out
     print ")" >> txt_out
