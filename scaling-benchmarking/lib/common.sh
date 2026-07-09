@@ -650,17 +650,23 @@ gr_set_on_all_pods() {
     return 1
   fi
 
-  log_phase "${phase}" "setting ${var_name}=${value} on ${#pods[@]} pod(s): ${pods[*]}"
+  log_phase "${phase}" "setting ${var_name}=${value} on ${#pods[@]} pod(s) (PERSIST): ${pods[*]}"
 
   local failed=0
   for pod in "${pods[@]}"; do
     local set_err
     if set_err="$(_gr_mysql_in_pod "${pod}" "${container}" "${password}" \
-        "SET GLOBAL ${var_name} = ${value};" 2>&1)"; then
-      log_phase "${phase}" "  ${pod}: SET OK"
+        "SET PERSIST ${var_name} = ${value};" 2>&1)"; then
+      log_phase "${phase}" "  ${pod}: SET PERSIST OK"
     else
-      log_phase "${phase}" "  ${pod}: SET FAILED — ${set_err}"
-      failed=1
+      log_phase "${phase}" "  ${pod}: SET PERSIST FAILED, falling back to SET GLOBAL"
+      if set_err="$(_gr_mysql_in_pod "${pod}" "${container}" "${password}" \
+          "SET GLOBAL ${var_name} = ${value};" 2>&1)"; then
+        log_phase "${phase}" "  ${pod}: SET GLOBAL OK (will not survive restart)"
+      else
+        log_phase "${phase}" "  ${pod}: SET FAILED — ${set_err}"
+        failed=1
+      fi
     fi
   done
 
