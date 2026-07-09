@@ -226,9 +226,60 @@ run_scale_workflow() {
     | tee -a "${SCALE_LOG}"
 }
 
+check_group_replication_settings() {
+  log_phase "GR_CHECK" "querying Group Replication flow-control and exit-state settings"
+  local gr_vars
+  gr_vars="$(mysql_admin -e "
+    SELECT variable_name, variable_value
+    FROM performance_schema.global_variables
+    WHERE variable_name IN (
+      'group_replication_flow_control_applier_threshold',
+      'group_replication_flow_control_certifier_threshold',
+      'group_replication_exit_state_action',
+      'group_replication_flow_control_mode'
+    )
+    ORDER BY variable_name;
+  " 2>&1)" || true
+
+  if [[ -z "${gr_vars}" ]]; then
+    log_phase "GR_CHECK" "no Group Replication variables found (plugin may not be active)"
+  else
+    log_phase "GR_CHECK" "current values:"
+    while IFS= read -r line; do
+      log_phase "GR_CHECK" "  ${line}"
+    done <<< "${gr_vars}"
+  fi
+
+  local gr_members
+  gr_members="$(mysql_admin -e "
+    SELECT member_host, member_port, member_state, member_role
+    FROM performance_schema.replication_group_members;
+  " 2>&1)" || true
+
+  if [[ -n "${gr_members}" ]]; then
+    log_phase "GR_CHECK" "group members:"
+    while IFS= read -r line; do
+      log_phase "GR_CHECK" "  ${line}"
+    done <<< "${gr_members}"
+  fi
+
+  if [[ -d "${RUN_DIR}" ]]; then
+    {
+      echo "=== Group Replication Settings ==="
+      echo "${gr_vars}"
+      echo ""
+      echo "=== Group Members ==="
+      echo "${gr_members}"
+    } > "${RUN_DIR}/gr_settings.txt"
+    log_phase "GR_CHECK" "saved to ${RUN_DIR}/gr_settings.txt"
+  fi
+}
+
 phase2_run_with_scaling() {
   local tpcc_max_time="${TPCC_MAX_TIME:-${TPCC_TOTAL_TIME:-3600}}"
   export TPCC_MAX_TIME="${tpcc_max_time}"
+
+  check_group_replication_settings
 
   log_phase "2_RUN" "starting TPC-C (threads=${TPCC_THREADS} duration=${tpcc_max_time}s)"
   if scaling_enabled; then

@@ -113,7 +113,46 @@ if ! tpcc_tables_exist; then
   echo "Load data first with run_benchmark.sh (or SKIP_PREPARE=0)." >&2
   exit 1
 fi
-echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] TPC-C tables verified — starting workload"
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] TPC-C tables verified"
+echo ""
+
+# Check Group Replication settings before workload
+log_phase "GR_CHECK" "querying Group Replication flow-control and exit-state settings"
+gr_vars="$(mysql_admin -e "
+  SELECT variable_name, variable_value
+  FROM performance_schema.global_variables
+  WHERE variable_name IN (
+    'group_replication_flow_control_applier_threshold',
+    'group_replication_flow_control_certifier_threshold',
+    'group_replication_exit_state_action',
+    'group_replication_flow_control_mode'
+  )
+  ORDER BY variable_name;
+" 2>&1)" || true
+
+if [[ -z "${gr_vars}" ]]; then
+  log_phase "GR_CHECK" "no Group Replication variables found (plugin may not be active)"
+else
+  log_phase "GR_CHECK" "current values:"
+  while IFS= read -r line; do
+    log_phase "GR_CHECK" "  ${line}"
+  done <<< "${gr_vars}"
+fi
+
+gr_members="$(mysql_admin -e "
+  SELECT member_host, member_port, member_state, member_role
+  FROM performance_schema.replication_group_members;
+" 2>&1)" || true
+
+if [[ -n "${gr_members}" ]]; then
+  log_phase "GR_CHECK" "group members:"
+  while IFS= read -r line; do
+    log_phase "GR_CHECK" "  ${line}"
+  done <<< "${gr_members}"
+fi
+
+echo ""
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] starting workload"
 echo ""
 
 run_tpcc run 2>&1

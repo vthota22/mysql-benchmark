@@ -8,6 +8,7 @@ Usage:
   pip install plotly
   python3 generate_scaling_analysis_report.py scaling-benchmarking/results/run_20260702_142729_advanced-2-july-s-scale
   python3 generate_scaling_analysis_report.py /path/to/run_dir -o /path/to/report.html
+
 """
 
 from __future__ import annotations
@@ -76,6 +77,10 @@ class K8sPodRow:
     pvc_cap: str
     restarts: str
     deleting: str
+    read_only: str = "?"
+    super_read_only: str = "?"
+    gr_queue: str = ""
+    gr_applier_queue: str = ""
 
 
 @dataclass
@@ -253,6 +258,10 @@ def load_k8s_monitor(path: Path) -> list[K8sPodRow]:
                 pvc_cap=raw.get("pvc_cap", ""),
                 restarts=raw.get("restarts", "0"),
                 deleting=raw.get("deleting", "no"),
+                read_only=raw.get("read_only", "?"),
+                super_read_only=raw.get("super_read_only", "?"),
+                gr_queue=raw.get("gr_queue", ""),
+                gr_applier_queue=raw.get("gr_applier_queue", ""),
             ))
     return rows
 
@@ -1855,6 +1864,186 @@ def build_k8s_status_bars(
     </section>"""
 
 
+def _safe_metric_int(val: str) -> int | None:
+    """Parse numeric k8s monitor fields, skipping malformed values like '?'."""
+    cleaned = (val or "").strip().strip("?\t ")
+    if not cleaned or not cleaned.isdigit():
+        return None
+    return int(cleaned)
+
+
+def _read_only_gantt_key(row: K8sPodRow) -> str | None:
+    ro = _safe_metric_int(row.read_only)
+    sro = _safe_metric_int(row.super_read_only)
+    if ro is None:
+        return None
+    if ro == 0:
+        return "WRITABLE"
+    if sro == 1:
+        return "READ-ONLY"
+    return "ro=1 only"
+
+
+def _read_only_gantt_label(key: str) -> str:
+    if key == "WRITABLE":
+        return "ro=0, sro=0"
+    if key == "READ-ONLY":
+        return "ro=1, sro=1"
+    return key
+
+
+READ_ONLY_GANTT_COLORS = {
+    "WRITABLE": "#2da44e",
+    "READ-ONLY": "#0969da",
+    "ro=1 only": "#f0883e",
+}
+
+
+def build_replication_queue_figure(
+    k8s_rows: list[K8sPodRow],
+    timing: ScaleTiming,
+    failovers: list[dict[str, str]],
+) -> go.Figure | None:
+    """Line charts for GR certification and applier queue depth."""
+    pods, pod_short = _discover_mysql_pods(k8s_rows)
+    if not pods:
+        return None
+    k8s_rows = _filter_k8s_rows_for_pods(k8s_rows, pods)
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.08,
+        subplot_titles=(
+            "GR Certification Queue (transactions pending certification)",
+            "GR Applier Queue (transactions behind on applier)",
+        ),
+    )
+
+    pod_colors = ["#0969da", "#d62728", "#2ca02c", "#9467bd", "#8c564b"]
+    has_data = False
+
+    for idx, pod in enumerate(pods):
+        pod_rows = sorted(
+            [r for r in k8s_rows if r.pod == pod and r.timestamp and "T" in r.timestamp],
+            key=lambda r: r.timestamp,
+        )
+        if not pod_rows:
+            continue
+
+        label = f"mysql-{pod_short[pod]}"
+        color = pod_colors[idx % len(pod_colors)]
+
+        cert_times: list[str] = []
+        cert_vals: list[int] = []
+        applier_times: list[str] = []
+        applier_vals: list[int] = []
+
+        for r in pod_rows:
+            cert = _safe_metric_int(r.gr_queue)
+            if cert is not None:
+                cert_times.append(r.timestamp)
+                cert_vals.append(cert)
+            applier = _safe_metric_int(r.gr_applier_queue)
+            if applier is not None:
+                applier_times.append(r.timestamp)
+                applier_vals.append(applier)
+
+        if cert_times:
+            has_data = True
+            fig.add_trace(go.Scatter(
+                x=cert_times, y=cert_vals,
+                mode="lines+markers", name=label,
+                line=dict(width=2, color=color),
+                marker=dict(size=4),
+                legendgroup=label, showlegend=True,
+            ), row=1, col=1)
+
+        if applier_times:
+            has_data = True
+            fig.add_trace(go.Scatter(
+                x=applier_times, y=applier_vals,
+                mode="lines+markers", name=label,
+                line=dict(width=2, color=color),
+                marker=dict(size=4),
+                legendgroup=label, showlegend=False,
+            ), row=2, col=1)
+
+    if not has_data:
+        return None
+
+    _add_scale_event_vlines(fig, timing, failovers, [1, 2])
+
+    fig.update_layout(
+        height=560,
+        hovermode="x unified",
+        margin=dict(t=60, b=40),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+    )
+    fig.update_yaxes(title_text="Queue depth", row=1, col=1)
+    fig.update_yaxes(title_text="Queue depth", row=2, col=1)
+    fig.update_xaxes(title_text="Time (UTC)", row=2, col=1)
+
+    return fig
+
+
+def render_replication_lag_section(
+    k8s_rows: list[K8sPodRow],
+    timing: ScaleTiming,
+    run_dir: Path | None = None,
+) -> str:
+    """GR queue line charts + read_only/super_read_only Gantt timeline."""
+    if not k8s_rows:
+        return ""
+
+    pods, pod_short = _discover_mysql_pods(k8s_rows)
+    if not pods:
+        return ""
+    k8s_rows = _filter_k8s_rows_for_pods(k8s_rows, pods)
+    failovers = _resolve_failovers(k8s_rows, run_dir)
+
+    queue_fig = build_replication_queue_figure(k8s_rows, timing, failovers)
+    ro_fig = _build_pod_timeline_figure(
+        "Read-Only Status (read_only / super_read_only)",
+        k8s_rows=k8s_rows,
+        timing=timing,
+        failovers=failovers,
+        pods=pods,
+        pod_short=pod_short,
+        key_fn=_read_only_gantt_key,
+        color_map=READ_ONLY_GANTT_COLORS,
+        label_fn=_read_only_gantt_label,
+        show_bar_text=True,
+        carry_forward=True,
+    )
+
+    if queue_fig is None and ro_fig is None:
+        return ""
+
+    _plotly_config = {"scrollZoom": True, "displayModeBar": True, "responsive": True}
+    charts_html = ""
+    if queue_fig is not None:
+        charts_html += (
+            '<div class="chart-box" style="margin-top:12px;">'
+            f'{queue_fig.to_html(full_html=False, include_plotlyjs=False, div_id="replication-queues", config=_plotly_config)}'
+            "</div>"
+        )
+    if ro_fig is not None:
+        charts_html += (
+            '<div class="chart-box" style="margin-top:12px;">'
+            f'{ro_fig.to_html(full_html=False, include_plotlyjs=False, div_id="replication-readonly", config=_plotly_config)}'
+            "</div>"
+        )
+
+    return f"""
+    <section>
+      <h2 class="section-title">GR Replication Lag</h2>
+      <p>Queue depth over time (line charts) and read-only / super-read-only state per pod (Gantt timeline).</p>
+      {charts_html}
+    </section>"""
+
+
 # =============================================================================
 # HTML rendering
 # =============================================================================
@@ -2736,6 +2925,7 @@ def generate_report(run_dir: Path, output_path: Path | None = None) -> Path:
   {render_temporal_breakdown(activities)}
 
   {build_k8s_status_bars(k8s_rows, timing, run_dir, metrics)}
+  {render_replication_lag_section(k8s_rows, timing, run_dir)}
   {render_vertical_scale_timeline(k8s_rows, timing, run_dir)}
   {render_node_join_timeline(k8s_rows, timing)}
   {render_pvc_timeline(k8s_rows)}
