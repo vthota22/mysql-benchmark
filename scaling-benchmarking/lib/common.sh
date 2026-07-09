@@ -672,17 +672,22 @@ _gr_apply_settings() {
 }
 
 # Apply WITHOUT_SCALING_* GR settings on all pods (before TPC-C workload starts).
+# Non-fatal: logs warning on failure but never aborts the script.
 gr_apply_without_scaling() {
-  _gr_apply_settings "GR_PRE_WORKLOAD" "WITHOUT_SCALING"
+  _gr_apply_settings "GR_PRE_WORKLOAD" "WITHOUT_SCALING" || \
+    log_phase "GR_PRE_WORKLOAD" "WARNING: some GR settings could not be applied — continuing"
 }
 
 # Apply DURING_SCALING_* GR settings on all pods (just before scaling trigger).
+# Non-fatal: logs warning on failure but never aborts the script.
 gr_apply_during_scaling() {
-  _gr_apply_settings "GR_DURING_SCALE" "DURING_SCALING"
+  _gr_apply_settings "GR_DURING_SCALE" "DURING_SCALING" || \
+    log_phase "GR_DURING_SCALE" "WARNING: some GR settings could not be applied — continuing"
 }
 
 # Restore WITHOUT_SCALING_* GR settings on all pods (after scaling completes).
 # Only restores properties that were changed by DURING_SCALING_*.
+# Non-fatal: logs warning on failure but never aborts the script.
 gr_restore_after_scaling() {
   local ds_exit="${DURING_SCALING_GR_EXIT_STATE_ACTION:-}"
   local ds_applier="${DURING_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD:-}"
@@ -724,7 +729,11 @@ gr_restore_after_scaling() {
       log_phase "GR_POST_SCALE" "certifier_threshold: no WITHOUT_SCALING value — leaving as-is"
     fi
   fi
-  return "${rc}"
+
+  if [[ "${rc}" -ne 0 ]]; then
+    log_phase "GR_POST_SCALE" "WARNING: some GR settings could not be restored — continuing"
+  fi
+  return 0
 }
 
 tpcc_tables_exist() {
