@@ -63,6 +63,14 @@ export K8S_NAMESPACE="${K8S_NAMESPACE:-mysql}"
 export PXC_CLUSTER_NAME="${PXC_CLUSTER_NAME:-}"
 export K8S_MONITOR_POLL_SEC="${K8S_MONITOR_POLL_SEC:-5}"
 
+# Group Replication tuning (applied via kubectl exec on every MySQL pod)
+export WITHOUT_SCALING_GR_EXIT_STATE_ACTION="${WITHOUT_SCALING_GR_EXIT_STATE_ACTION:-}"
+export WITHOUT_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD="${WITHOUT_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD:-}"
+export WITHOUT_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD="${WITHOUT_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD:-}"
+export DURING_SCALING_GR_EXIT_STATE_ACTION="${DURING_SCALING_GR_EXIT_STATE_ACTION:-}"
+export DURING_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD="${DURING_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD:-}"
+export DURING_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD="${DURING_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD:-}"
+
 K8S_MONITOR_DIR="${RUN_DIR}/k8s_monitor"
 
 on_exit() {
@@ -155,6 +163,8 @@ run_scale_workflow() {
     "elapsed=${scale_start_elapsed}s command=$(scale_resize_command_description)" \
     | tee -a "${SCALE_LOG}"
 
+  gr_apply_during_scaling
+
   local trigger_rc=0 poll_rc=0 poll_duration=0
   local target_num_nodes="" target_storage_mib=""
   echo "SCALE_TARGET_SIZE=${SCALE_TARGET_SIZE}" >> "${SCALE_TIMING_FILE}"
@@ -224,6 +234,8 @@ run_scale_workflow() {
   log_phase "SCALE_COMPLETE" \
     "elapsed=${scale_complete_elapsed}s duration=${scale_duration}s trigger_rc=${trigger_rc} poll_rc=${poll_rc}" \
     | tee -a "${SCALE_LOG}"
+
+  gr_restore_after_scaling
 }
 
 check_group_replication_settings() {
@@ -280,6 +292,7 @@ phase2_run_with_scaling() {
   export TPCC_MAX_TIME="${tpcc_max_time}"
 
   check_group_replication_settings
+  gr_apply_without_scaling
 
   log_phase "2_RUN" "starting TPC-C (threads=${TPCC_THREADS} duration=${tpcc_max_time}s)"
   if scaling_enabled; then

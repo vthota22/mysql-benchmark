@@ -471,6 +471,262 @@ ensure_database_exists() {
   mysql_admin -e "CREATE DATABASE IF NOT EXISTS \`${MYSQL_DB}\`;"
 }
 
+# ── Group Replication settings via kubectl exec ──────────────────────────────
+# These functions require K8S_KUBECONFIG to be set and valid.
+
+gr_tuning_enabled() {
+  [[ -n "${K8S_KUBECONFIG:-}" && -f "${K8S_KUBECONFIG:-/nonexistent}" ]]
+}
+
+_gr_detect_cr_type() {
+  local ns="${K8S_NAMESPACE:-percona}"
+  local name="${PXC_CLUSTER_NAME:-}"
+
+  if [[ -n "${name}" ]]; then
+    if kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get ps "${name}" >/dev/null 2>&1; then
+      echo "ps"
+    elif kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get pxc "${name}" >/dev/null 2>&1; then
+      echo "pxc"
+    fi
+  else
+    name="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get ps -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    if [[ -n "${name}" ]]; then
+      echo "ps"
+      return
+    fi
+    name="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get pxc -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)"
+    if [[ -n "${name}" ]]; then
+      echo "pxc"
+    fi
+  fi
+}
+
+# Print running MySQL pod names, one per line.
+_gr_get_mysql_pods() {
+  local ns="${K8S_NAMESPACE:-percona}"
+  local cluster="${PXC_CLUSTER_NAME:-}"
+  local cr_type component container
+
+  cr_type="$(_gr_detect_cr_type)"
+  case "${cr_type}" in
+    ps)  component="database"; container="mysql" ;;
+    pxc) component="pxc";      container="pxc" ;;
+    *)
+      log_phase "GR_TUNE" "ERROR: cannot detect CR type (ps/pxc) in namespace ${ns}"
+      return 1
+      ;;
+  esac
+
+  if [[ -z "${cluster}" ]]; then
+    case "${cr_type}" in
+      ps)  cluster="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get ps -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" ;;
+      pxc) cluster="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get pxc -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" ;;
+    esac
+  fi
+
+  echo "${container}"  # first line = container name
+  kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get pods \
+    -l "app.kubernetes.io/instance=${cluster},app.kubernetes.io/component=${component}" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null
+}
+
+# Get MySQL root password for kubectl exec (reuses K8s monitor credentials).
+_gr_get_password() {
+  if [[ -n "${PXC_MYSQL_ROOT_PASSWORD:-}" ]]; then
+    echo "${PXC_MYSQL_ROOT_PASSWORD}"
+    return
+  fi
+  local ns="${K8S_NAMESPACE:-percona}"
+  local cluster="${PXC_CLUSTER_NAME:-}"
+  local secret="${PXC_MYSQL_ROOT_SECRET:-}"
+  if [[ -z "${secret}" ]]; then
+    if [[ -z "${cluster}" ]]; then
+      local cr_type
+      cr_type="$(_gr_detect_cr_type)"
+      case "${cr_type}" in
+        ps)  cluster="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get ps -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" ;;
+        pxc) cluster="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get pxc -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" ;;
+      esac
+    fi
+    secret="${cluster}-secrets"
+  fi
+  kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get secret "${secret}" \
+    -o jsonpath='{.data.root}' 2>/dev/null | base64 -d 2>/dev/null || true
+}
+
+# Run a MySQL statement on a single pod via kubectl exec.
+# Usage: _gr_mysql_in_pod <pod> <container> <password> <sql>
+_gr_mysql_in_pod() {
+  local pod="${1}" container="${2}" password="${3}" sql="${4}"
+  local ns="${K8S_NAMESPACE:-percona}"
+  local user="${PXC_MYSQL_ROOT_USER:-root}"
+  kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" \
+    exec "${pod}" -c "${container}" -- \
+    mysql -u"${user}" -p"${password}" --skip-column-names -e "${sql}" 2>/dev/null
+}
+
+# SET GLOBAL a variable on all running MySQL pods and verify each one.
+# Usage: gr_set_on_all_pods <phase_tag> <variable_name> <value>
+# Returns 0 only if all pods report the expected value.
+gr_set_on_all_pods() {
+  local phase="${1}" var_name="${2}" value="${3}"
+
+  if ! gr_tuning_enabled; then
+    log_phase "${phase}" "skipped (K8S_KUBECONFIG not set)"
+    return 0
+  fi
+
+  local pod_info password container
+  pod_info="$(_gr_get_mysql_pods)" || return 1
+  container="$(echo "${pod_info}" | head -1)"
+  password="$(_gr_get_password)"
+
+  if [[ -z "${password}" ]]; then
+    log_phase "${phase}" "ERROR: cannot determine MySQL root password for kubectl exec"
+    return 1
+  fi
+
+  local pods=()
+  while IFS= read -r pod; do
+    [[ -z "${pod}" ]] && continue
+    pods+=("${pod}")
+  done <<< "$(echo "${pod_info}" | tail -n +2)"
+
+  if [[ ${#pods[@]} -eq 0 ]]; then
+    log_phase "${phase}" "ERROR: no running MySQL pods found"
+    return 1
+  fi
+
+  log_phase "${phase}" "setting ${var_name}=${value} on ${#pods[@]} pod(s)"
+
+  local failed=0
+  for pod in "${pods[@]}"; do
+    if _gr_mysql_in_pod "${pod}" "${container}" "${password}" \
+        "SET GLOBAL ${var_name} = ${value};" 2>/dev/null; then
+      log_phase "${phase}" "  ${pod}: SET OK"
+    else
+      log_phase "${phase}" "  ${pod}: SET FAILED"
+      failed=1
+    fi
+  done
+
+  # Verify on every pod
+  log_phase "${phase}" "verifying ${var_name} on all pods"
+  local all_ok=1
+  for pod in "${pods[@]}"; do
+    local actual
+    actual="$(_gr_mysql_in_pod "${pod}" "${container}" "${password}" \
+      "SELECT @@GLOBAL.${var_name};" 2>/dev/null)" || true
+    actual="$(echo "${actual}" | tr -d '[:space:]')"
+    local expected_trimmed
+    expected_trimmed="$(echo "${value}" | tr -d "'" | tr -d '[:space:]')"
+    if [[ "${actual^^}" == "${expected_trimmed^^}" ]]; then
+      log_phase "${phase}" "  ${pod}: verified ${var_name}=${actual}"
+    else
+      log_phase "${phase}" "  ${pod}: MISMATCH expected=${expected_trimmed} actual=${actual}"
+      all_ok=0
+    fi
+  done
+
+  if [[ "${all_ok}" -eq 1 ]]; then
+    log_phase "${phase}" "${var_name}=${value} confirmed on all ${#pods[@]} pod(s)"
+  else
+    log_phase "${phase}" "WARNING: ${var_name} not consistent across all pods"
+  fi
+
+  return "${failed}"
+}
+
+# Apply a set of GR variables from a given prefix (WITHOUT_SCALING_ or DURING_SCALING_).
+# Only non-empty values are applied; if all are empty the call is a no-op.
+# Usage: _gr_apply_settings <phase_tag> <prefix>
+#   e.g. _gr_apply_settings "GR_PRE_WORKLOAD" "WITHOUT_SCALING"
+_gr_apply_settings() {
+  local phase="${1}" prefix="${2}"
+  local exit_action applier certifier
+  eval "exit_action=\"\${${prefix}_GR_EXIT_STATE_ACTION:-}\""
+  eval "applier=\"\${${prefix}_GR_FLOW_CONTROL_APPLIER_THRESHOLD:-}\""
+  eval "certifier=\"\${${prefix}_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD:-}\""
+
+  if [[ -z "${exit_action}" && -z "${applier}" && -z "${certifier}" ]]; then
+    log_phase "${phase}" "all ${prefix}_GR_* values empty — skipping"
+    return 0
+  fi
+
+  log_phase "${phase}" "applying GR settings (prefix=${prefix})"
+  local rc=0
+
+  if [[ -n "${exit_action}" ]]; then
+    gr_set_on_all_pods "${phase}" \
+      "group_replication_exit_state_action" "'${exit_action}'" || rc=1
+  fi
+  if [[ -n "${applier}" ]]; then
+    gr_set_on_all_pods "${phase}" \
+      "group_replication_flow_control_applier_threshold" "${applier}" || rc=1
+  fi
+  if [[ -n "${certifier}" ]]; then
+    gr_set_on_all_pods "${phase}" \
+      "group_replication_flow_control_certifier_threshold" "${certifier}" || rc=1
+  fi
+  return "${rc}"
+}
+
+# Apply WITHOUT_SCALING_* GR settings on all pods (before TPC-C workload starts).
+gr_apply_without_scaling() {
+  _gr_apply_settings "GR_PRE_WORKLOAD" "WITHOUT_SCALING"
+}
+
+# Apply DURING_SCALING_* GR settings on all pods (just before scaling trigger).
+gr_apply_during_scaling() {
+  _gr_apply_settings "GR_DURING_SCALE" "DURING_SCALING"
+}
+
+# Restore WITHOUT_SCALING_* GR settings on all pods (after scaling completes).
+# Only restores properties that were changed by DURING_SCALING_*.
+gr_restore_after_scaling() {
+  local ds_exit="${DURING_SCALING_GR_EXIT_STATE_ACTION:-}"
+  local ds_applier="${DURING_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD:-}"
+  local ds_certifier="${DURING_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD:-}"
+
+  if [[ -z "${ds_exit}" && -z "${ds_applier}" && -z "${ds_certifier}" ]]; then
+    log_phase "GR_POST_SCALE" "no DURING_SCALING_GR_* values were set — nothing to restore"
+    return 0
+  fi
+
+  local ws_exit="${WITHOUT_SCALING_GR_EXIT_STATE_ACTION:-}"
+  local ws_applier="${WITHOUT_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD:-}"
+  local ws_certifier="${WITHOUT_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD:-}"
+
+  log_phase "GR_POST_SCALE" "restoring GR settings to WITHOUT_SCALING_* values"
+  local rc=0
+
+  if [[ -n "${ds_exit}" ]]; then
+    if [[ -n "${ws_exit}" ]]; then
+      gr_set_on_all_pods "GR_POST_SCALE" \
+        "group_replication_exit_state_action" "'${ws_exit}'" || rc=1
+    else
+      log_phase "GR_POST_SCALE" "exit_state_action: no WITHOUT_SCALING value — leaving as-is"
+    fi
+  fi
+  if [[ -n "${ds_applier}" ]]; then
+    if [[ -n "${ws_applier}" ]]; then
+      gr_set_on_all_pods "GR_POST_SCALE" \
+        "group_replication_flow_control_applier_threshold" "${ws_applier}" || rc=1
+    else
+      log_phase "GR_POST_SCALE" "applier_threshold: no WITHOUT_SCALING value — leaving as-is"
+    fi
+  fi
+  if [[ -n "${ds_certifier}" ]]; then
+    if [[ -n "${ws_certifier}" ]]; then
+      gr_set_on_all_pods "GR_POST_SCALE" \
+        "group_replication_flow_control_certifier_threshold" "${ws_certifier}" || rc=1
+    else
+      log_phase "GR_POST_SCALE" "certifier_threshold: no WITHOUT_SCALING value — leaving as-is"
+    fi
+  fi
+  return "${rc}"
+}
+
 tpcc_tables_exist() {
   local tables="${TPCC_TABLES:-10}"
   local expected=$((tables * 9))
