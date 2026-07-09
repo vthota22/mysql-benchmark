@@ -101,6 +101,7 @@ export PXC_MYSQL_ROOT_SECRET="${PXC_MYSQL_ROOT_SECRET:-}"
 export WITHOUT_SCALING_GR_EXIT_STATE_ACTION="${WITHOUT_SCALING_GR_EXIT_STATE_ACTION:-}"
 export WITHOUT_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD="${WITHOUT_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD:-}"
 export WITHOUT_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD="${WITHOUT_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD:-}"
+export WITHOUT_SCALING_GR_FLOW_CONTROL_HOLD_PERCENT="${WITHOUT_SCALING_GR_FLOW_CONTROL_HOLD_PERCENT:-}"
 
 preflight_checks
 
@@ -135,6 +136,7 @@ gr_vars="$(mysql_admin -e "
   WHERE variable_name IN (
     'group_replication_flow_control_applier_threshold',
     'group_replication_flow_control_certifier_threshold',
+    'group_replication_flow_control_hold_percent',
     'group_replication_exit_state_action',
     'group_replication_flow_control_mode'
   )

@@ -113,6 +113,26 @@ PXC_MYSQL_ROOT_SECRET=""
 # Monitor poll interval (seconds).
 K8S_MONITOR_POLL_SEC=5
 
+# --- Group Replication tuning (optional, requires K8S_KUBECONFIG) ---
+# Applied via kubectl exec on every MySQL pod. Leave empty to skip.
+#
+# WITHOUT_SCALING_* — applied before the TPC-C workload starts (always).
+# DURING_SCALING_*  — applied just before the scaling trigger fires,
+#                     then restored to WITHOUT_SCALING_* values after scaling completes.
+# Only non-empty values are applied; if all are empty, the step is skipped entirely.
+
+# --- Before workload (without scaling) ---
+WITHOUT_SCALING_GR_EXIT_STATE_ACTION=""
+WITHOUT_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD=""
+WITHOUT_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD=""
+WITHOUT_SCALING_GR_FLOW_CONTROL_HOLD_PERCENT=""
+
+# --- During scaling ---
+DURING_SCALING_GR_EXIT_STATE_ACTION=""
+DURING_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD=""
+DURING_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD=""
+DURING_SCALING_GR_FLOW_CONTROL_HOLD_PERCENT=""
+
 # --- Output ---
 # Each run creates results/run_YYYYMMDD_HHMMSS_<engine>/ with all logs, CSVs, and a copy of benchmark.conf.
 RESULTS_DIR="results"

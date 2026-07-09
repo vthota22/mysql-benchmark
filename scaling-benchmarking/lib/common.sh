@@ -696,12 +696,13 @@ gr_set_on_all_pods() {
 #   e.g. _gr_apply_settings "GR_PRE_WORKLOAD" "WITHOUT_SCALING"
 _gr_apply_settings() {
   local phase="${1}" prefix="${2}"
-  local exit_action applier certifier
+  local exit_action applier certifier hold_pct
   eval "exit_action=\"\${${prefix}_GR_EXIT_STATE_ACTION:-}\""
   eval "applier=\"\${${prefix}_GR_FLOW_CONTROL_APPLIER_THRESHOLD:-}\""
   eval "certifier=\"\${${prefix}_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD:-}\""
+  eval "hold_pct=\"\${${prefix}_GR_FLOW_CONTROL_HOLD_PERCENT:-}\""
 
-  if [[ -z "${exit_action}" && -z "${applier}" && -z "${certifier}" ]]; then
+  if [[ -z "${exit_action}" && -z "${applier}" && -z "${certifier}" && -z "${hold_pct}" ]]; then
     log_phase "${phase}" "all ${prefix}_GR_* values empty — skipping"
     return 0
   fi
@@ -720,6 +721,10 @@ _gr_apply_settings() {
   if [[ -n "${certifier}" ]]; then
     gr_set_on_all_pods "${phase}" \
       "group_replication_flow_control_certifier_threshold" "${certifier}" || rc=1
+  fi
+  if [[ -n "${hold_pct}" ]]; then
+    gr_set_on_all_pods "${phase}" \
+      "group_replication_flow_control_hold_percent" "${hold_pct}" || rc=1
   fi
   return "${rc}"
 }
@@ -745,8 +750,9 @@ gr_restore_after_scaling() {
   local ds_exit="${DURING_SCALING_GR_EXIT_STATE_ACTION:-}"
   local ds_applier="${DURING_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD:-}"
   local ds_certifier="${DURING_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD:-}"
+  local ds_hold_pct="${DURING_SCALING_GR_FLOW_CONTROL_HOLD_PERCENT:-}"
 
-  if [[ -z "${ds_exit}" && -z "${ds_applier}" && -z "${ds_certifier}" ]]; then
+  if [[ -z "${ds_exit}" && -z "${ds_applier}" && -z "${ds_certifier}" && -z "${ds_hold_pct}" ]]; then
     log_phase "GR_POST_SCALE" "no DURING_SCALING_GR_* values were set — nothing to restore"
     return 0
   fi
@@ -754,6 +760,7 @@ gr_restore_after_scaling() {
   local ws_exit="${WITHOUT_SCALING_GR_EXIT_STATE_ACTION:-}"
   local ws_applier="${WITHOUT_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD:-}"
   local ws_certifier="${WITHOUT_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD:-}"
+  local ws_hold_pct="${WITHOUT_SCALING_GR_FLOW_CONTROL_HOLD_PERCENT:-}"
 
   log_phase "GR_POST_SCALE" "restoring GR settings to WITHOUT_SCALING_* values"
   local rc=0
@@ -780,6 +787,14 @@ gr_restore_after_scaling() {
         "group_replication_flow_control_certifier_threshold" "${ws_certifier}" || rc=1
     else
       log_phase "GR_POST_SCALE" "certifier_threshold: no WITHOUT_SCALING value — leaving as-is"
+    fi
+  fi
+  if [[ -n "${ds_hold_pct}" ]]; then
+    if [[ -n "${ws_hold_pct}" ]]; then
+      gr_set_on_all_pods "GR_POST_SCALE" \
+        "group_replication_flow_control_hold_percent" "${ws_hold_pct}" || rc=1
+    else
+      log_phase "GR_POST_SCALE" "hold_percent: no WITHOUT_SCALING value — leaving as-is"
     fi
   fi
 
