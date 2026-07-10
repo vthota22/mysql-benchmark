@@ -659,7 +659,7 @@ def _averages_after_failover(
     trigger_sec: float,
     promote_sec: float | None,
 ) -> tuple[float, float, float, str]:
-    """Average healthy per-second metrics after promotion (or post-trigger fallback)."""
+    """Average per-second metrics after promotion through end of run."""
     if promote_sec is not None and promote_sec >= 0:
         start = trigger_sec + promote_sec
         window_note = f"from promotion ({promote_sec:.2f}s after trigger) through end of run"
@@ -672,8 +672,6 @@ def _averages_after_failover(
     lat_vals: list[float] = []
     for row in rows:
         if row["elapsed_sec"] < start:
-            continue
-        if row["err_per_sec"] > 0 or row["tps"] <= 0:
             continue
         tps_vals.append(row["tps"])
         qps_vals.append(row["qps"])
@@ -722,7 +720,7 @@ def _before_after_throughput_table_html(bundle: dict) -> str:
         )
 
     return f"""
-    <p class="monitor-subhead">After failover: average of healthy seconds {html.escape(window_note)}.</p>
+    <p class="monitor-subhead">After failover: average of all seconds {html.escape(window_note)}.</p>
     <div class="table-scroll">
       <table class="throughput-compare">
         <thead>
@@ -1728,6 +1726,134 @@ CLUSTER_CHARTS_CSS = """
     table.cluster-table th { color: var(--muted); font-weight: 500; }
 """
 
+FAILOVER_SUMMARY_CSS = """
+    .report-header {
+      background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+      border: 1px solid var(--border); border-radius: 12px;
+      padding: 1.35rem 1.5rem; margin-bottom: 1.25rem;
+    }
+    .header-top { display: flex; justify-content: space-between; gap: 1.25rem; flex-wrap: wrap; }
+    .header-eyebrow {
+      margin: 0 0 0.3rem; font-size: 0.72rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted);
+    }
+    .header-title {
+      margin: 0; font-size: 1.65rem; font-weight: 750; letter-spacing: -0.03em;
+      line-height: 1.15; color: var(--text);
+    }
+    .header-subtitle { margin: 0.4rem 0 0; font-size: 0.95rem; font-weight: 600; color: var(--accent); }
+    .header-primary-row {
+      display: flex; align-items: center; gap: 0.55rem; flex-wrap: wrap; margin-top: 0.7rem;
+    }
+    .primary-chip {
+      display: inline-flex; align-items: center; padding: 0.3rem 0.65rem; border-radius: 8px;
+      font-size: 0.82rem; font-weight: 600; font-variant-numeric: tabular-nums;
+    }
+    .primary-chip.from { background: rgba(148, 163, 184, 0.12); color: var(--muted); border: 1px solid var(--border); }
+    .primary-chip.to { background: rgba(56, 189, 248, 0.15); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.35); }
+    .primary-arrow { font-size: 1rem; color: var(--muted); font-weight: 600; }
+    .header-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 0.45rem; min-width: 180px; }
+    .header-run, .header-generated { text-align: right; font-size: 0.8rem; color: var(--muted); }
+    .meta-label {
+      display: block; font-size: 0.66rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: 0.06em; color: #64748b; margin-bottom: 2px;
+    }
+    .badge {
+      display: inline-block; padding: 0.2rem 0.6rem; border-radius: 999px;
+      font-size: 0.74rem; font-weight: 700; letter-spacing: 0.04em;
+    }
+    .badge-ok { background: rgba(34, 197, 94, 0.18); color: #4ade80; border: 1px solid rgba(74, 222, 128, 0.35); }
+    .badge-warn { background: rgba(251, 191, 36, 0.15); color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.35); }
+    .badge-fail { background: rgba(248, 113, 113, 0.15); color: #f87171; border: 1px solid rgba(248, 113, 113, 0.35); }
+    .impact-section {
+      background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+      padding: 1.25rem 1.35rem 1.1rem; margin-bottom: 1.25rem;
+    }
+    .impact-hero { margin-bottom: 1rem; }
+    .impact-hero-row { display: flex; align-items: stretch; gap: 0.85rem; flex-wrap: wrap; }
+    .impact-hero-card {
+      display: inline-block; min-width: 200px;
+      border-radius: 10px; padding: 1rem 1.35rem;
+      box-shadow: 0 2px 10px rgba(15, 23, 42, 0.35);
+    }
+    .impact-hero-card.hero-ok {
+      background: linear-gradient(135deg, #0369a1 0%, #0ea5e9 100%); color: #f0f9ff;
+    }
+    .impact-hero-card.hero-warn {
+      background: linear-gradient(135deg, #b45309 0%, #f59e0b 100%); color: #fffbeb;
+    }
+    .impact-hero-card.hero-bad {
+      background: linear-gradient(135deg, #b91c1c 0%, #ef4444 100%); color: #fef2f2;
+    }
+    .impact-hero-value {
+      font-size: 2rem; font-weight: 800; letter-spacing: -0.02em; line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+    .impact-hero-label { margin-top: 0.35rem; font-size: 0.78rem; font-weight: 600; opacity: 0.92; }
+    .impact-hero-secondary { display: flex; align-items: center; }
+    .hero-chip {
+      display: inline-flex; align-items: center; padding: 0.55rem 0.85rem; border-radius: 8px;
+      background: rgba(148, 163, 184, 0.1); border: 1px solid var(--border);
+      font-size: 0.82rem; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums;
+    }
+    .impact-group { margin-top: 1rem; }
+    .impact-group-title {
+      margin: 0 0 0.55rem; font-size: 0.88rem; font-weight: 650; color: var(--text);
+    }
+    .impact-group-hint { font-weight: 500; color: var(--muted); font-size: 0.78rem; }
+    .metric-kpi-grid {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 0.65rem;
+    }
+    .metric-kpi-grid-4 { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+    .metric-kpi {
+      background: rgba(15, 23, 42, 0.45); border: 1px solid var(--border); border-radius: 10px;
+      padding: 0.85rem 0.9rem; text-align: center;
+    }
+    .metric-kpi-alert { background: rgba(248, 113, 113, 0.08); border-color: rgba(248, 113, 113, 0.35); }
+    .metric-kpi-value {
+      min-height: 1.85rem; display: flex; align-items: center; justify-content: center;
+    }
+    .metric-kpi-number {
+      font-size: 1.55rem; font-weight: 800; color: var(--accent);
+      font-variant-numeric: tabular-nums; letter-spacing: -0.02em;
+    }
+    .metric-kpi-unit { font-size: 0.9rem; font-weight: 700; margin-left: 2px; opacity: 0.85; }
+    .metric-kpi-label { font-size: 0.76rem; font-weight: 650; color: var(--muted); margin-top: 0.35rem; }
+    .metric-kpi-sub { font-size: 0.7rem; color: #64748b; margin-top: 0.25rem; font-variant-numeric: tabular-nums; }
+    .delta-badge {
+      display: inline-flex; align-items: center; gap: 3px;
+      font-size: 1.2rem; font-weight: 800; letter-spacing: -0.02em; font-variant-numeric: tabular-nums;
+    }
+    .delta-arrow { font-size: 0.9rem; opacity: 0.9; }
+    .delta-good { color: #4ade80; }
+    .delta-bad { color: #f87171; }
+    .delta-neutral { color: var(--muted); }
+    .phase-strip-wrap { margin-top: 0.25rem; }
+    .phase-strip {
+      display: flex; height: 18px; border-radius: 6px; overflow: hidden;
+      background: rgba(15, 23, 42, 0.6); border: 1px solid var(--border);
+    }
+    .phase-seg { min-width: 3px; transition: width 0.2s; }
+    .phase-legend {
+      display: flex; flex-wrap: wrap; gap: 0.65rem 1rem; margin-top: 0.55rem; font-size: 0.76rem; color: var(--muted);
+    }
+    .phase-legend-item { display: inline-flex; align-items: center; gap: 0.35rem; }
+    .phase-swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+    .impact-details { margin-top: 0.85rem; }
+    .impact-details summary {
+      cursor: pointer; font-size: 0.82rem; font-weight: 600; color: var(--accent); user-select: none;
+    }
+    .impact-details .details-body { margin-top: 0.65rem; }
+    table.summary-phase-table {
+      width: 100%; border-collapse: collapse; font-size: 0.82rem; margin-top: 0.35rem;
+    }
+    table.summary-phase-table th, table.summary-phase-table td {
+      padding: 0.4rem 0.55rem; border-bottom: 1px solid var(--border); text-align: left;
+    }
+    table.summary-phase-table th { color: var(--muted); font-weight: 500; }
+    table.summary-phase-table td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+"""
+
 
 CLUSTER_CHARTS_JS = """
     function clusterChartAnnotations(triggerSec, clusterData, thresholdKey) {
@@ -2590,6 +2716,397 @@ def _promote_three_phase_html(scenario_dir: Path) -> str:
     """
 
 
+PHASE_STRIP_COLORS = ("#22c55e", "#38bdf8", "#a78bfa")
+
+
+def _failover_run_id(scenario_dir: Path) -> str:
+    if scenario_dir.name in {"mixed", "write_only"}:
+        return scenario_dir.parent.name
+    return scenario_dir.name
+
+
+def _hero_duration_short(value: str | float | int | None) -> str:
+    sec = _parse_metric_sec(value)
+    if sec is None:
+        return "N/A"
+    if sec >= 60:
+        return f"{sec:.1f}s"
+    if sec < 1:
+        return f"{sec:.2f}s"
+    if sec == int(sec):
+        return f"{int(sec)}s"
+    return f"{sec:.1f}s"
+
+
+def _delta_badge_html(before: float, after: float, *, lower_is_better: bool = False) -> str:
+    if before <= 0 or after <= 0:
+        return '<span class="delta-badge delta-neutral">—</span>'
+    pct = (after - before) / before * 100.0
+    if abs(pct) < 0.05:
+        return '<span class="delta-badge delta-neutral">0%</span>'
+    is_good = (pct < 0) if lower_is_better else (pct > 0)
+    cls = "delta-good" if is_good else "delta-bad"
+    arrow = "↓" if pct < 0 else "↑"
+    sign = "+" if pct > 0 else ""
+    return (
+        f'<span class="delta-badge {cls}">'
+        f'<span class="delta-arrow">{arrow}</span>{sign}{pct:.1f}%</span>'
+    )
+
+
+def _promotion_phases_by_key(scenario_dir: Path) -> dict[str, dict[str, str]]:
+    return {row.get("phase", ""): row for row in load_promotion_breakdown(scenario_dir / "failover_promotion_breakdown.csv")}
+
+
+def _applier_at_trigger_for_pod(scenario_dir: Path, pod: str) -> str | None:
+    if not pod:
+        return None
+    env = load_metadata(scenario_dir / "gr_pre_failover_applier.env")
+    direct = env.get(f"GR_PRE_FAILOVER_POD_APPLIER_{pod}", "")
+    if direct not in {"", "N/A"}:
+        return direct
+    short = pod.split("-")[-1] if "-" in pod else pod
+    for key, val in env.items():
+        if not key.startswith("GR_PRE_FAILOVER_POD_APPLIER_"):
+            continue
+        if key.endswith(f"_{short}") or key.removeprefix("GR_PRE_FAILOVER_POD_APPLIER_").endswith(short):
+            if val not in {"", "N/A"}:
+                return val
+    return None
+
+
+def _promoted_apply_context(scenario_dir: Path, primary: dict[str, str], trigger_wall: float) -> dict[str, object]:
+    promoted = (
+        primary.get("PRIMARY_AFTER", "")
+        or load_metadata(scenario_dir / "gr_election_internal.env").get("GR_ELECTION_POD", "")
+    )
+    by_phase = _promotion_phases_by_key(scenario_dir)
+    ha_row = by_phase.get("promote_ha_routing_after_ttd", {})
+    ha_dur_raw = ha_row.get("duration_from_ttd_sec", "")
+
+    gr_env = load_metadata(scenario_dir / "gr_election_internal.env")
+    election_sec = _parse_metric_sec(gr_env.get("GR_ELECTION_FROM_TRIGGER_SEC"))
+    writable_sec = _parse_metric_sec(gr_env.get("GR_WRITABLE_FROM_TRIGGER_SEC"))
+    internal_apply_sec: float | None = None
+    if election_sec is not None and writable_sec is not None and writable_sec > election_sec:
+        internal_apply_sec = writable_sec - election_sec
+
+    applier_raw = _applier_at_trigger_for_pod(scenario_dir, str(promoted))
+    apply_rate: float | None = None
+    summary = build_gr_pre_failover_summary(scenario_dir, trigger_wall)
+    for pod_row in summary.get("pods") or []:
+        if str(pod_row.get("pod") or "") == promoted:
+            rate = pod_row.get("avg_apply_rate")
+            if rate is not None:
+                apply_rate = float(rate)
+            break
+
+    estimated_drain: float | None = None
+    if applier_raw and apply_rate and apply_rate > 0:
+        try:
+            estimated_drain = float(applier_raw) / apply_rate
+        except (TypeError, ValueError):
+            estimated_drain = None
+
+    return {
+        "promoted_pod": str(promoted) if promoted else "",
+        "applier_at_trigger": applier_raw,
+        "apply_rate": apply_rate,
+        "estimated_drain_sec": estimated_drain,
+        "internal_apply_sec": internal_apply_sec,
+        "ha_routable_sec": _parse_metric_sec(ha_dur_raw),
+    }
+
+
+def _phase_strip_html(by_phase: dict[str, dict[str, str]]) -> str:
+    segments: list[tuple[str, float, str]] = []
+    titles = (
+        ("promote_gr_election_after_ttd", "GR election"),
+        ("promote_ha_routing_after_ttd", "HAProxy routable"),
+        ("promote_client_path_restore_after_ttd", "Client path restore"),
+    )
+    for idx, (key, title) in enumerate(titles):
+        row = by_phase.get(key, {})
+        if not row and key == "promote_client_path_restore_after_ttd":
+            row = by_phase.get("promote_replication_lag_after_ttd", {})
+        dur = _parse_metric_sec(row.get("duration_from_ttd_sec"))
+        if dur is not None and dur >= 0:
+            segments.append((title, dur, PHASE_STRIP_COLORS[idx % len(PHASE_STRIP_COLORS)]))
+
+    total_row = by_phase.get("promote_total", {})
+    total = _parse_metric_sec(total_row.get("duration_from_ttd_sec"))
+    if not segments:
+        return '<p class="muted" style="margin:0;font-size:0.82rem">Promotion breakdown not available.</p>'
+    denom = total if total and total > 0 else sum(d for _, d, _ in segments)
+    if denom <= 0:
+        denom = 1.0
+
+    bar_parts: list[str] = []
+    legend_parts: list[str] = []
+    for title, dur, color in segments:
+        pct = max(2.0, dur / denom * 100.0)
+        bar_parts.append(
+            f'<div class="phase-seg" style="width:{pct:.1f}%;background:{color}" '
+            f'title="{html.escape(title)}: {_hero_duration_short(dur)}"></div>'
+        )
+        legend_parts.append(
+            f'<span class="phase-legend-item">'
+            f'<span class="phase-swatch" style="background:{color}"></span>'
+            f'{html.escape(title)} <strong>{html.escape(_hero_duration_short(dur))}</strong>'
+            f"</span>"
+        )
+    total_label = _hero_duration_short(total) if total else _hero_duration_short(denom)
+    legend_parts.append(f'<span class="phase-legend-item"><strong>Total {html.escape(total_label)}</strong></span>')
+    return (
+        '<div class="phase-strip-wrap">'
+        f'<div class="phase-strip">{"".join(bar_parts)}</div>'
+        f'<div class="phase-legend">{"".join(legend_parts)}</div>'
+        "</div>"
+    )
+
+
+def _summary_phase_details_html(by_phase: dict[str, dict[str, str]]) -> str:
+    if not by_phase:
+        return ""
+    rows: list[str] = []
+    for phase_key, title, _help in PROMOTE_PHASE_DEFINITIONS:
+        row = by_phase.get(phase_key, {})
+        if not row and phase_key == "promote_client_path_restore_after_ttd":
+            row = by_phase.get("promote_replication_lag_after_ttd", {})
+        dur = _breakdown_cell_duration(row.get("duration_from_ttd_sec", "N/A"))
+        at_trig = _breakdown_cell_time(row.get("time_from_trigger_sec", "N/A"))
+        weight = ' style="font-weight:600"' if phase_key == "promote_total" else ""
+        rows.append(
+            f"<tr{weight}><td>{html.escape(title)}</td>"
+            f'<td class="num">{html.escape(dur)}</td>'
+            f'<td class="num">{html.escape(at_trig)}</td></tr>'
+        )
+    return (
+        '<table class="summary-phase-table">'
+        "<thead><tr><th>Phase</th><th>Duration (from TTD)</th><th>At (from trigger)</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
+    )
+
+
+def _throughput_kpi_cards_html(bundle: dict) -> str:
+    rows = bundle.get("rows", [])
+    trigger = float(bundle.get("trigger", 0))
+    parsed = bundle.get("parsed", {})
+    kpi = bundle.get("kpi", {})
+    extended = bundle.get("extended", {})
+
+    before_tps, before_qps, before_lat = _resolve_baseline_metrics(parsed, rows, trigger)
+    promote_sec = _parse_kpi_sec(kpi.get("primary_election_sec")) or _parse_kpi_sec(
+        extended.get("promote_sec")
+    )
+    after_tps, after_qps, after_lat, _note = _averages_after_failover(rows, trigger, promote_sec)
+
+    cards = [
+        (
+            "TPS",
+            _delta_badge_html(before_tps, after_tps),
+            f"{_fmt_compare_num(after_tps)} after · {_fmt_compare_num(before_tps)} before",
+        ),
+        (
+            "QPS",
+            _delta_badge_html(before_qps, after_qps),
+            f"{_fmt_compare_num(after_qps)} after · {_fmt_compare_num(before_qps)} before",
+        ),
+        (
+            "Latency p95",
+            _delta_badge_html(before_lat, after_lat, lower_is_better=True),
+            (
+                f"{_format_latency_ms(after_lat)} after · {_format_latency_ms(before_lat)} before"
+                if after_lat > 0 and before_lat > 0
+                else "N/A"
+            ),
+        ),
+    ]
+    parts: list[str] = []
+    for label, badge, sub in cards:
+        parts.append(
+            f'<div class="metric-kpi">'
+            f'<div class="metric-kpi-value">{badge}</div>'
+            f'<div class="metric-kpi-label">{html.escape(label)}</div>'
+            f'<div class="metric-kpi-sub">{html.escape(sub)}</div>'
+            f"</div>"
+        )
+    return "".join(parts)
+
+
+def _promoted_kpi_cards_html(ctx: dict[str, object]) -> str:
+    promoted = str(ctx.get("promoted_pod") or "")
+    if not promoted:
+        return '<p class="muted" style="margin:0;font-size:0.82rem">Promoted primary not recorded.</p>'
+
+    applier = ctx.get("applier_at_trigger")
+    apply_rate = ctx.get("apply_rate")
+    drain = ctx.get("estimated_drain_sec")
+    internal = ctx.get("internal_apply_sec")
+    ha_sec = ctx.get("ha_routable_sec")
+
+    def num_card(label: str, value_html: str, sub: str = "", *, alert: bool = False) -> str:
+        cls = " metric-kpi-alert" if alert else ""
+        sub_html = f'<div class="metric-kpi-sub">{html.escape(sub)}</div>' if sub else ""
+        return (
+            f'<div class="metric-kpi{cls}">'
+            f'<div class="metric-kpi-value metric-kpi-number">{value_html}</div>'
+            f'<div class="metric-kpi-label">{html.escape(label)}</div>'
+            f"{sub_html}"
+            f"</div>"
+        )
+
+    applier_val = html.escape(str(applier)) if applier not in (None, "", "N/A") else "N/A"
+    try:
+        applier_alert = float(applier) >= 1000 if applier not in (None, "", "N/A") else False
+    except (TypeError, ValueError):
+        applier_alert = False
+
+    rate_sub = ""
+    if apply_rate and float(apply_rate) > 0:
+        rate_sub = f"{float(apply_rate):.1f} tx/s pre-trigger avg"
+        if drain:
+            rate_sub += f" · est. drain {_hero_duration_short(drain)}"
+
+    cards = [
+        num_card("Applier queue @ trigger", applier_val, "on promoted pod", alert=applier_alert),
+        num_card(
+            "Pre-trigger apply rate",
+            f"{float(apply_rate):.1f}" if apply_rate else "N/A",
+            rate_sub or "30s window before trigger",
+        ),
+        num_card(
+            "Internal apply (mysqld)",
+            _hero_duration_short(internal) if internal is not None else "N/A",
+            "elected → working-as-primary",
+        ),
+        num_card(
+            "HAProxy routable",
+            _hero_duration_short(ha_sec) if ha_sec is not None else "N/A",
+            "GR elected → stats UP",
+        ),
+    ]
+    return f'<div class="metric-kpi-grid metric-kpi-grid-4">{"".join(cards)}</div>'
+
+
+def _failover_status_badge(promote_raw: str) -> tuple[str, str]:
+    sec = _parse_metric_sec(promote_raw)
+    if sec is None:
+        return "badge-fail", "INCOMPLETE"
+    if sec <= 5:
+        return "badge-ok", "SUCCESS"
+    if sec <= 30:
+        return "badge-warn", "DEGRADED"
+    return "badge-warn", "SLOW"
+
+
+def _failover_impact_summary_html(bundle: dict) -> str:
+    scenario_dir = Path(bundle["dir"])
+    kpi = bundle.get("kpi", {})
+    extended = bundle.get("extended", {})
+    primary = bundle.get("primary", {})
+    event = bundle.get("event", {})
+    edition = bundle.get("edition", "advanced")
+    scenario = bundle.get("scenario", "default")
+    trx_profile = bundle.get("trx_profile", "mixed")
+    threads = bundle.get("threads", "")
+
+    promote_raw = kpi.get("primary_election_sec") or extended.get("promote_sec", "N/A")
+    detect_raw = kpi.get("failure_detection_sec") or extended.get("failure_detect_sec", "N/A")
+    before = primary.get("PRIMARY_BEFORE") or extended.get("primary_before", "N/A")
+    after = primary.get("PRIMARY_AFTER") or extended.get("primary_after", "N/A")
+
+    badge_cls, badge_text = _failover_status_badge(str(promote_raw))
+    promote_sec = _parse_metric_sec(promote_raw)
+    if promote_sec is not None and promote_sec <= 5:
+        hero_cls = "hero-ok"
+    elif promote_sec is not None and promote_sec <= 30:
+        hero_cls = "hero-warn"
+    else:
+        hero_cls = "hero-bad"
+
+    trigger_utc = event.get("FAILOVER_TRIGGER_UTC", "N/A")
+    trigger_method = event.get("FAILOVER_METHOD", "N/A")
+    target_pod = event.get("FAILOVER_TARGET_POD", "N/A")
+    run_id = _failover_run_id(scenario_dir)
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    trigger_line = f"{trigger_utc}"
+    if trigger_method not in {"", "N/A"} or target_pod not in {"", "N/A"}:
+        trigger_line += f" · {trigger_method} · {target_pod}"
+
+    by_phase = _promotion_phases_by_key(scenario_dir)
+    trigger_wall = float(bundle.get("trigger_wall", bundle.get("trigger", 0)))
+    apply_ctx = _promoted_apply_context(scenario_dir, primary, trigger_wall)
+    promoted_pod = str(apply_ctx.get("promoted_pod") or after or "N/A")
+
+    primary_row = ""
+    if before not in {"", "N/A"} or after not in {"", "N/A"}:
+        primary_row = (
+            '<div class="header-primary-row">'
+            f'<span class="primary-chip from">{html.escape(before)}</span>'
+            '<span class="primary-arrow" aria-hidden="true">→</span>'
+            f'<span class="primary-chip to">{html.escape(after)}</span>'
+            "</div>"
+        )
+
+    details_html = ""
+    if by_phase:
+        details_html = (
+            '<details class="impact-details">'
+            "<summary>Full promote breakdown</summary>"
+            f'<div class="details-body">{_summary_phase_details_html(by_phase)}</div>'
+            "</details>"
+        )
+
+    threads_label = f"{threads} threads" if threads else "threads N/A"
+
+    return f"""
+<header class="report-header">
+  <div class="header-top">
+    <div class="header-titles">
+      <p class="header-eyebrow">Failover benchmark</p>
+      <h1 class="header-title">Failover Impact Summary</h1>
+      <p class="header-subtitle">{html.escape(edition)} · {html.escape(scenario)} ({html.escape(trx_profile)}) · {html.escape(threads_label)}</p>
+      {primary_row}
+    </div>
+    <div class="header-meta">
+      <span class="badge {badge_cls}">{badge_text}</span>
+      <div class="header-run"><span class="meta-label">Run</span>{html.escape(run_id)}</div>
+      <div class="header-run"><span class="meta-label">Trigger</span>{html.escape(trigger_line)}</div>
+      <div class="header-generated"><span class="meta-label">Generated</span>{html.escape(generated)}</div>
+    </div>
+  </div>
+</header>
+<section class="impact-section">
+  <div class="impact-hero">
+    <div class="impact-hero-row">
+      <div class="impact-hero-card {hero_cls}">
+        <div class="impact-hero-value">{html.escape(_hero_duration_short(promote_raw))}</div>
+        <div class="impact-hero-label">Time to promote (TTD → write OK)</div>
+      </div>
+      <div class="impact-hero-secondary">
+        <span class="hero-chip">Time to detect: {html.escape(_hero_duration_short(detect_raw))}</span>
+      </div>
+    </div>
+  </div>
+  <div class="impact-group">
+    <h3 class="impact-group-title">Throughput impact <span class="impact-group-hint">before vs after failover</span></h3>
+    <div class="metric-kpi-grid">{_throughput_kpi_cards_html(bundle)}</div>
+  </div>
+  <div class="impact-group">
+    <h3 class="impact-group-title">Promote breakdown <span class="impact-group-hint">from TTD</span></h3>
+    {_phase_strip_html(by_phase)}
+  </div>
+  <div class="impact-group">
+    <h3 class="impact-group-title">Promoted primary <span class="impact-group-hint">({html.escape(promoted_pod)})</span></h3>
+    {_promoted_kpi_cards_html(apply_ctx)}
+  </div>
+  {details_html}
+</section>
+"""
+
+
 def _parse_utc_timestamp(raw: str) -> datetime | None:
     if not raw:
         return None
@@ -3208,6 +3725,22 @@ def generate_html_report(
         "event": event,
         "scenario": scenario,
     }
+    summary_bundle = {
+        "dir": str(edition_dir),
+        "edition": edition,
+        "scenario": scenario,
+        "trx_profile": trx_profile,
+        "threads": infer_thread_count(edition_dir, meta, bench),
+        "rows": rows,
+        "parsed": parsed,
+        "event": event,
+        "kpi": kpi,
+        "extended": extended,
+        "primary": primary,
+        "trigger": trigger_log,
+        "trigger_wall": trigger_wall,
+    }
+    impact_summary_html = _failover_impact_summary_html(summary_bundle)
 
     out_path = edition_dir / "graphs" / "failover_report.html"
     out_path.parent.mkdir(exist_ok=True)
@@ -3298,12 +3831,12 @@ def generate_html_report(
     table.throughput-compare tbody th {{ color: var(--text); font-weight: 500; width: 28%; }}
     table.throughput-compare td {{ font-variant-numeric: tabular-nums; }}
     .table-scroll {{ overflow-x: auto; }}
+{FAILOVER_SUMMARY_CSS}
 {CLUSTER_CHARTS_CSS}
   </style>
 </head>
 <body>
-  <h1>Failover benchmark report</h1>
-  <p class="subtitle">{html.escape(edition)} · {html.escape(scenario)} ({html.escape(trx_profile)}) · {html.escape(edition_dir.name)}</p>
+  {impact_summary_html}
 
   <div class="grid">
     <div class="sidebar">
@@ -3506,11 +4039,13 @@ def generate_combined_sweep_html_report(
         cluster_html = _cluster_monitors_html(
             Path(bundle["dir"]), float(bundle.get("trigger_wall", bundle["trigger"])), panel_id=panel_id
         )
+        impact_summary_html = _failover_impact_summary_html(bundle)
         chart_payload[key] = bundle["chart_data"]
         cluster_payload[key] = bundle.get("cluster_data") or {}
         panels.append(
             f'<div class="run-panel" id="{panel_id}" data-sweep="{sweep_id}" '
             f'data-scenario="{html.escape(scenario)}"{hidden}>'
+            f"{impact_summary_html}"
             f'<div class="grid"><div class="sidebar">'
             f'<div class="card sidebar-meta"><h2>Run metadata</h2><table><tbody>{meta_html}</tbody></table></div>'
             f"</div><div class=\"main-column\">"
@@ -3653,11 +4188,12 @@ def generate_combined_sweep_html_report(
     table.throughput-compare tbody th {{ color: var(--text); font-weight: 500; width: 28%; }}
     table.throughput-compare td {{ font-variant-numeric: tabular-nums; }}
     .table-scroll {{ overflow-x: auto; }}
+{FAILOVER_SUMMARY_CSS}
 {CLUSTER_CHARTS_CSS}
   </style>
 </head>
 <body>
-  <h1>Failover benchmark report</h1>
+  <h1 style="font-size:1.35rem;margin:0 0 0.25rem">Failover benchmark report</h1>
   <p class="subtitle">{subtitle}</p>
 
   {kpi_summary_html}
