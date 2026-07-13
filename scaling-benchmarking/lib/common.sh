@@ -843,6 +843,7 @@ gr_apply_replica_parallel_workers() {
       | tail -1 | sed 's/.*=[[:space:]]*//' | tr -d '[:space:]')"
   fi
 
+  local cr_changed=0
   if [[ "${existing_value}" == "${workers}" ]]; then
     log_phase "GR_REPLICA" "replica_parallel_workers=${workers} already in CR configuration — no patch needed"
   else
@@ -866,115 +867,20 @@ print(json.dumps({'spec': {'mysql': {'configuration': conf}}}))
     if patch_out="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" \
         patch ps "${cluster}" --type merge -p "${patch_json}" 2>&1)"; then
       log_phase "GR_REPLICA" "CR patched: ${patch_out}"
+      cr_changed=1
     else
       log_phase "GR_REPLICA" "WARNING: CR patch failed — ${patch_out}"
       return 0
     fi
   fi
 
-  # Collect pre-patch pod UIDs so we know when pods have actually been replaced.
-  local pod_info container
+  # Check if pods already have the correct runtime value (avoids unnecessary rollout wait).
+  local pod_info container password
   pod_info="$(_gr_get_mysql_pods)" || {
-    log_phase "GR_REPLICA" "WARNING: failed to discover MySQL pods for rollout wait"
+    log_phase "GR_REPLICA" "WARNING: failed to discover MySQL pods"
     return 0
   }
   container="$(echo "${pod_info}" | head -1)"
-
-  local expected_pods=()
-  while IFS= read -r pod; do
-    [[ -z "${pod}" ]] && continue
-    expected_pods+=("${pod}")
-  done <<< "$(echo "${pod_info}" | tail -n +2)"
-
-  local expected_count=${#expected_pods[@]}
-
-  if [[ "${existing_value}" == "${workers}" ]]; then
-    log_phase "GR_REPLICA" "skipping rollout wait (CR already had correct value)"
-  else
-    local sts_name="${cluster}-mysql"
-    local poll_interval=10
-    local timeout=600
-    local elapsed=0
-
-    # Capture the StatefulSet revision before the operator reconciles so we can
-    # detect when a new revision appears (the operator updates the ConfigMap hash
-    # annotation which triggers a new STS revision).
-    local pre_patch_rev
-    pre_patch_rev="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
-      -o jsonpath='{.status.updateRevision}' 2>/dev/null)" || pre_patch_rev=""
-
-    log_phase "GR_REPLICA" "waiting for operator to reconcile CR patch (pre-patch revision: ${pre_patch_rev})..."
-
-    # Phase 1: wait for the operator to reconcile — the STS updateRevision
-    # should change from pre_patch_rev once the operator updates the ConfigMap
-    # and rolls the StatefulSet.
-    local reconcile_timeout=120
-    local reconciled=0
-    while (( elapsed < reconcile_timeout )); do
-      local update_rev
-      update_rev="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
-        -o jsonpath='{.status.updateRevision}' 2>/dev/null)" || update_rev=""
-
-      if [[ -n "${update_rev}" && "${update_rev}" != "${pre_patch_rev}" ]]; then
-        log_phase "GR_REPLICA" "operator reconciled — new revision: ${update_rev} (${elapsed}s)"
-        reconciled=1
-        break
-      fi
-
-      log_phase "GR_REPLICA" "  waiting for operator reconciliation... (${elapsed}s)"
-      sleep "${poll_interval}"
-      elapsed=$(( elapsed + poll_interval ))
-    done
-
-    if [[ "${reconciled}" -eq 0 ]]; then
-      log_phase "GR_REPLICA" "WARNING: operator did not create a new STS revision within ${reconcile_timeout}s"
-      log_phase "GR_REPLICA" "  the configuration may already match or the operator is slow — checking pods directly"
-    fi
-
-    # Phase 2: wait for the rolling restart to finish (all pods ready on the new revision).
-    log_phase "GR_REPLICA" "waiting for StatefulSet ${sts_name} rollout (timeout=${timeout}s, ${expected_count} pod(s))..."
-
-    while (( elapsed < timeout )); do
-      local ready_count
-      ready_count="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
-        -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || ready_count=0
-      local updated_count
-      updated_count="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
-        -o jsonpath='{.status.updatedReplicas}' 2>/dev/null)" || updated_count=0
-      local current_rev
-      current_rev="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
-        -o jsonpath='{.status.currentRevision}' 2>/dev/null)" || current_rev=""
-      local update_rev
-      update_rev="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
-        -o jsonpath='{.status.updateRevision}' 2>/dev/null)" || update_rev=""
-
-      if (( ready_count >= expected_count )) && (( updated_count >= expected_count )) \
-          && [[ -n "${current_rev}" && "${current_rev}" == "${update_rev}" ]] \
-          && [[ "${current_rev}" != "${pre_patch_rev}" || "${reconciled}" -eq 0 ]]; then
-        log_phase "GR_REPLICA" "rollout complete — ${ready_count}/${expected_count} pods ready, revision=${current_rev} (${elapsed}s)"
-        break
-      fi
-
-      log_phase "GR_REPLICA" "  rollout in progress — ready=${ready_count}/${expected_count} updated=${updated_count} rev=${current_rev}/${update_rev} (${elapsed}s)"
-      sleep "${poll_interval}"
-      elapsed=$(( elapsed + poll_interval ))
-    done
-
-    if (( elapsed >= timeout )); then
-      log_phase "GR_REPLICA" "WARNING: rollout did not complete within ${timeout}s — continuing anyway"
-    fi
-  fi
-
-  # Verify replica_parallel_workers on every running pod.
-  log_phase "GR_REPLICA" "verifying replica_parallel_workers on all pods..."
-
-  pod_info="$(_gr_get_mysql_pods)" || {
-    log_phase "GR_REPLICA" "WARNING: failed to discover MySQL pods for verification"
-    return 0
-  }
-  container="$(echo "${pod_info}" | head -1)"
-
-  local password
   password="$(_gr_get_password)"
   if [[ -z "${password}" ]]; then
     log_phase "GR_REPLICA" "WARNING: cannot determine MySQL root password — skipping verification"
@@ -982,6 +888,107 @@ print(json.dumps({'spec': {'mysql': {'configuration': conf}}}))
   fi
 
   local pods=()
+  while IFS= read -r pod; do
+    [[ -z "${pod}" ]] && continue
+    pods+=("${pod}")
+  done <<< "$(echo "${pod_info}" | tail -n +2)"
+
+  local expected_count=${#pods[@]}
+
+  # Pre-check: see if all pods already report the desired value.
+  local _pre_all_ok=1
+  log_phase "GR_REPLICA" "checking current replica_parallel_workers on ${expected_count} pod(s)..."
+  for pod in "${pods[@]}"; do
+    local _pre_val
+    _pre_val="$(_gr_mysql_in_pod "${pod}" "${container}" "${password}" \
+      "SELECT @@GLOBAL.replica_parallel_workers;" 2>&1)" || _pre_val="?"
+    _pre_val="$(echo "${_pre_val}" | tr -d '[:space:]')"
+    log_phase "GR_REPLICA" "  ${pod}: replica_parallel_workers=${_pre_val}"
+    if [[ "${_pre_val}" != "${workers}" ]]; then
+      _pre_all_ok=0
+    fi
+  done
+
+  if [[ "${_pre_all_ok}" -eq 1 ]]; then
+    log_phase "GR_REPLICA" "replica_parallel_workers=${workers} confirmed on all ${expected_count} pod(s) — no restart needed"
+    return 0
+  fi
+
+  # Pods don't have the right value yet — need a rolling restart.
+  local sts_name="${cluster}-mysql"
+
+  if [[ "${cr_changed}" -eq 0 ]]; then
+    # CR already had the correct value but pods don't — the operator didn't roll
+    # them (e.g. no ConfigMap hash change, or a previous rollout was interrupted).
+    # Force a restart by annotating the StatefulSet template.
+    log_phase "GR_REPLICA" "CR has correct value but pods don't — forcing rolling restart via annotation"
+    local restart_ts
+    restart_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" \
+      patch sts "${sts_name}" --type merge \
+      -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"benchmark/restart-trigger\":\"${restart_ts}\"}}}}}" \
+      >/dev/null 2>&1 || {
+      log_phase "GR_REPLICA" "WARNING: failed to annotate StatefulSet for restart — falling back to SET PERSIST"
+      _gr_apply_replica_parallel_workers_set_persist "${workers}"
+      return $?
+    }
+  fi
+
+  # Wait for the rolling restart to complete.
+  local poll_interval=10
+  local timeout=600
+  local elapsed=0
+
+  local pre_patch_rev
+  pre_patch_rev="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
+    -o jsonpath='{.status.currentRevision}' 2>/dev/null)" || pre_patch_rev=""
+
+  log_phase "GR_REPLICA" "waiting for StatefulSet ${sts_name} rollout (timeout=${timeout}s, ${expected_count} pod(s), pre-rev=${pre_patch_rev})..."
+
+  # Give the operator / STS controller a moment to pick up the change.
+  sleep 5
+  elapsed=5
+
+  while (( elapsed < timeout )); do
+    local ready_count
+    ready_count="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
+      -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || ready_count=0
+    local updated_count
+    updated_count="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
+      -o jsonpath='{.status.updatedReplicas}' 2>/dev/null)" || updated_count=0
+    local current_rev
+    current_rev="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
+      -o jsonpath='{.status.currentRevision}' 2>/dev/null)" || current_rev=""
+    local update_rev
+    update_rev="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
+      -o jsonpath='{.status.updateRevision}' 2>/dev/null)" || update_rev=""
+
+    if (( ready_count >= expected_count )) && (( updated_count >= expected_count )) \
+        && [[ -n "${current_rev}" && "${current_rev}" == "${update_rev}" ]] \
+        && [[ "${current_rev}" != "${pre_patch_rev}" ]]; then
+      log_phase "GR_REPLICA" "rollout complete — ${ready_count}/${expected_count} pods ready, revision=${current_rev} (${elapsed}s)"
+      break
+    fi
+
+    log_phase "GR_REPLICA" "  rollout in progress — ready=${ready_count}/${expected_count} updated=${updated_count} rev=${current_rev}/${update_rev} (${elapsed}s)"
+    sleep "${poll_interval}"
+    elapsed=$(( elapsed + poll_interval ))
+  done
+
+  if (( elapsed >= timeout )); then
+    log_phase "GR_REPLICA" "WARNING: rollout did not complete within ${timeout}s — continuing anyway"
+  fi
+
+  # Final verification on all pods after rollout.
+  log_phase "GR_REPLICA" "verifying replica_parallel_workers on all pods after rollout..."
+
+  pod_info="$(_gr_get_mysql_pods)" || {
+    log_phase "GR_REPLICA" "WARNING: failed to discover MySQL pods for verification"
+    return 0
+  }
+  container="$(echo "${pod_info}" | head -1)"
+
+  pods=()
   while IFS= read -r pod; do
     [[ -z "${pod}" ]] && continue
     pods+=("${pod}")
@@ -1007,7 +1014,7 @@ print(json.dumps({'spec': {'mysql': {'configuration': conf}}}))
   if [[ "${all_ok}" -eq 1 ]]; then
     log_phase "GR_REPLICA" "replica_parallel_workers=${workers} confirmed on all ${#pods[@]} pod(s)"
   else
-    log_phase "GR_REPLICA" "WARNING: replica_parallel_workers not consistent across all pods"
+    log_phase "GR_REPLICA" "WARNING: replica_parallel_workers not consistent across all pods after rollout"
   fi
 
   return 0
