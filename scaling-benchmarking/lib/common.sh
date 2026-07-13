@@ -872,7 +872,7 @@ print(json.dumps({'spec': {'mysql': {'configuration': conf}}}))
     fi
   fi
 
-  # Record pod UIDs before rolling restart so we can detect when all pods are replaced.
+  # Collect pre-patch pod UIDs so we know when pods have actually been replaced.
   local pod_info container
   pod_info="$(_gr_get_mysql_pods)" || {
     log_phase "GR_REPLICA" "WARNING: failed to discover MySQL pods for rollout wait"
@@ -891,12 +891,47 @@ print(json.dumps({'spec': {'mysql': {'configuration': conf}}}))
   if [[ "${existing_value}" == "${workers}" ]]; then
     log_phase "GR_REPLICA" "skipping rollout wait (CR already had correct value)"
   else
-    # Wait for the StatefulSet rolling restart to complete.
     local sts_name="${cluster}-mysql"
     local poll_interval=10
     local timeout=600
     local elapsed=0
 
+    # Capture the StatefulSet revision before the operator reconciles so we can
+    # detect when a new revision appears (the operator updates the ConfigMap hash
+    # annotation which triggers a new STS revision).
+    local pre_patch_rev
+    pre_patch_rev="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
+      -o jsonpath='{.status.updateRevision}' 2>/dev/null)" || pre_patch_rev=""
+
+    log_phase "GR_REPLICA" "waiting for operator to reconcile CR patch (pre-patch revision: ${pre_patch_rev})..."
+
+    # Phase 1: wait for the operator to reconcile — the STS updateRevision
+    # should change from pre_patch_rev once the operator updates the ConfigMap
+    # and rolls the StatefulSet.
+    local reconcile_timeout=120
+    local reconciled=0
+    while (( elapsed < reconcile_timeout )); do
+      local update_rev
+      update_rev="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
+        -o jsonpath='{.status.updateRevision}' 2>/dev/null)" || update_rev=""
+
+      if [[ -n "${update_rev}" && "${update_rev}" != "${pre_patch_rev}" ]]; then
+        log_phase "GR_REPLICA" "operator reconciled — new revision: ${update_rev} (${elapsed}s)"
+        reconciled=1
+        break
+      fi
+
+      log_phase "GR_REPLICA" "  waiting for operator reconciliation... (${elapsed}s)"
+      sleep "${poll_interval}"
+      elapsed=$(( elapsed + poll_interval ))
+    done
+
+    if [[ "${reconciled}" -eq 0 ]]; then
+      log_phase "GR_REPLICA" "WARNING: operator did not create a new STS revision within ${reconcile_timeout}s"
+      log_phase "GR_REPLICA" "  the configuration may already match or the operator is slow — checking pods directly"
+    fi
+
+    # Phase 2: wait for the rolling restart to finish (all pods ready on the new revision).
     log_phase "GR_REPLICA" "waiting for StatefulSet ${sts_name} rollout (timeout=${timeout}s, ${expected_count} pod(s))..."
 
     while (( elapsed < timeout )); do
@@ -914,8 +949,9 @@ print(json.dumps({'spec': {'mysql': {'configuration': conf}}}))
         -o jsonpath='{.status.updateRevision}' 2>/dev/null)" || update_rev=""
 
       if (( ready_count >= expected_count )) && (( updated_count >= expected_count )) \
-          && [[ -n "${current_rev}" && "${current_rev}" == "${update_rev}" ]]; then
-        log_phase "GR_REPLICA" "rollout complete — ${ready_count}/${expected_count} pods ready (${elapsed}s)"
+          && [[ -n "${current_rev}" && "${current_rev}" == "${update_rev}" ]] \
+          && [[ "${current_rev}" != "${pre_patch_rev}" || "${reconciled}" -eq 0 ]]; then
+        log_phase "GR_REPLICA" "rollout complete — ${ready_count}/${expected_count} pods ready, revision=${current_rev} (${elapsed}s)"
         break
       fi
 
