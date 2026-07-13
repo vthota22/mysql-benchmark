@@ -72,6 +72,7 @@ export DURING_SCALING_GR_EXIT_STATE_ACTION="${DURING_SCALING_GR_EXIT_STATE_ACTIO
 export DURING_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD="${DURING_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD:-}"
 export DURING_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD="${DURING_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD:-}"
 export DURING_SCALING_GR_FLOW_CONTROL_HOLD_PERCENT="${DURING_SCALING_GR_FLOW_CONTROL_HOLD_PERCENT:-}"
+export GR_REPLICA_PARALLEL_WORKERS="${GR_REPLICA_PARALLEL_WORKERS:-}"
 
 K8S_MONITOR_DIR="${RUN_DIR}/k8s_monitor"
 
@@ -251,7 +252,9 @@ check_group_replication_settings() {
       'group_replication_flow_control_certifier_threshold',
       'group_replication_flow_control_hold_percent',
       'group_replication_exit_state_action',
-      'group_replication_flow_control_mode'
+      'group_replication_flow_control_mode',
+      'replica_parallel_workers',
+      'replica_preserve_commit_order'
     )
     ORDER BY variable_name;
   " 2>&1)" || true
@@ -297,6 +300,7 @@ phase2_run_with_scaling() {
   snapshot_cr_config
   check_group_replication_settings
   gr_apply_without_scaling
+  gr_apply_replica_parallel_workers
 
   log_phase "2_RUN" "starting TPC-C (threads=${TPCC_THREADS} duration=${tpcc_max_time}s)"
   if scaling_enabled; then

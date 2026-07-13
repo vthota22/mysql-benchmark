@@ -790,6 +790,56 @@ gr_apply_without_scaling() {
     log_phase "GR_PRE_WORKLOAD" "WARNING: some GR settings could not be applied — continuing"
 }
 
+# Apply replica_parallel_workers on all pods (once, before workload; not scaling-phase specific).
+# Non-fatal: logs warning on failure but never aborts the script.
+gr_apply_replica_parallel_workers() {
+  local workers="${GR_REPLICA_PARALLEL_WORKERS:-}"
+
+  if [[ -z "${workers}" ]]; then
+    log_phase "GR_REPLICA" "GR_REPLICA_PARALLEL_WORKERS empty — skipping"
+    return 0
+  fi
+
+  if ! gr_tuning_enabled; then
+    log_phase "GR_REPLICA" "skipped (K8S_KUBECONFIG not set or kubectl not found)"
+    return 0
+  fi
+
+  local pod_info password container
+  pod_info="$(_gr_get_mysql_pods)" || {
+    log_phase "GR_REPLICA" "WARNING: failed to discover MySQL pods — cannot set replica_parallel_workers"
+    return 0
+  }
+  container="$(echo "${pod_info}" | head -1)"
+  password="$(_gr_get_password)"
+
+  if [[ -z "${password}" ]]; then
+    log_phase "GR_REPLICA" "WARNING: cannot determine MySQL root password — skipping"
+    return 0
+  fi
+
+  local pods=()
+  while IFS= read -r pod; do
+    [[ -z "${pod}" ]] && continue
+    pods+=("${pod}")
+  done <<< "$(echo "${pod_info}" | tail -n +2)"
+
+  log_phase "GR_REPLICA" "current replica_parallel_workers on ${#pods[@]} pod(s):"
+  for pod in "${pods[@]}"; do
+    local current preserve
+    current="$(_gr_mysql_in_pod "${pod}" "${container}" "${password}" \
+      "SELECT @@GLOBAL.replica_parallel_workers;" 2>&1)" || current="?"
+    preserve="$(_gr_mysql_in_pod "${pod}" "${container}" "${password}" \
+      "SELECT @@GLOBAL.replica_preserve_commit_order;" 2>&1)" || preserve="?"
+    current="$(echo "${current}" | tr -d '[:space:]')"
+    preserve="$(echo "${preserve}" | tr -d '[:space:]')"
+    log_phase "GR_REPLICA" "  ${pod}: replica_parallel_workers=${current} replica_preserve_commit_order=${preserve}"
+  done
+
+  gr_set_on_all_pods "GR_REPLICA" "replica_parallel_workers" "${workers}" || \
+    log_phase "GR_REPLICA" "WARNING: replica_parallel_workers could not be applied on all pods — continuing"
+}
+
 # Apply DURING_SCALING_* GR settings on all pods (just before scaling trigger).
 # Non-fatal: logs warning on failure but never aborts the script.
 gr_apply_during_scaling() {

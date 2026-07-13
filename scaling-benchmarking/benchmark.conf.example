@@ -133,6 +133,9 @@ DURING_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD=""
 DURING_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD=""
 DURING_SCALING_GR_FLOW_CONTROL_HOLD_PERCENT=""
 
+# Applied once before workload on all pods (not tied to scaling phase). Leave empty to skip.
+GR_REPLICA_PARALLEL_WORKERS=""
+
 # --- Output ---
 # Each run creates results/run_YYYYMMDD_HHMMSS_<engine>/ with all logs, CSVs, and a copy of benchmark.conf.
 RESULTS_DIR="results"

@@ -102,6 +102,7 @@ export WITHOUT_SCALING_GR_EXIT_STATE_ACTION="${WITHOUT_SCALING_GR_EXIT_STATE_ACT
 export WITHOUT_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD="${WITHOUT_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD:-}"
 export WITHOUT_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD="${WITHOUT_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD:-}"
 export WITHOUT_SCALING_GR_FLOW_CONTROL_HOLD_PERCENT="${WITHOUT_SCALING_GR_FLOW_CONTROL_HOLD_PERCENT:-}"
+export GR_REPLICA_PARALLEL_WORKERS="${GR_REPLICA_PARALLEL_WORKERS:-}"
 
 preflight_checks
 
@@ -140,7 +141,9 @@ gr_vars="$(mysql_admin -e "
     'group_replication_flow_control_certifier_threshold',
     'group_replication_flow_control_hold_percent',
     'group_replication_exit_state_action',
-    'group_replication_flow_control_mode'
+    'group_replication_flow_control_mode',
+    'replica_parallel_workers',
+    'replica_preserve_commit_order'
   )
   ORDER BY variable_name;
 " 2>&1)" || true
@@ -168,6 +171,7 @@ fi
 
 echo ""
 gr_apply_without_scaling
+gr_apply_replica_parallel_workers
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] starting workload"
 echo ""
 
