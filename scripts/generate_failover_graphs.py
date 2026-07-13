@@ -158,9 +158,35 @@ def load_mysql_pod_buffer_pool(edition_dir: Path) -> list[dict[str, str]]:
                 "bp_used_pct": parts[4],
                 "gr_role": parts[5],
                 "replica_parallel_workers": parts[6] if len(parts) > 6 else "",
+                "workers_total": parts[7] if len(parts) > 7 else "",
+                "workers_applying_now": parts[8] if len(parts) > 8 else "",
             }
         )
     return rows
+
+
+def _pod_replica_parallel_workers_map(edition_dir: Path) -> dict[str, str]:
+    """Per-pod replica_parallel_workers from mysql_pod_buffer_pool.tsv (start-of-run snapshot)."""
+    out: dict[str, str] = {}
+    for pod_row in load_mysql_pod_buffer_pool(edition_dir):
+        pod = pod_row.get("pod", "").strip()
+        workers = pod_row.get("replica_parallel_workers", "").strip()
+        if pod and workers not in ("", "N/A"):
+            out[pod] = workers
+    if out:
+        return out
+    cfg: dict[str, str] = {}
+    for path in (edition_dir / "benchmark_config.env", edition_dir / "mysql_runtime.env"):
+        if path.exists():
+            cfg.update(load_metadata(path))
+    vip = cfg.get("REPLICA_PARALLEL_WORKERS", "").strip()
+    if vip and vip != "N/A":
+        return {"*": vip}
+    return {}
+
+
+def _replica_workers_for_pod(pod: str, workers_by_pod: dict[str, str]) -> str:
+    return workers_by_pod.get(pod) or workers_by_pod.get("*") or ""
 
 
 def _mysql_pod_replica_workers_meta_rows(edition_dir: Path) -> list[tuple[str, str]]:
@@ -175,6 +201,10 @@ def _mysql_pod_replica_workers_meta_rows(edition_dir: Path) -> list[tuple[str, s
         if gr_role and gr_role != "N/A":
             val += f" [{gr_role}]"
         rows.append((f"replica_parallel_workers ({pod})", val))
+        workers_total = pod_row.get("workers_total", "").strip()
+        workers_applying = pod_row.get("workers_applying_now", "").strip()
+        if workers_total not in ("", "N/A") and workers_applying not in ("", "N/A"):
+            rows.append((f"parallel workers in use ({pod})", f"{workers_applying}/{workers_total}"))
     return rows
 
 
@@ -895,12 +925,20 @@ def load_gr_pod_monitor(scenario_dir: Path) -> list[dict[str, str | float]]:
         parts = line.split("\t")
         if len(parts) < 7:
             continue
-        # New format (13 cols): ... conflicts, gtid_seq
-        # Legacy (14 cols): ... conflicts, member_weight, gtid_seq
-        if len(parts) >= 14:
+        # New format (15 cols): ... gtid_seq, workers_total, workers_applying_now
+        # Legacy (13 cols): ... conflicts, gtid_seq
+        if len(parts) >= 15:
+            gtid_idx = 12
+            workers_total_idx = 13
+            workers_applying_idx = 14
+        elif len(parts) >= 14:
             gtid_idx = 13
+            workers_total_idx = -1
+            workers_applying_idx = -1
         else:
             gtid_idx = 12
+            workers_total_idx = -1
+            workers_applying_idx = -1
         elapsed = float(parts[1])
         rows.append(
             {
@@ -918,6 +956,8 @@ def load_gr_pod_monitor(scenario_dir: Path) -> list[dict[str, str | float]]:
                 "tx_checked": parts[10] if len(parts) > 10 else "-1",
                 "conflicts": parts[11] if len(parts) > 11 else "-1",
                 "gtid_seq": parts[gtid_idx] if len(parts) > gtid_idx else "0",
+                "workers_total": parts[workers_total_idx] if workers_total_idx >= 0 and len(parts) > workers_total_idx else "-1",
+                "workers_applying_now": parts[workers_applying_idx] if workers_applying_idx >= 0 and len(parts) > workers_applying_idx else "-1",
             }
         )
     return rows
@@ -987,6 +1027,7 @@ def _build_queue_point(
     row: dict[str, str | float],
     prev_row: dict[str, str | float] | None,
     queue_key: str,
+    replica_parallel_workers: str = "",
 ) -> dict[str, object]:
     y = _monitor_float(row.get(queue_key))
     if y < 0:
@@ -1001,7 +1042,11 @@ def _build_queue_point(
         "applier_queue": _monitor_float(row.get("applier_queue")),
         "conflicts": _monitor_float(row.get("conflicts")),
         "gtid_seq": _monitor_float(row.get("gtid_seq"), 0),
+        "workers_total": _monitor_float(row.get("workers_total")),
+        "workers_applying_now": _monitor_float(row.get("workers_applying_now")),
     }
+    if replica_parallel_workers:
+        pt["replica_parallel_workers"] = replica_parallel_workers
     if prev_row is not None:
         prev_y = _monitor_float(prev_row.get(queue_key))
         if prev_y >= 0:
@@ -1039,6 +1084,8 @@ def build_gr_pre_failover_summary(
         certs = [_monitor_float(r.get("cert_queue")) for r in rows]
         certs_ok = [c for c in certs if c >= 0]
         apply_rates: list[float] = []
+        workers_applying_vals = [_monitor_float(r.get("workers_applying_now")) for r in rows]
+        workers_applying_ok = [w for w in workers_applying_vals if w >= 0]
         sorted_rows = sorted(rows, key=lambda r: float(r["sysbench_sec"]))
         for i in range(1, len(sorted_rows)):
             prev = sorted_rows[i - 1]
@@ -1056,6 +1103,8 @@ def build_gr_pre_failover_summary(
                 "max_applier": max(appliers_ok) if appliers_ok else None,
                 "avg_cert": round(sum(certs_ok) / len(certs_ok), 2) if certs_ok else None,
                 "avg_apply_rate": round(sum(apply_rates) / len(apply_rates), 2) if apply_rates else None,
+                "avg_workers_applying": round(sum(workers_applying_ok) / len(workers_applying_ok), 2) if workers_applying_ok else None,
+                "max_workers_applying": max(workers_applying_ok) if workers_applying_ok else None,
             }
         )
 
@@ -1459,9 +1508,12 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
 
     event = load_metadata(scenario_dir / "failover_event.txt")
     target_pod = event.get("FAILOVER_TARGET_POD", "")
+    edition_root = parent_edition_dir(scenario_dir) or scenario_dir
+    replica_workers_by_pod = _pod_replica_parallel_workers_map(edition_root)
 
     gr_state_datasets: list[dict] = []
     applier_datasets: list[dict] = []
+    workers_applying_datasets: list[dict] = []
     cert_datasets: list[dict] = []
     k8s_state_datasets: list[dict] = []
 
@@ -1474,15 +1526,24 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
         )
         state_points = []
         applier_points: list[dict] = []
+        workers_applying_points: list[dict] = []
         cert_points: list[dict] = []
         prev_label: str | None = None
         prev_row: dict[str, str | float] | None = None
+        pod_replica_workers = _replica_workers_for_pod(pod, replica_workers_by_pod)
         for row in pod_rows:
             sec = float(row["sysbench_sec"])
-            applier_pt = _build_queue_point(row, prev_row, "applier_queue")
+            applier_pt = _build_queue_point(
+                row, prev_row, "applier_queue", pod_replica_workers
+            )
             if applier_pt:
                 applier_points.append(applier_pt)
-            cert_pt = _build_queue_point(row, prev_row, "cert_queue")
+            workers_pt = _build_queue_point(
+                row, prev_row, "workers_applying_now", pod_replica_workers
+            )
+            if workers_pt:
+                workers_applying_points.append(workers_pt)
+            cert_pt = _build_queue_point(row, prev_row, "cert_queue", pod_replica_workers)
             if cert_pt:
                 cert_points.append(cert_pt)
             prev_row = row
@@ -1512,6 +1573,14 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
         )
         applier_datasets.append(
             {"label": pod, "data": applier_points, "borderColor": color, "backgroundColor": color}
+        )
+        workers_applying_datasets.append(
+            {
+                "label": pod,
+                "data": workers_applying_points,
+                "borderColor": color,
+                "backgroundColor": color,
+            }
         )
         cert_datasets.append(
             {"label": pod, "data": cert_points, "borderColor": color, "backgroundColor": color}
@@ -1580,8 +1649,10 @@ def build_cluster_monitor_chart_data(scenario_dir: Path, trigger: float) -> dict
         "target_pod": target_pod,
         "gr_state_datasets": gr_state_datasets,
         "applier_datasets": applier_datasets,
+        "workers_applying_datasets": workers_applying_datasets,
         "cert_datasets": cert_datasets,
         "has_applier_queue": any(ds.get("data") for ds in applier_datasets),
+        "has_workers_applying": any(ds.get("data") for ds in workers_applying_datasets),
         "has_cert_queue": any(ds.get("data") for ds in cert_datasets),
         "flow_thresholds": flow_thresholds,
         "event_markers": event_markers,
@@ -1640,7 +1711,9 @@ def _cluster_gr_pre_failover_table_html(data: dict) -> str:
             f"<td>{html.escape(str(row.get('avg_applier', 'N/A')))}</td>"
             f"<td>{html.escape(str(row.get('max_applier', 'N/A')))}</td>"
             f"<td>{html.escape(str(row.get('avg_cert', 'N/A')))}</td>"
-            f"<td>{html.escape(str(row.get('avg_apply_rate', 'N/A')))}</td></tr>"
+            f"<td>{html.escape(str(row.get('avg_apply_rate', 'N/A')))}</td>"
+            f"<td>{html.escape(str(row.get('avg_workers_applying', 'N/A')))}</td>"
+            f"<td>{html.escape(str(row.get('max_workers_applying', 'N/A')))}</td></tr>"
         )
     note = summary.get("note")
     note_html = (
@@ -1653,6 +1726,7 @@ def _cluster_gr_pre_failover_table_html(data: dict) -> str:
         + '<table class="cluster-table"><thead><tr>'
         "<th>Pod</th><th>Rank</th><th>Avg applier</th><th>Max applier</th>"
         "<th>Avg cert</th><th>Apply rate (txn/s)</th>"
+        "<th>Avg workers applying</th><th>Max workers applying</th>"
         "</tr></thead><tbody>"
         + "".join(body)
         + "</tbody></table>"
@@ -1711,6 +1785,18 @@ def _cluster_monitors_html(scenario_dir: Path, trigger: float, *, panel_id: str 
                     "Hover for role/state, cert queue, and apply rate.</p>",
                     '<div class="chart-wrap chart-wrap-sm">'
                     f'<canvas id="grApplierQueueChart{suffix}"></canvas></div>',
+                ]
+            )
+        if data.get("has_workers_applying"):
+            sections.extend(
+                [
+                    "<h3>Parallel replica workers in use</h3>",
+                    '<p class="monitor-subhead">Count of GR applier workers with a non-empty '
+                    "<code>APPLYING_TRANSACTION</code> per pod "
+                    "(from <code>replication_applier_status_by_worker</code>). "
+                    "Hover for configured <code>replica_parallel_workers</code> and worker totals.</p>",
+                    '<div class="chart-wrap chart-wrap-sm">'
+                    f'<canvas id="grWorkersApplyingChart{suffix}"></canvas></div>',
                 ]
             )
         sections.extend(
@@ -1933,10 +2019,16 @@ CLUSTER_CHARTS_JS = """
           },
           label: function(ctx) {
             const pt = ctx.raw || {};
-            const lines = [(ctx.dataset.label || "") + ": queue " + pt.y];
+            const valLabel = (pt.workers_applying_now >= 0 && pt.y === pt.workers_applying_now)
+              ? (pt.y + " applying")
+              : ("queue " + pt.y);
+            const lines = [(ctx.dataset.label || "") + ": " + valLabel];
             if (pt.role) lines.push("  " + pt.role + " / " + pt.state);
+            if (pt.replica_parallel_workers) lines.push("  replica_parallel_workers: " + pt.replica_parallel_workers);
             if (pt.cert_queue >= 0) lines.push("  cert queue: " + pt.cert_queue);
             if (pt.applier_queue >= 0) lines.push("  applier queue: " + pt.applier_queue);
+            if (pt.workers_applying_now >= 0) lines.push("  workers applying: " + pt.workers_applying_now);
+            if (pt.workers_total >= 0) lines.push("  workers total: " + pt.workers_total);
             if (pt.delta_queue != null) lines.push("  delta queue: " + pt.delta_queue);
             if (pt.apply_rate != null) lines.push("  apply rate: " + pt.apply_rate + " txn/s");
             if (pt.conflicts >= 0) lines.push("  conflicts: " + pt.conflicts);
@@ -2064,6 +2156,14 @@ CLUSTER_CHARTS_JS = """
             clusterData.applier_datasets,
             "Applier queue depth",
             null, null, false, clusterData, "applier"
+          );
+        }
+        if (clusterData.has_workers_applying) {
+          makeLineChart(
+            "grWorkersApplyingChart" + suffix,
+            clusterData.workers_applying_datasets,
+            "Parallel workers applying (count)",
+            null, null, false, clusterData, null
           );
         }
         makeLineChart(

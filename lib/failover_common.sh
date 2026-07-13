@@ -42,6 +42,12 @@ failover_defaults() {
   : "${FAILOVER_GR_READINESS_POLL_SEC:=2}"
   : "${FAILOVER_GR_READINESS_TIMEOUT_SEC:=600}"
   : "${FAILOVER_GR_READINESS_ABORT_ON_TIMEOUT:=1}"
+  # Advanced: ensure replica_parallel_workers on every pod before each iteration / trigger
+  : "${FAILOVER_REPLICA_WORKERS_GATE:=1}"
+  : "${FAILOVER_REPLICA_PARALLEL_WORKERS:=16}"
+  : "${FAILOVER_REPLICA_WORKERS_POLL_SEC:=2}"
+  : "${FAILOVER_REPLICA_WORKERS_TIMEOUT_SEC:=600}"
+  : "${FAILOVER_REPLICA_WORKERS_ABORT_ON_TIMEOUT:=1}"
   : "${FAILOVER_COLLECT_K8S_EVENTS:=1}"
   : "${FAILOVER_RUN_TPCC_CHECK:=0}"
   : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011}"
@@ -677,7 +683,12 @@ SELECT @@hostname,
        IFNULL((SELECT COUNT_CONFLICTS_DETECTED
                  FROM performance_schema.replication_group_member_stats
                 WHERE MEMBER_ID = @@server_uuid LIMIT 1), -1),
-       IFNULL(CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(@@GLOBAL.gtid_executed, '\'':'\'', -1), '\''-'\'', -1) AS UNSIGNED), 0);"' 2>/dev/null || true
+       IFNULL(CAST(SUBSTRING_INDEX(SUBSTRING_INDEX(@@GLOBAL.gtid_executed, '\'':'\'', -1), '\''-'\'', -1) AS UNSIGNED), 0),
+       IFNULL((SELECT COUNT(*) FROM performance_schema.replication_applier_status_by_worker
+               WHERE CHANNEL_NAME = '\''group_replication_applier'\''), 0),
+       IFNULL((SELECT SUM(APPLYING_TRANSACTION <> '\'''\'')
+                 FROM performance_schema.replication_applier_status_by_worker
+                WHERE CHANNEL_NAME = '\''group_replication_applier'\''), 0);"' 2>/dev/null || true
 }
 
 _failover_poll_pod_buffer_pool_once() {
@@ -696,7 +707,12 @@ SELECT @@hostname,
                WHERE VARIABLE_NAME = '\''Innodb_buffer_pool_bytes_data'\'' LIMIT 1), 0),
        IFNULL((SELECT MEMBER_ROLE FROM performance_schema.replication_group_members
                WHERE MEMBER_ID = @@server_uuid LIMIT 1), '\''N/A'\''),
-       @@GLOBAL.replica_parallel_workers;"' 2>/dev/null || true
+       @@GLOBAL.replica_parallel_workers,
+       IFNULL((SELECT COUNT(*) FROM performance_schema.replication_applier_status_by_worker
+               WHERE CHANNEL_NAME = '\''group_replication_applier'\''), 0),
+       IFNULL((SELECT SUM(APPLYING_TRANSACTION <> '\'''\'')
+                 FROM performance_schema.replication_applier_status_by_worker
+                WHERE CHANNEL_NAME = '\''group_replication_applier'\''), 0);"' 2>/dev/null || true
 }
 
 # One-shot per-pod buffer pool snapshot (limit + bytes_data + GR role) for report metadata.
@@ -720,19 +736,21 @@ capture_mysql_pod_buffer_pool_metadata() {
   {
     echo "# captured_utc=${captured_utc}"
     echo "# namespace=${ns} kubeconfig=${kubeconfig}"
-    echo -e "pod\thostname\tbp_limit_bytes\tbp_data_bytes\tbp_used_pct\tgr_role\treplica_parallel_workers"
-    local pod line hostname bp_limit bp_data gr_role replica_workers bp_used_pct
+    echo -e "pod\thostname\tbp_limit_bytes\tbp_data_bytes\tbp_used_pct\tgr_role\treplica_parallel_workers\tworkers_total\tworkers_applying_now"
+    local pod line hostname bp_limit bp_data gr_role replica_workers workers_total workers_applying bp_used_pct
     while IFS= read -r pod; do
       [[ -n "${pod}" ]] || continue
       line="$(_failover_poll_pod_buffer_pool_once "${kubeconfig}" "${ns}" "${pod}")"
       [[ -n "${line}" ]] || continue
-      IFS=$'\t' read -r hostname bp_limit bp_data gr_role replica_workers <<< "${line}"
+      IFS=$'\t' read -r hostname bp_limit bp_data gr_role replica_workers workers_total workers_applying <<< "${line}"
       replica_workers="${replica_workers:-N/A}"
+      workers_total="${workers_total:-N/A}"
+      workers_applying="${workers_applying:-N/A}"
       bp_used_pct="N/A"
       if [[ -n "${bp_limit}" && -n "${bp_data}" && "${bp_limit}" =~ ^[0-9]+$ && "${bp_data}" =~ ^[0-9]+$ && "${bp_limit}" -gt 0 ]]; then
         bp_used_pct="$(awk "BEGIN { printf \"%.1f\", (${bp_data} / ${bp_limit}) * 100 }")"
       fi
-      echo -e "${pod}\t${hostname}\t${bp_limit}\t${bp_data}\t${bp_used_pct}\t${gr_role}\t${replica_workers}"
+      echo -e "${pod}\t${hostname}\t${bp_limit}\t${bp_data}\t${bp_used_pct}\t${gr_role}\t${replica_workers}\t${workers_total}\t${workers_applying}"
     done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
   } > "${out_tsv}"
 
@@ -742,9 +760,9 @@ capture_mysql_pod_buffer_pool_metadata() {
   fi
 
   echo "Captured MySQL pod buffer pool metadata: ${out_tsv}"
-  while IFS=$'\t' read -r pod _host _limit _data _pct gr_role replica_workers; do
+  while IFS=$'\t' read -r pod _host _limit _data _pct gr_role replica_workers workers_total workers_applying; do
     [[ "${pod}" == "pod" || -z "${pod}" || "${pod}" =~ ^# ]] && continue
-    echo "  ${pod}: replica_parallel_workers=${replica_workers:-N/A} [${gr_role:-N/A}]"
+    echo "  ${pod}: replica_parallel_workers=${replica_workers:-N/A} workers_applying=${workers_applying:-N/A}/${workers_total:-N/A} [${gr_role:-N/A}]"
   done < "${out_tsv}"
   return 0
 }
@@ -891,7 +909,7 @@ start_gr_pod_monitor() {
   start_epoch=$(python3 -c "import time; print('%.3f' % time.time())")
 
   : > "${out_file}"
-  echo -e "timestamp_utc\telapsed_sec\tpod\tconnect_ok\thostname\tgr_member_role\tgr_member_state\tcert_queue\tapplier_queue\tremote_applied\ttx_checked\tconflicts\tgtid_seq" >> "${out_file}"
+  echo -e "timestamp_utc\telapsed_sec\tpod\tconnect_ok\thostname\tgr_member_role\tgr_member_state\tcert_queue\tapplier_queue\tremote_applied\ttx_checked\tconflicts\tgtid_seq\tworkers_total\tworkers_applying_now" >> "${out_file}"
   {
     echo "GR_POD_MONITOR_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "GR_POD_MONITOR_START_EPOCH=${start_epoch}"
@@ -903,7 +921,7 @@ start_gr_pod_monitor() {
 
   (
     local tick=0 target_epoch elapsed ts due_tick pod line host role state cert_q applier_q
-    local remote_applied tx_checked conflicts gtid_seq
+    local remote_applied tx_checked conflicts gtid_seq workers_total workers_applying
     while true; do
       due_tick=$(python3 -c "
 import math, time
@@ -925,14 +943,16 @@ print(int(math.floor((time.time() - start) / interval)))
         [[ -n "${pod}" ]] || continue
         line=$(_failover_poll_gr_pod_once "${kubeconfig}" "${ns}" "${pod}")
         if [[ "${line}" == *$'\t'* ]]; then
-          IFS=$'\t' read -r host role state cert_q applier_q remote_applied tx_checked conflicts gtid_seq <<< "${line}"
+          IFS=$'\t' read -r host role state cert_q applier_q remote_applied tx_checked conflicts gtid_seq workers_total workers_applying <<< "${line}"
           remote_applied="${remote_applied:--1}"
           tx_checked="${tx_checked:--1}"
           conflicts="${conflicts:--1}"
           gtid_seq="${gtid_seq:-0}"
-          echo -e "${ts}\t${elapsed}\t${pod}\t1\t${host}\t${role}\t${state}\t${cert_q}\t${applier_q}\t${remote_applied}\t${tx_checked}\t${conflicts}\t${gtid_seq}" >> "${out_file}"
+          workers_total="${workers_total:--1}"
+          workers_applying="${workers_applying:--1}"
+          echo -e "${ts}\t${elapsed}\t${pod}\t1\t${host}\t${role}\t${state}\t${cert_q}\t${applier_q}\t${remote_applied}\t${tx_checked}\t${conflicts}\t${gtid_seq}\t${workers_total}\t${workers_applying}" >> "${out_file}"
         else
-          echo -e "${ts}\t${elapsed}\t${pod}\t0\tERROR\tERROR\tERROR\t-1\t-1\t-1\t-1\t-1\t0" >> "${out_file}"
+          echo -e "${ts}\t${elapsed}\t${pod}\t0\tERROR\tERROR\tERROR\t-1\t-1\t-1\t-1\t-1\t0\t-1\t-1" >> "${out_file}"
         fi
       done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
 
@@ -2342,6 +2362,364 @@ wait_for_gr_readiness_before_failover() {
   echo "WARNING: proceeding despite GR not ready (FAILOVER_GR_READINESS_ABORT_ON_TIMEOUT=0)" \
     | tee -a "${log_file}"
   return 0
+}
+
+failover_replica_workers_gate_enabled() {
+  [[ "${FAILOVER_REPLICA_WORKERS_GATE:-1}" == "1" ]]
+}
+
+_failover_target_replica_parallel_workers() {
+  echo "${FAILOVER_REPLICA_PARALLEL_WORKERS:-16}"
+}
+
+_failover_replica_workers_gate_prereqs() {
+  local results_dir="${1:-}"
+  REPLICA_WORKERS_GATE_KUBECONFIG=""
+  REPLICA_WORKERS_GATE_NS="${ADVANCED_K8S_NAMESPACE:-}"
+
+  command -v kubectl >/dev/null 2>&1 || {
+    REPLICA_WORKERS_GATE_SKIP_REASON="kubectl not found"
+    return 1
+  }
+  [[ -n "${REPLICA_WORKERS_GATE_NS}" ]] || {
+    REPLICA_WORKERS_GATE_SKIP_REASON="ADVANCED_K8S_NAMESPACE unset"
+    return 1
+  }
+  if ! REPLICA_WORKERS_GATE_KUBECONFIG="$(_failover_resolve_kubeconfig "${results_dir}")"; then
+    REPLICA_WORKERS_GATE_SKIP_REASON="no kubeconfig (set ADVANCED_KUBECONFIG_PATH)"
+    return 1
+  fi
+  return 0
+}
+
+_failover_poll_pod_replica_workers_role() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local pod="${3:?pod required}"
+  local line hostname bp_limit bp_data gr_role replica_workers
+
+  line="$(_failover_poll_pod_buffer_pool_once "${kubeconfig}" "${ns}" "${pod}")"
+  [[ -n "${line}" ]] || return 1
+  IFS=$'\t' read -r hostname bp_limit bp_data gr_role replica_workers _rest <<< "${line}"
+  gr_role="${gr_role^^}"
+  printf '%s\t%s\n' "${gr_role}" "${replica_workers}"
+}
+
+_failover_mysql_root_exec() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local pod="${3:?pod required}"
+  local sql="${4:?sql required}"
+  local exec_timeout="${5:-90}"
+  local -a kubectl
+  local container="${ADVANCED_K8S_MYSQL_CONTAINER:-mysql}"
+
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+  _failover_run_timeout "${exec_timeout}" "${kubectl[@]}" exec -n "${ns}" "${pod}" -c "${container}" -- \
+    sh -ce 'mysql -uroot -p"$(tr -d "\n" </etc/mysql/mysql-users-secret/root)" -e "$1"' _ "${sql}"
+}
+
+_failover_get_pod_server_uuid() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local pod="${3:?pod required}"
+
+  _failover_mysql_root_exec "${kubeconfig}" "${ns}" "${pod}" "SELECT @@server_uuid;" 30 \
+    | awk 'NF { print; exit }'
+}
+
+_failover_wait_gr_cluster_online() {
+  local log_file="${1:-/dev/stderr}"
+  local poll_sec="${FAILOVER_REPLICA_WORKERS_POLL_SEC:-2}"
+  local timeout_sec="${FAILOVER_REPLICA_WORKERS_TIMEOUT_SEC:-600}"
+  local waited=0 poll_num=0 tsv rc
+
+  while (( waited <= timeout_sec )); do
+    poll_num=$((poll_num + 1))
+    tsv="$(_failover_query_gr_members 2>/dev/null || true)"
+    rc=2
+    if [[ -n "${tsv}" ]]; then
+      _failover_eval_gr_cluster_readiness "${tsv}"
+      rc=$?
+    else
+      GR_READY_SUMMARY="mysql GR query failed"
+    fi
+    echo "  gr_wait poll=${poll_num} waited=${waited}s summary=${GR_READY_SUMMARY}" >> "${log_file}"
+    if (( rc == 0 )); then
+      return 0
+    fi
+    if (( waited >= timeout_sec )); then
+      break
+    fi
+    sleep "${poll_sec}"
+    waited=$((waited + poll_sec))
+  done
+  echo "ERROR: GR not ONLINE after replica_parallel_workers change (${GR_READY_SUMMARY})" >> "${log_file}"
+  return 1
+}
+
+_failover_capture_replica_workers_snapshot() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local out_tsv="${3:?out tsv required}"
+  local pod role workers captured_utc
+
+  captured_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  {
+    echo "# captured_utc=${captured_utc}"
+    echo "# namespace=${ns} kubeconfig=${kubeconfig}"
+    echo -e "pod\tgr_role\treplica_parallel_workers"
+    while IFS= read -r pod; do
+      [[ -n "${pod}" ]] || continue
+      if IFS=$'\t' read -r role workers < <(_failover_poll_pod_replica_workers_role "${kubeconfig}" "${ns}" "${pod}"); then
+        echo -e "${pod}\t${role}\t${workers}"
+      else
+        echo -e "${pod}\tERROR\tERROR"
+      fi
+    done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
+  } > "${out_tsv}"
+}
+
+_failover_collect_replica_workers_state() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local target="${3:?target required}"
+  local pod role workers
+
+  REPLICA_WORKERS_PRIMARY_POD=""
+  REPLICA_WORKERS_MISMATCH_PODS=()
+  REPLICA_WORKERS_READY_PODS=()
+
+  while IFS= read -r pod; do
+    [[ -n "${pod}" ]] || continue
+    if ! IFS=$'\t' read -r role workers < <(_failover_poll_pod_replica_workers_role "${kubeconfig}" "${ns}" "${pod}"); then
+      REPLICA_WORKERS_MISMATCH_PODS+=("${pod}:query_failed")
+      continue
+    fi
+    if [[ "${role}" == "PRIMARY" ]]; then
+      REPLICA_WORKERS_PRIMARY_POD="${pod}"
+    fi
+    if [[ "${workers}" == "${target}" ]]; then
+      REPLICA_WORKERS_READY_PODS+=("${pod}")
+    else
+      REPLICA_WORKERS_MISMATCH_PODS+=("${pod}:${workers:-?}")
+    fi
+  done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
+}
+
+_failover_apply_replica_workers_on_pod() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local pod="${3:?pod required}"
+  local target="${4:?target required}"
+  local log_file="${5:?log file required}"
+  local role workers
+
+  if ! IFS=$'\t' read -r role workers < <(_failover_poll_pod_replica_workers_role "${kubeconfig}" "${ns}" "${pod}"); then
+    echo "ERROR: could not read replica_parallel_workers on ${pod}" | tee -a "${log_file}"
+    return 1
+  fi
+  if [[ "${workers}" == "${target}" ]]; then
+    echo "  ${pod}: already replica_parallel_workers=${target} [${role}]" | tee -a "${log_file}"
+    return 0
+  fi
+
+  echo "  ${pod}: SET PERSIST replica_parallel_workers=${target} (was ${workers:-?}, role=${role})" | tee -a "${log_file}"
+  if ! _failover_mysql_root_exec "${kubeconfig}" "${ns}" "${pod}" \
+    "SET PERSIST replica_parallel_workers = ${target};" 90 | tee -a "${log_file}"; then
+    echo "ERROR: SET PERSIST failed on ${pod}" | tee -a "${log_file}"
+    return 1
+  fi
+  echo "  ${pod}: restarting group replication applier" | tee -a "${log_file}"
+  if ! _failover_mysql_root_exec "${kubeconfig}" "${ns}" "${pod}" \
+    "STOP GROUP_REPLICATION; START GROUP_REPLICATION;" 120 | tee -a "${log_file}"; then
+    echo "ERROR: group replication restart failed on ${pod}" | tee -a "${log_file}"
+    return 1
+  fi
+  if ! _failover_wait_gr_cluster_online "${log_file}"; then
+    return 1
+  fi
+  return 0
+}
+
+_failover_promote_mysql_pod_to_primary() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local pod="${3:?pod required}"
+  local log_file="${4:?log file required}"
+  local member_id exec_pod
+
+  member_id="$(_failover_get_pod_server_uuid "${kubeconfig}" "${ns}" "${pod}")"
+  [[ -n "${member_id}" ]] || {
+    echo "ERROR: could not read server_uuid on ${pod}" | tee -a "${log_file}"
+    return 1
+  }
+  exec_pod="${REPLICA_WORKERS_PRIMARY_POD:-${pod}}"
+  echo "  promoting ${pod} (${member_id}) via ${exec_pod}" | tee -a "${log_file}"
+  if ! _failover_mysql_root_exec "${kubeconfig}" "${ns}" "${exec_pod}" \
+    "SELECT group_replication_set_as_primary('${member_id}');" 60 | tee -a "${log_file}"; then
+    echo "ERROR: group_replication_set_as_primary failed for ${pod}" | tee -a "${log_file}"
+    return 1
+  fi
+  if ! _failover_wait_gr_cluster_online "${log_file}"; then
+    return 1
+  fi
+  return 0
+}
+
+_failover_ensure_replica_workers_topology() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local target="${3:?target required}"
+  local log_file="${4:?log file required}"
+  local pod primary_pod candidate
+
+  _failover_collect_replica_workers_state "${kubeconfig}" "${ns}" "${target}"
+  if ((${#REPLICA_WORKERS_MISMATCH_PODS[@]} == 0)); then
+    return 0
+  fi
+
+  echo "Pods needing replica_parallel_workers=${target}: ${REPLICA_WORKERS_MISMATCH_PODS[*]}" | tee -a "${log_file}"
+
+  while IFS= read -r pod; do
+    [[ -n "${pod}" ]] || continue
+    if ! IFS=$'\t' read -r role workers < <(_failover_poll_pod_replica_workers_role "${kubeconfig}" "${ns}" "${pod}"); then
+      return 1
+    fi
+    [[ "${role}" == "PRIMARY" ]] && continue
+    [[ "${workers}" == "${target}" ]] && continue
+    if ! _failover_apply_replica_workers_on_pod "${kubeconfig}" "${ns}" "${pod}" "${target}" "${log_file}"; then
+      return 1
+    fi
+  done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
+
+  _failover_collect_replica_workers_state "${kubeconfig}" "${ns}" "${target}"
+  primary_pod="${REPLICA_WORKERS_PRIMARY_POD}"
+  if [[ -n "${primary_pod}" ]]; then
+    if ! IFS=$'\t' read -r role workers < <(_failover_poll_pod_replica_workers_role "${kubeconfig}" "${ns}" "${primary_pod}"); then
+      return 1
+    fi
+    if [[ "${workers}" != "${target}" ]]; then
+      candidate=""
+      for pod in "${REPLICA_WORKERS_READY_PODS[@]}"; do
+        [[ "${pod}" == "${primary_pod}" ]] && continue
+        candidate="${pod}"
+        break
+      done
+      if [[ -z "${candidate}" ]]; then
+        echo "ERROR: primary ${primary_pod} needs replica_parallel_workers=${target} but no updated secondary is available to promote" \
+          | tee -a "${log_file}"
+        return 1
+      fi
+      if ! _failover_promote_mysql_pod_to_primary "${kubeconfig}" "${ns}" "${candidate}" "${log_file}"; then
+        return 1
+      fi
+      if ! _failover_apply_replica_workers_on_pod "${kubeconfig}" "${ns}" "${primary_pod}" "${target}" "${log_file}"; then
+        return 1
+      fi
+    fi
+  fi
+
+  _failover_collect_replica_workers_state "${kubeconfig}" "${ns}" "${target}"
+  if ((${#REPLICA_WORKERS_MISMATCH_PODS[@]} > 0)); then
+    echo "ERROR: replica_parallel_workers still mismatched: ${REPLICA_WORKERS_MISMATCH_PODS[*]}" | tee -a "${log_file}"
+    return 1
+  fi
+  return 0
+}
+
+# Ensure every MySQL pod has replica_parallel_workers at target before iteration / trigger.
+ensure_replica_parallel_workers_before_failover() {
+  local results_dir="${1:?results dir required}"
+  local log_file="${results_dir}/failover_replica_workers_gate.log"
+  local snap_tsv="${results_dir}/replica_parallel_workers_gate.tsv"
+  local target kubeconfig ns
+
+  if ! failover_replica_workers_gate_enabled; then
+    return 0
+  fi
+  if ! _failover_replica_workers_gate_prereqs "${results_dir}"; then
+    echo "Replica workers gate: skipped (${REPLICA_WORKERS_GATE_SKIP_REASON})" | tee "${log_file}"
+    return 0
+  fi
+
+  kubeconfig="${REPLICA_WORKERS_GATE_KUBECONFIG}"
+  ns="${REPLICA_WORKERS_GATE_NS}"
+  target="$(_failover_target_replica_parallel_workers)"
+  if ! [[ "${target}" =~ ^[0-9]+$ ]] || (( target < 1 )); then
+    echo "ERROR: FAILOVER_REPLICA_PARALLEL_WORKERS must be a positive integer (got ${target})" | tee "${log_file}"
+    return 1
+  fi
+
+  echo "=== Replica parallel workers gate (target=${target}) ===" | tee "${log_file}"
+  echo "namespace=${ns} kubeconfig=${kubeconfig}" | tee -a "${log_file}"
+
+  _failover_capture_replica_workers_snapshot "${kubeconfig}" "${ns}" "${snap_tsv}"
+  cat "${snap_tsv}" | tee -a "${log_file}"
+
+  if _failover_ensure_replica_workers_topology "${kubeconfig}" "${ns}" "${target}" "${log_file}"; then
+    _failover_capture_replica_workers_snapshot "${kubeconfig}" "${ns}" "${snap_tsv}"
+    echo "Replica workers gate PASSED: all pods at replica_parallel_workers=${target}" | tee -a "${log_file}"
+    {
+      echo "FAILOVER_REPLICA_WORKERS_GATE=passed"
+      echo "FAILOVER_REPLICA_PARALLEL_WORKERS=${target}"
+      echo "FAILOVER_REPLICA_WORKERS_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } >> "${results_dir}/failover_replica_workers_gate.env"
+    return 0
+  fi
+
+  echo "ERROR: replica workers gate FAILED" | tee -a "${log_file}"
+  {
+    echo "FAILOVER_REPLICA_WORKERS_GATE=failed"
+    echo "FAILOVER_REPLICA_PARALLEL_WORKERS=${target}"
+    echo "FAILOVER_REPLICA_WORKERS_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >> "${results_dir}/failover_replica_workers_gate.env"
+  if [[ "${FAILOVER_REPLICA_WORKERS_ABORT_ON_TIMEOUT:-1}" == "1" ]]; then
+    return 1
+  fi
+  echo "WARNING: proceeding despite replica_parallel_workers gate failure (FAILOVER_REPLICA_WORKERS_ABORT_ON_TIMEOUT=0)" \
+    | tee -a "${log_file}"
+  return 0
+}
+
+# Fast validation immediately before failover trigger (no apply).
+validate_replica_parallel_workers_before_failover() {
+  local results_dir="${1:?results dir required}"
+  local log_file="${results_dir}/failover_replica_workers_gate.log"
+  local target kubeconfig ns
+
+  if ! failover_replica_workers_gate_enabled; then
+    return 0
+  fi
+  if ! _failover_replica_workers_gate_prereqs "${results_dir}"; then
+    echo "Replica workers pre-trigger validation: skipped (${REPLICA_WORKERS_GATE_SKIP_REASON})" \
+      | tee -a "${log_file}"
+    return 0
+  fi
+
+  kubeconfig="${REPLICA_WORKERS_GATE_KUBECONFIG}"
+  ns="${REPLICA_WORKERS_GATE_NS}"
+  target="$(_failover_target_replica_parallel_workers)"
+  _failover_collect_replica_workers_state "${kubeconfig}" "${ns}" "${target}"
+  if ((${#REPLICA_WORKERS_MISMATCH_PODS[@]} == 0)); then
+    echo "Replica workers pre-trigger validation PASSED (all pods=${target})" | tee -a "${log_file}"
+    {
+      echo "FAILOVER_REPLICA_WORKERS_PRETRIGGER=passed"
+      echo "FAILOVER_REPLICA_PARALLEL_WORKERS=${target}"
+      echo "FAILOVER_REPLICA_WORKERS_PRETRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } >> "${results_dir}/failover_event.txt"
+    return 0
+  fi
+
+  echo "ERROR: replica workers pre-trigger validation FAILED: ${REPLICA_WORKERS_MISMATCH_PODS[*]}" \
+    | tee -a "${log_file}"
+  {
+    echo "FAILOVER_REPLICA_WORKERS_PRETRIGGER=failed"
+    echo "FAILOVER_REPLICA_PARALLEL_WORKERS=${target}"
+    echo "FAILOVER_REPLICA_WORKERS_MISMATCH=${REPLICA_WORKERS_MISMATCH_PODS[*]}"
+    echo "FAILOVER_REPLICA_WORKERS_PRETRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } >> "${results_dir}/failover_event.txt"
+  return 1
 }
 
 sleep_until_failover_trigger() {

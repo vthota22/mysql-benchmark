@@ -61,6 +61,7 @@ echo "Editions: ${FAILOVER_EDITIONS}"
 echo "Reconnect: mysql-ignore-errors=${FAILOVER_MYSQL_IGNORE_ERRORS}"
 echo "Monitor:   primary=${FAILOVER_MONITOR_PRIMARY:-1} k8s_events=${FAILOVER_COLLECT_K8S_EVENTS:-1}"
 echo "GR gate:   readiness=${FAILOVER_GR_READINESS_GATE:-1} poll=${FAILOVER_GR_READINESS_POLL_SEC:-2}s timeout=${FAILOVER_GR_READINESS_TIMEOUT_SEC:-600}s"
+echo "Workers:   gate=${FAILOVER_REPLICA_WORKERS_GATE:-1} target=${FAILOVER_REPLICA_PARALLEL_WORKERS:-16}"
 if failover_trigger_enabled; then
   if [[ "${FAILOVER_EDITIONS}" == *advanced* ]]; then
     echo "Trigger:  enabled (method=${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}, pod delete=${FAILOVER_POD_DELETE})"
@@ -126,6 +127,15 @@ run_failover_scenario() {
   if [[ "${edition}" == "advanced" ]] && failover_advanced_trigger_active; then
     BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${scenario_dir}" refresh \
       2>&1 | tee -a "${scenario_dir}/failover_trigger.log"
+    if failover_replica_workers_gate_enabled; then
+      echo "--- Replica parallel workers validation (pre-trigger) ---"
+      if ! validate_replica_parallel_workers_before_failover "${scenario_dir}" \
+        2>&1 | tee -a "${scenario_dir}/failover_trigger.log"; then
+        stop_sysbench_load "${scenario_dir}"
+        stop_failover_watchers "${scenario_dir}"
+        return 1
+      fi
+    fi
     if failover_gr_readiness_gate_enabled; then
       echo "--- GR readiness gate (all members ONLINE, none RECOVERING) ---"
       if ! wait_for_gr_readiness_before_failover "${scenario_dir}" \
@@ -309,6 +319,21 @@ run_failover_edition() {
     return 0
   }
 
+  _run_iteration_replica_workers_gate() {
+    local gate_dir="${1:?gate dir required}"
+    if [[ "${edition}" != "advanced" ]] || ! failover_advanced_trigger_active; then
+      return 0
+    fi
+    if ! failover_replica_workers_gate_enabled; then
+      return 0
+    fi
+    echo "--- Replica parallel workers gate (target=${FAILOVER_REPLICA_PARALLEL_WORKERS:-16}) ---"
+    if ! ensure_replica_parallel_workers_before_failover "${gate_dir}"; then
+      return 1
+    fi
+    return 0
+  }
+
   if (( iterations > 1 )); then
     local iter=0
     for iter in $(seq 1 "${iterations}"); do
@@ -325,11 +350,17 @@ run_failover_edition() {
         echo "FAILOVER_ITERATION=${iter}"
         echo "FAILOVER_ITERATIONS=${iterations}"
       } > "${iter_dir}/failover_iteration.env"
+      if ! _run_iteration_replica_workers_gate "${iter_dir}"; then
+        return 1
+      fi
       if ! _run_edition_scenarios_under_dir "${iter_dir}"; then
         return 1
       fi
     done
   else
+    if ! _run_iteration_replica_workers_gate "${edition_dir}"; then
+      return 1
+    fi
     if ! _run_edition_scenarios_under_dir "${edition_dir}"; then
       return 1
     fi
