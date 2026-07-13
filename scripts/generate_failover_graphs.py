@@ -95,8 +95,16 @@ def _display_cfg_gb(val: str) -> str:
     return val
 
 
-def _mysql_runtime_meta_rows(cfg: dict[str, str]) -> list[tuple[str, str]]:
+def _mysql_runtime_meta_rows(
+    cfg: dict[str, str],
+    edition_dir: Path | None = None,
+) -> list[tuple[str, str]]:
     """Key InnoDB / GR settings captured before the run."""
+    per_pod_workers = (
+        _mysql_pod_replica_workers_meta_rows(edition_dir)
+        if edition_dir is not None
+        else []
+    )
     rows: list[tuple[str, str]] = []
     mapping = (
         ("Buffer pool limit (VIP)", "BUFFER_POOL_GB"),
@@ -105,7 +113,7 @@ def _mysql_runtime_meta_rows(cfg: dict[str, str]) -> list[tuple[str, str]]:
         ("Redo log capacity", "REDO_LOG_CAPACITY_GB"),
         ("Buffer pool hit % (at start)", "BUFFER_POOL_HIT_PCT"),
         ("Buffer pool / data ratio", "BUFFER_POOL_DATA_RATIO"),
-        ("replica_parallel_workers", "REPLICA_PARALLEL_WORKERS"),
+        ("replica_parallel_workers (VIP)", "REPLICA_PARALLEL_WORKERS"),
         (
             "GR flow control certifier threshold",
             "GR_FLOW_CONTROL_CERTIFIER_THRESHOLD",
@@ -116,11 +124,14 @@ def _mysql_runtime_meta_rows(cfg: dict[str, str]) -> list[tuple[str, str]]:
         ),
     )
     for label, key in mapping:
+        if key == "REPLICA_PARALLEL_WORKERS" and per_pod_workers:
+            continue
         val = _cfg_value(cfg, key)
         if key.endswith("_GB"):
             val = _display_cfg_gb(val)
         if val != "N/A":
             rows.append((label, val))
+    rows.extend(per_pod_workers)
     return rows
 
 
@@ -146,8 +157,24 @@ def load_mysql_pod_buffer_pool(edition_dir: Path) -> list[dict[str, str]]:
                 "bp_data_bytes": parts[3],
                 "bp_used_pct": parts[4],
                 "gr_role": parts[5],
+                "replica_parallel_workers": parts[6] if len(parts) > 6 else "",
             }
         )
+    return rows
+
+
+def _mysql_pod_replica_workers_meta_rows(edition_dir: Path) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    for pod_row in load_mysql_pod_buffer_pool(edition_dir):
+        pod = pod_row.get("pod", "")
+        workers = pod_row.get("replica_parallel_workers", "").strip()
+        gr_role = pod_row.get("gr_role", "")
+        if not pod or workers in ("", "N/A"):
+            continue
+        val = workers
+        if gr_role and gr_role != "N/A":
+            val += f" [{gr_role}]"
+        rows.append((f"replica_parallel_workers ({pod})", val))
     return rows
 
 
@@ -246,7 +273,7 @@ def _edition_metadata_rows(
 ) -> list[tuple[str, str]]:
     edition_root = parent_edition_dir(edition_dir) or edition_dir
     rows = [
-        *_mysql_runtime_meta_rows(bench),
+        *_mysql_runtime_meta_rows(bench, edition_root),
     ]
     if scenario_dir is not None:
         rows.extend(_gr_pre_failover_applier_meta_rows(scenario_dir))

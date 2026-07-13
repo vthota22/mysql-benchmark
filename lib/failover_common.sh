@@ -695,7 +695,8 @@ SELECT @@hostname,
        IFNULL((SELECT VARIABLE_VALUE FROM performance_schema.global_status
                WHERE VARIABLE_NAME = '\''Innodb_buffer_pool_bytes_data'\'' LIMIT 1), 0),
        IFNULL((SELECT MEMBER_ROLE FROM performance_schema.replication_group_members
-               WHERE MEMBER_ID = @@server_uuid LIMIT 1), '\''N/A'\'');"' 2>/dev/null || true
+               WHERE MEMBER_ID = @@server_uuid LIMIT 1), '\''N/A'\''),
+       @@GLOBAL.replica_parallel_workers;"' 2>/dev/null || true
 }
 
 # One-shot per-pod buffer pool snapshot (limit + bytes_data + GR role) for report metadata.
@@ -719,18 +720,19 @@ capture_mysql_pod_buffer_pool_metadata() {
   {
     echo "# captured_utc=${captured_utc}"
     echo "# namespace=${ns} kubeconfig=${kubeconfig}"
-    echo -e "pod\thostname\tbp_limit_bytes\tbp_data_bytes\tbp_used_pct\tgr_role"
-    local pod line hostname bp_limit bp_data gr_role bp_used_pct
+    echo -e "pod\thostname\tbp_limit_bytes\tbp_data_bytes\tbp_used_pct\tgr_role\treplica_parallel_workers"
+    local pod line hostname bp_limit bp_data gr_role replica_workers bp_used_pct
     while IFS= read -r pod; do
       [[ -n "${pod}" ]] || continue
       line="$(_failover_poll_pod_buffer_pool_once "${kubeconfig}" "${ns}" "${pod}")"
       [[ -n "${line}" ]] || continue
-      IFS=$'\t' read -r hostname bp_limit bp_data gr_role <<< "${line}"
+      IFS=$'\t' read -r hostname bp_limit bp_data gr_role replica_workers <<< "${line}"
+      replica_workers="${replica_workers:-N/A}"
       bp_used_pct="N/A"
       if [[ -n "${bp_limit}" && -n "${bp_data}" && "${bp_limit}" =~ ^[0-9]+$ && "${bp_data}" =~ ^[0-9]+$ && "${bp_limit}" -gt 0 ]]; then
         bp_used_pct="$(awk "BEGIN { printf \"%.1f\", (${bp_data} / ${bp_limit}) * 100 }")"
       fi
-      echo -e "${pod}\t${hostname}\t${bp_limit}\t${bp_data}\t${bp_used_pct}\t${gr_role}"
+      echo -e "${pod}\t${hostname}\t${bp_limit}\t${bp_data}\t${bp_used_pct}\t${gr_role}\t${replica_workers}"
     done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
   } > "${out_tsv}"
 
@@ -740,6 +742,10 @@ capture_mysql_pod_buffer_pool_metadata() {
   fi
 
   echo "Captured MySQL pod buffer pool metadata: ${out_tsv}"
+  while IFS=$'\t' read -r pod _host _limit _data _pct gr_role replica_workers; do
+    [[ "${pod}" == "pod" || -z "${pod}" || "${pod}" =~ ^# ]] && continue
+    echo "  ${pod}: replica_parallel_workers=${replica_workers:-N/A} [${gr_role:-N/A}]"
+  done < "${out_tsv}"
   return 0
 }
 
