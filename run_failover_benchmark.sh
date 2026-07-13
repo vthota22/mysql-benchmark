@@ -128,8 +128,8 @@ run_failover_scenario() {
     BENCHMARK_CONF="${CONFIG}" "${SCRIPT_DIR}/trigger_failover.sh" "${edition}" "${scenario_dir}" refresh \
       2>&1 | tee -a "${scenario_dir}/failover_trigger.log"
     if failover_replica_workers_gate_enabled; then
-      echo "--- Replica parallel workers validation (pre-trigger) ---"
-      if ! validate_replica_parallel_workers_before_failover "${scenario_dir}" \
+      echo "--- Replica parallel workers gate (pre-trigger) ---"
+      if ! ensure_replica_parallel_workers_before_failover "${scenario_dir}" "pre-trigger" \
         2>&1 | tee -a "${scenario_dir}/failover_trigger.log"; then
         stop_sysbench_load "${scenario_dir}"
         stop_failover_watchers "${scenario_dir}"

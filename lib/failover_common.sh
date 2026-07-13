@@ -2496,15 +2496,69 @@ _failover_collect_replica_workers_state() {
       REPLICA_WORKERS_MISMATCH_PODS+=("${pod}:query_failed")
       continue
     fi
+    # Mis-parsed poll (e.g. pod still starting): GR role column holds a numeric workers value.
+    if [[ "${role}" =~ ^[0-9]+$ ]]; then
+      workers="${role}"
+      role="INVALID"
+    fi
+    if [[ "${role}" != "PRIMARY" && "${role}" != "SECONDARY" ]]; then
+      REPLICA_WORKERS_MISMATCH_PODS+=("${pod}:invalid_gr_role(${role:-empty})")
+      continue
+    fi
     if [[ "${role}" == "PRIMARY" ]]; then
       REPLICA_WORKERS_PRIMARY_POD="${pod}"
     fi
-    if [[ "${workers}" == "${target}" ]]; then
+    if [[ "${workers}" =~ ^[0-9]+$ && "${workers}" == "${target}" ]]; then
       REPLICA_WORKERS_READY_PODS+=("${pod}")
     else
       REPLICA_WORKERS_MISMATCH_PODS+=("${pod}:${workers:-?}")
     fi
   done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
+}
+
+_failover_wait_mysql_pods_ready_for_workers_gate() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local ns="${2:?namespace required}"
+  local log_file="${3:?log file required}"
+  local poll_sec="${FAILOVER_REPLICA_WORKERS_POLL_SEC:-2}"
+  local timeout_sec="${FAILOVER_REPLICA_WORKERS_TIMEOUT_SEC:-600}"
+  local waited=0 poll_num=0
+  local -a kubectl pending=()
+  local pod ready_col n_ready n_total
+
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+
+  while (( waited <= timeout_sec )); do
+    poll_num=$((poll_num + 1))
+    pending=()
+    while IFS= read -r pod; do
+      [[ -n "${pod}" ]] || continue
+      ready_col="$("${kubectl[@]}" get pod "${pod}" -n "${ns}" --no-headers 2>/dev/null | awk '{print $2}')"
+      if [[ "${ready_col}" =~ ^([0-9]+)/([0-9]+)$ ]]; then
+        n_ready="${BASH_REMATCH[1]}"
+        n_total="${BASH_REMATCH[2]}"
+        if (( n_ready < n_total || n_total == 0 )); then
+          pending+=("${pod}:${ready_col}")
+        fi
+      else
+        pending+=("${pod}:${ready_col:-unknown}")
+      fi
+    done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
+
+    if ((${#pending[@]} == 0)); then
+      echo "  all MySQL pods container-ready after ${waited}s" | tee -a "${log_file}"
+      return 0
+    fi
+    echo "  wait_mysql_pods_ready poll=${poll_num} waited=${waited}s pending: ${pending[*]}" | tee -a "${log_file}"
+    if (( waited >= timeout_sec )); then
+      break
+    fi
+    sleep "${poll_sec}"
+    waited=$((waited + poll_sec))
+  done
+
+  echo "ERROR: MySQL pods not fully ready after ${timeout_sec}s: ${pending[*]}" | tee -a "${log_file}"
+  return 1
 }
 
 _failover_apply_replica_workers_on_pod() {
@@ -2629,17 +2683,24 @@ _failover_ensure_replica_workers_topology() {
 }
 
 # Ensure every MySQL pod has replica_parallel_workers at target before iteration / trigger.
+# Optional second arg: phase label for logs (e.g. "pre-trigger").
 ensure_replica_parallel_workers_before_failover() {
   local results_dir="${1:?results dir required}"
+  local phase="${2:-}"
   local log_file="${results_dir}/failover_replica_workers_gate.log"
   local snap_tsv="${results_dir}/replica_parallel_workers_gate.tsv"
   local target kubeconfig ns
+  local phase_label=""
+
+  if [[ -n "${phase}" ]]; then
+    phase_label=" [${phase}]"
+  fi
 
   if ! failover_replica_workers_gate_enabled; then
     return 0
   fi
   if ! _failover_replica_workers_gate_prereqs "${results_dir}"; then
-    echo "Replica workers gate: skipped (${REPLICA_WORKERS_GATE_SKIP_REASON})" | tee "${log_file}"
+    echo "Replica workers gate${phase_label}: skipped (${REPLICA_WORKERS_GATE_SKIP_REASON})" | tee "${log_file}"
     return 0
   fi
 
@@ -2651,29 +2712,51 @@ ensure_replica_parallel_workers_before_failover() {
     return 1
   fi
 
-  echo "=== Replica parallel workers gate (target=${target}) ===" | tee "${log_file}"
+  echo "=== Replica parallel workers gate (target=${target})${phase_label} ===" | tee -a "${log_file}"
   echo "namespace=${ns} kubeconfig=${kubeconfig}" | tee -a "${log_file}"
+
+  if ! _failover_wait_mysql_pods_ready_for_workers_gate "${kubeconfig}" "${ns}" "${log_file}"; then
+    echo "ERROR: replica workers gate FAILED (pods not ready)${phase_label}" | tee -a "${log_file}"
+    return 1
+  fi
 
   _failover_capture_replica_workers_snapshot "${kubeconfig}" "${ns}" "${snap_tsv}"
   cat "${snap_tsv}" | tee -a "${log_file}"
 
   if _failover_ensure_replica_workers_topology "${kubeconfig}" "${ns}" "${target}" "${log_file}"; then
     _failover_capture_replica_workers_snapshot "${kubeconfig}" "${ns}" "${snap_tsv}"
-    echo "Replica workers gate PASSED: all pods at replica_parallel_workers=${target}" | tee -a "${log_file}"
-    {
-      echo "FAILOVER_REPLICA_WORKERS_GATE=passed"
-      echo "FAILOVER_REPLICA_PARALLEL_WORKERS=${target}"
-      echo "FAILOVER_REPLICA_WORKERS_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    } >> "${results_dir}/failover_replica_workers_gate.env"
+    echo "Replica workers gate PASSED: all pods at replica_parallel_workers=${target}${phase_label}" | tee -a "${log_file}"
+    if [[ "${phase}" == "pre-trigger" ]]; then
+      {
+        echo "FAILOVER_REPLICA_WORKERS_PRETRIGGER=passed"
+        echo "FAILOVER_REPLICA_PARALLEL_WORKERS=${target}"
+        echo "FAILOVER_REPLICA_WORKERS_PRETRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      } >> "${results_dir}/failover_event.txt"
+    else
+      {
+        echo "FAILOVER_REPLICA_WORKERS_GATE=passed"
+        echo "FAILOVER_REPLICA_PARALLEL_WORKERS=${target}"
+        echo "FAILOVER_REPLICA_WORKERS_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      } >> "${results_dir}/failover_replica_workers_gate.env"
+    fi
     return 0
   fi
 
-  echo "ERROR: replica workers gate FAILED" | tee -a "${log_file}"
-  {
-    echo "FAILOVER_REPLICA_WORKERS_GATE=failed"
-    echo "FAILOVER_REPLICA_PARALLEL_WORKERS=${target}"
-    echo "FAILOVER_REPLICA_WORKERS_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  } >> "${results_dir}/failover_replica_workers_gate.env"
+  echo "ERROR: replica workers gate FAILED${phase_label}" | tee -a "${log_file}"
+  if [[ "${phase}" == "pre-trigger" ]]; then
+    {
+      echo "FAILOVER_REPLICA_WORKERS_PRETRIGGER=failed"
+      echo "FAILOVER_REPLICA_PARALLEL_WORKERS=${target}"
+      echo "FAILOVER_REPLICA_WORKERS_MISMATCH=${REPLICA_WORKERS_MISMATCH_PODS[*]}"
+      echo "FAILOVER_REPLICA_WORKERS_PRETRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } >> "${results_dir}/failover_event.txt"
+  else
+    {
+      echo "FAILOVER_REPLICA_WORKERS_GATE=failed"
+      echo "FAILOVER_REPLICA_PARALLEL_WORKERS=${target}"
+      echo "FAILOVER_REPLICA_WORKERS_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } >> "${results_dir}/failover_replica_workers_gate.env"
+  fi
   if [[ "${FAILOVER_REPLICA_WORKERS_ABORT_ON_TIMEOUT:-1}" == "1" ]]; then
     return 1
   fi
@@ -2682,44 +2765,9 @@ ensure_replica_parallel_workers_before_failover() {
   return 0
 }
 
-# Fast validation immediately before failover trigger (no apply).
+# Deprecated alias: pre-trigger now applies fixes via ensure (kept for compatibility).
 validate_replica_parallel_workers_before_failover() {
-  local results_dir="${1:?results dir required}"
-  local log_file="${results_dir}/failover_replica_workers_gate.log"
-  local target kubeconfig ns
-
-  if ! failover_replica_workers_gate_enabled; then
-    return 0
-  fi
-  if ! _failover_replica_workers_gate_prereqs "${results_dir}"; then
-    echo "Replica workers pre-trigger validation: skipped (${REPLICA_WORKERS_GATE_SKIP_REASON})" \
-      | tee -a "${log_file}"
-    return 0
-  fi
-
-  kubeconfig="${REPLICA_WORKERS_GATE_KUBECONFIG}"
-  ns="${REPLICA_WORKERS_GATE_NS}"
-  target="$(_failover_target_replica_parallel_workers)"
-  _failover_collect_replica_workers_state "${kubeconfig}" "${ns}" "${target}"
-  if ((${#REPLICA_WORKERS_MISMATCH_PODS[@]} == 0)); then
-    echo "Replica workers pre-trigger validation PASSED (all pods=${target})" | tee -a "${log_file}"
-    {
-      echo "FAILOVER_REPLICA_WORKERS_PRETRIGGER=passed"
-      echo "FAILOVER_REPLICA_PARALLEL_WORKERS=${target}"
-      echo "FAILOVER_REPLICA_WORKERS_PRETRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    } >> "${results_dir}/failover_event.txt"
-    return 0
-  fi
-
-  echo "ERROR: replica workers pre-trigger validation FAILED: ${REPLICA_WORKERS_MISMATCH_PODS[*]}" \
-    | tee -a "${log_file}"
-  {
-    echo "FAILOVER_REPLICA_WORKERS_PRETRIGGER=failed"
-    echo "FAILOVER_REPLICA_PARALLEL_WORKERS=${target}"
-    echo "FAILOVER_REPLICA_WORKERS_MISMATCH=${REPLICA_WORKERS_MISMATCH_PODS[*]}"
-    echo "FAILOVER_REPLICA_WORKERS_PRETRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  } >> "${results_dir}/failover_event.txt"
-  return 1
+  ensure_replica_parallel_workers_before_failover "${1:?results dir required}" "pre-trigger"
 }
 
 sleep_until_failover_trigger() {
