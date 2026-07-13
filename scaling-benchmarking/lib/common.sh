@@ -790,7 +790,10 @@ gr_apply_without_scaling() {
     log_phase "GR_PRE_WORKLOAD" "WARNING: some GR settings could not be applied — continuing"
 }
 
-# Apply replica_parallel_workers on all pods (once, before workload; not scaling-phase specific).
+# Apply replica_parallel_workers via PerconaServerMySQL CR patch so the value
+# survives pod restarts (the operator bootstrap reads it from spec.mysql.configuration).
+# Patches the CR, waits for the rolling restart to complete, then verifies the
+# runtime value on every MySQL pod.
 # Non-fatal: logs warning on failure but never aborts the script.
 gr_apply_replica_parallel_workers() {
   local workers="${GR_REPLICA_PARALLEL_WORKERS:-}"
@@ -804,6 +807,179 @@ gr_apply_replica_parallel_workers() {
     log_phase "GR_REPLICA" "skipped (K8S_KUBECONFIG not set or kubectl not found)"
     return 0
   fi
+
+  local ns="${K8S_NAMESPACE:-percona}"
+  local cr_type cluster
+  cr_type="$(_gr_detect_cr_type)"
+  if [[ "${cr_type}" != "ps" ]]; then
+    log_phase "GR_REPLICA" "CR patch only supported for PerconaServerMySQL (ps), detected: ${cr_type} — falling back to SET PERSIST"
+    _gr_apply_replica_parallel_workers_set_persist "${workers}"
+    return $?
+  fi
+
+  cluster="${PXC_CLUSTER_NAME:-}"
+  if [[ -z "${cluster}" ]]; then
+    cluster="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get ps \
+      -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" || true
+  fi
+  if [[ -z "${cluster}" ]]; then
+    log_phase "GR_REPLICA" "WARNING: could not detect PS cluster name — skipping"
+    return 0
+  fi
+
+  # Read current spec.mysql.configuration from the CR.
+  local current_config
+  current_config="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get ps "${cluster}" \
+    -o jsonpath='{.spec.mysql.configuration}' 2>&1)" || {
+    log_phase "GR_REPLICA" "WARNING: failed to read CR configuration — ${current_config}"
+    return 0
+  }
+
+  # Check if replica_parallel_workers is already set to the desired value.
+  local existing_value=""
+  if echo "${current_config}" | grep -qiE '^[[:space:]]*(loose_)?replica_parallel_workers[[:space:]]*='; then
+    existing_value="$(echo "${current_config}" \
+      | grep -iE '^[[:space:]]*(loose_)?replica_parallel_workers[[:space:]]*=' \
+      | tail -1 | sed 's/.*=[[:space:]]*//' | tr -d '[:space:]')"
+  fi
+
+  if [[ "${existing_value}" == "${workers}" ]]; then
+    log_phase "GR_REPLICA" "replica_parallel_workers=${workers} already in CR configuration — no patch needed"
+  else
+    # Build new configuration: remove any existing replica_parallel_workers line, append new one.
+    local new_config
+    new_config="$(echo "${current_config}" \
+      | grep -viE '^[[:space:]]*(loose_)?replica_parallel_workers[[:space:]]*=')"
+    new_config="${new_config}
+replica_parallel_workers=${workers}"
+
+    log_phase "GR_REPLICA" "patching PS CR ${cluster} — adding replica_parallel_workers=${workers}"
+
+    local patch_json
+    patch_json="$(python3 -c "
+import json, sys
+conf = sys.stdin.read()
+print(json.dumps({'spec': {'mysql': {'configuration': conf}}}))
+" <<< "${new_config}")"
+
+    local patch_out
+    if patch_out="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" \
+        patch ps "${cluster}" --type merge -p "${patch_json}" 2>&1)"; then
+      log_phase "GR_REPLICA" "CR patched: ${patch_out}"
+    else
+      log_phase "GR_REPLICA" "WARNING: CR patch failed — ${patch_out}"
+      return 0
+    fi
+  fi
+
+  # Record pod UIDs before rolling restart so we can detect when all pods are replaced.
+  local pod_info container
+  pod_info="$(_gr_get_mysql_pods)" || {
+    log_phase "GR_REPLICA" "WARNING: failed to discover MySQL pods for rollout wait"
+    return 0
+  }
+  container="$(echo "${pod_info}" | head -1)"
+
+  local expected_pods=()
+  while IFS= read -r pod; do
+    [[ -z "${pod}" ]] && continue
+    expected_pods+=("${pod}")
+  done <<< "$(echo "${pod_info}" | tail -n +2)"
+
+  local expected_count=${#expected_pods[@]}
+
+  if [[ "${existing_value}" == "${workers}" ]]; then
+    log_phase "GR_REPLICA" "skipping rollout wait (CR already had correct value)"
+  else
+    # Wait for the StatefulSet rolling restart to complete.
+    local sts_name="${cluster}-mysql"
+    local poll_interval=10
+    local timeout=600
+    local elapsed=0
+
+    log_phase "GR_REPLICA" "waiting for StatefulSet ${sts_name} rollout (timeout=${timeout}s, ${expected_count} pod(s))..."
+
+    while (( elapsed < timeout )); do
+      local ready_count
+      ready_count="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
+        -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || ready_count=0
+      local updated_count
+      updated_count="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
+        -o jsonpath='{.status.updatedReplicas}' 2>/dev/null)" || updated_count=0
+      local current_rev
+      current_rev="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
+        -o jsonpath='{.status.currentRevision}' 2>/dev/null)" || current_rev=""
+      local update_rev
+      update_rev="$(kubectl --kubeconfig="${K8S_KUBECONFIG}" -n "${ns}" get sts "${sts_name}" \
+        -o jsonpath='{.status.updateRevision}' 2>/dev/null)" || update_rev=""
+
+      if (( ready_count >= expected_count )) && (( updated_count >= expected_count )) \
+          && [[ -n "${current_rev}" && "${current_rev}" == "${update_rev}" ]]; then
+        log_phase "GR_REPLICA" "rollout complete — ${ready_count}/${expected_count} pods ready (${elapsed}s)"
+        break
+      fi
+
+      log_phase "GR_REPLICA" "  rollout in progress — ready=${ready_count}/${expected_count} updated=${updated_count} rev=${current_rev}/${update_rev} (${elapsed}s)"
+      sleep "${poll_interval}"
+      elapsed=$(( elapsed + poll_interval ))
+    done
+
+    if (( elapsed >= timeout )); then
+      log_phase "GR_REPLICA" "WARNING: rollout did not complete within ${timeout}s — continuing anyway"
+    fi
+  fi
+
+  # Verify replica_parallel_workers on every running pod.
+  log_phase "GR_REPLICA" "verifying replica_parallel_workers on all pods..."
+
+  pod_info="$(_gr_get_mysql_pods)" || {
+    log_phase "GR_REPLICA" "WARNING: failed to discover MySQL pods for verification"
+    return 0
+  }
+  container="$(echo "${pod_info}" | head -1)"
+
+  local password
+  password="$(_gr_get_password)"
+  if [[ -z "${password}" ]]; then
+    log_phase "GR_REPLICA" "WARNING: cannot determine MySQL root password — skipping verification"
+    return 0
+  fi
+
+  local pods=()
+  while IFS= read -r pod; do
+    [[ -z "${pod}" ]] && continue
+    pods+=("${pod}")
+  done <<< "$(echo "${pod_info}" | tail -n +2)"
+
+  local all_ok=1
+  for pod in "${pods[@]}"; do
+    local actual preserve
+    actual="$(_gr_mysql_in_pod "${pod}" "${container}" "${password}" \
+      "SELECT @@GLOBAL.replica_parallel_workers;" 2>&1)" || actual="?"
+    preserve="$(_gr_mysql_in_pod "${pod}" "${container}" "${password}" \
+      "SELECT @@GLOBAL.replica_preserve_commit_order;" 2>&1)" || preserve="?"
+    actual="$(echo "${actual}" | tr -d '[:space:]')"
+    preserve="$(echo "${preserve}" | tr -d '[:space:]')"
+    if [[ "${actual}" == "${workers}" ]]; then
+      log_phase "GR_REPLICA" "  ${pod}: replica_parallel_workers=${actual} replica_preserve_commit_order=${preserve} — OK"
+    else
+      log_phase "GR_REPLICA" "  ${pod}: replica_parallel_workers=${actual} (expected ${workers}) — MISMATCH"
+      all_ok=0
+    fi
+  done
+
+  if [[ "${all_ok}" -eq 1 ]]; then
+    log_phase "GR_REPLICA" "replica_parallel_workers=${workers} confirmed on all ${#pods[@]} pod(s)"
+  else
+    log_phase "GR_REPLICA" "WARNING: replica_parallel_workers not consistent across all pods"
+  fi
+
+  return 0
+}
+
+# Fallback: apply replica_parallel_workers via SET PERSIST on all pods (for non-ps CR types).
+_gr_apply_replica_parallel_workers_set_persist() {
+  local workers="${1}"
 
   local pod_info password container
   pod_info="$(_gr_get_mysql_pods)" || {
