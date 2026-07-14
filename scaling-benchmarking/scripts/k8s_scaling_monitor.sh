@@ -8,9 +8,10 @@
 #   4. gr_detail: error reason when GR state is not ONLINE
 #   5. read_only / super_read_only per pod (failover detection)
 #   6. GR apply queue and transactions behind (replication lag)
-#   7. HAProxy/router pod state (phase, ready, backend routing)
-#   8. K8s service endpoint changes (when HAProxy detects new primary)
-#   9. K8s namespace events (pod kills, probe failures, scheduling)
+#   7. replica_parallel_workers (configured) and active applier workers per pod
+#   8. HAProxy/router pod state (phase, ready, backend routing)
+#   9. K8s service endpoint changes (when HAProxy detects new primary)
+#  10. K8s namespace events (pod kills, probe failures, scheduling)
 #
 # Outputs:
 #   k8s_monitor.tsv        — per-pod time-series (MySQL pods)
@@ -321,8 +322,14 @@ gr_lookup() {
   fi
 }
 
-# ── Per-pod read_only and super_read_only status ──────────────────────────
-# Writes TSV to READONLY_TMP: short_hostname \t read_only \t super_read_only
+# ── Per-pod MySQL session vars (read_only + parallel applier workers) ─────
+# Writes TSV to READONLY_TMP:
+#   short_hostname \t read_only \t super_read_only \
+#   replica_parallel_workers \t replica_parallel_active
+#
+# replica_parallel_workers = @@GLOBAL.replica_parallel_workers (configured)
+# replica_parallel_active  = GR applier workers with a non-empty
+#   LAST_APPLIED_TRANSACTION (busy/used workers)
 refresh_readonly_status() {
   : > "${READONLY_TMP}"
 
@@ -339,23 +346,43 @@ refresh_readonly_status() {
     [[ -z "${pod_name}" ]] && continue
     local ro_raw
     ro_raw="$(mysql_in_pod "${pod_name}" "${password}" -e "
-      SELECT @@hostname, @@read_only, @@super_read_only;
+      SELECT @@hostname,
+             @@read_only,
+             @@super_read_only,
+             @@GLOBAL.replica_parallel_workers,
+             (SELECT COUNT(*)
+                FROM performance_schema.replication_applier_status_by_worker
+               WHERE CHANNEL_NAME LIKE 'group_replication%'
+                 AND LAST_APPLIED_TRANSACTION <> '');
     " 2>/dev/null)" || continue
-    echo "${ro_raw}" | while IFS=$'\t' read -r host ro sro; do
+    echo "${ro_raw}" | while IFS=$'\t' read -r host ro sro rpw_cfg rpw_active; do
       [[ -z "${host}" ]] && continue
-      printf '%s\t%s\t%s\n' "${host}" "${ro}" "${sro}"
+      printf '%s\t%s\t%s\t%s\t%s\n' "${host}" "${ro}" "${sro}" "${rpw_cfg}" "${rpw_active}"
     done >> "${READONLY_TMP}"
   done <<< "${running_pods}"
 }
 
-# Lookup from READONLY_TMP: given a pod name, return "read_only \t super_read_only"
+# Lookup from READONLY_TMP: "read_only \t super_read_only"
 readonly_lookup() {
   local pod_name="${1}"
   [[ -z "${pod_name}" || ! -f "${READONLY_TMP}" ]] && { echo "?\t?"; return; }
   local match
   match="$(grep "^${pod_name}	" "${READONLY_TMP}" 2>/dev/null | head -1)" || true
   if [[ -n "${match}" ]]; then
-    echo "${match}" | cut -f2-
+    echo "${match}" | cut -f2-3
+  else
+    echo "?\t?"
+  fi
+}
+
+# Lookup from READONLY_TMP: "replica_parallel_workers \t replica_parallel_active"
+parallel_workers_lookup() {
+  local pod_name="${1}"
+  [[ -z "${pod_name}" || ! -f "${READONLY_TMP}" ]] && { echo "?\t?"; return; }
+  local match
+  match="$(grep "^${pod_name}	" "${READONLY_TMP}" 2>/dev/null | head -1)" || true
+  if [[ -n "${match}" ]]; then
+    echo "${match}" | cut -f4-5
   else
     echo "?\t?"
   fi
@@ -719,12 +746,20 @@ for item in data.get('items', []):
     gr_queue="$(echo "${stats_info}" | cut -f1)"
     gr_applier_queue="$(echo "${stats_info}" | cut -f2)"
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    # replica_parallel_workers (configured vs active/busy)
+    local rpw_info
+    rpw_info="$(parallel_workers_lookup "${pod_name}")"
+    local replica_parallel_workers replica_parallel_active
+    replica_parallel_workers="$(echo "${rpw_info}" | cut -f1)"
+    replica_parallel_active="$(echo "${rpw_info}" | cut -f2)"
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "${ts}" "${pod_name}" "${phase}" "${ready}" \
       "${gr_role}" "${gr_state}" "${gr_detail}" "${gr_members}" "${gr_online}" \
       "${node}" "${node_slug}" "${node_cpu}" "${node_mem}" \
       "${pvc_req}" "${pvc_cap}" "${restarts}" "${deleting}" \
       "${read_only}" "${super_read_only}" "${gr_queue}" "${gr_applier_queue}" \
+      "${replica_parallel_workers}" "${replica_parallel_active}" \
       >> "${TSV_FILE}"
 
     # Log transitions to/from read_only (key failover indicator)
@@ -803,12 +838,13 @@ main() {
 
   capture_baseline
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "timestamp" "pod" "phase" "ready" \
     "gr_role" "gr_state" "gr_detail" "gr_members" "gr_online" \
     "doks_node" "slug" "vcpus" "mem_gib" \
     "pvc_req" "pvc_cap" "restarts" "deleting" \
     "read_only" "super_read_only" "gr_queue" "gr_applier_queue" \
+    "replica_parallel_workers" "replica_parallel_active" \
     > "${TSV_FILE}"
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \

@@ -9,6 +9,8 @@ Usage:
   python3 generate_scaling_analysis_report.py scaling-benchmarking/results/run_20260702_142729_advanced-2-july-s-scale
   python3 generate_scaling_analysis_report.py /path/to/run_dir -o /path/to/report.html
 
+  python3 scaling-benchmarking/scripts/generate_scaling_analysis_report.py
+
 """
 
 from __future__ import annotations
@@ -81,6 +83,8 @@ class K8sPodRow:
     super_read_only: str = "?"
     gr_queue: str = ""
     gr_applier_queue: str = ""
+    replica_parallel_workers: str = ""
+    replica_parallel_active: str = ""
 
 
 @dataclass
@@ -262,6 +266,8 @@ def load_k8s_monitor(path: Path) -> list[K8sPodRow]:
                 super_read_only=raw.get("super_read_only", "?"),
                 gr_queue=raw.get("gr_queue", ""),
                 gr_applier_queue=raw.get("gr_applier_queue", ""),
+                replica_parallel_workers=raw.get("replica_parallel_workers", ""),
+                replica_parallel_active=raw.get("replica_parallel_active", ""),
             ))
     return rows
 
@@ -310,6 +316,42 @@ def _fmt_duration(seconds: float | int) -> str:
     if secs:
         parts.append(f"{secs}s")
     return " ".join(parts)
+
+
+def _fmt_tpcc_data_gib(conf: dict[str, str]) -> str:
+    """Estimate TPC-C dataset size as scale * tables * 0.1 GiB."""
+    try:
+        scale = float(conf.get("TPCC_SCALE", "") or 0)
+        tables = float(conf.get("TPCC_TABLES", "") or 0)
+    except ValueError:
+        return "N/A"
+    if scale <= 0 or tables <= 0:
+        return "N/A"
+    gib = scale * tables * 0.1
+    scale_s = str(int(scale)) if scale == int(scale) else str(scale)
+    tables_s = str(int(tables)) if tables == int(tables) else str(tables)
+    if gib >= 10 or gib == int(gib):
+        gib_s = f"{gib:.0f} GiB"
+    else:
+        gib_s = f"{gib:.1f} GiB"
+    return f"{gib_s} ({scale_s} × {tables_s} × 0.1)"
+
+
+def _is_offline_gr_token(val: str) -> bool:
+    """True for OFFLINE or k8s-monitor placeholders like '?\\t?\\t' / '?'."""
+    s = (val or "").strip()
+    if not s:
+        return True
+    if s.upper() in ("OFFLINE", "UNKNOWN"):
+        return True
+    # Monitor emits "?\t?\t" (literal backslash-t or real tabs) when GR lookup fails.
+    cleaned = (
+        s.replace("\\t", "")
+        .replace("\t", "")
+        .replace("?", "")
+        .strip()
+    )
+    return cleaned == ""
 
 
 def _pct_change(current: float, baseline: float) -> float:
@@ -570,13 +612,16 @@ def build_main_figure(
 
     if run_dir is not None:
         failovers = _resolve_failovers(k8s_rows or [], run_dir)
+        drains = _detect_secondary_drains(k8s_rows or [], run_dir, failovers=failovers)
     elif k8s_rows:
         failovers = _resolve_failovers(k8s_rows, None)
+        drains = _detect_secondary_drains(k8s_rows, None, failovers=failovers)
     else:
         failovers = []
+        drains = []
 
     # Event markers on metric panels (temporal row added after Gantt bars)
-    _add_scale_event_vlines(fig, timing, failovers, [1, 2, 3])
+    _add_scale_event_vlines(fig, timing, failovers, [1, 2, 3], drains)
 
     metric_times = [m.wall_clock_utc for m in metrics] if metrics else []
     if metric_times:
@@ -590,7 +635,7 @@ def build_main_figure(
     fig_height = 1200
     bottom_margin = 72
     event_band_h, event_items = _prepare_event_band(
-        timing, failovers, t_start, t_end,
+        timing, failovers, t_start, t_end, drains,
     )
     top_margin = max(72, event_band_h + 28)
     plot_h_px = fig_height - bottom_margin - top_margin
@@ -647,8 +692,8 @@ def build_main_figure(
             tickfont=dict(size=10),
         )
 
-    # Temporal panel: scale start / complete / failover on top of Gantt bars
-    _add_scale_event_vlines(fig, timing, failovers, [4])
+    # Temporal panel: scale start / complete / failover / secondary drain on top of Gantt bars
+    _add_scale_event_vlines(fig, timing, failovers, [4], drains)
 
     fig.update_layout(
         height=fig_height,
@@ -737,12 +782,14 @@ def build_k8s_figure(
     state_map = {"ONLINE": 3, "RECOVERING": 2, "PODINITIALIZING": 1, "ERROR": 0, "OFFLINE": 0}
 
     def _resolve_gr_state(row: K8sPodRow) -> str:
-        if row.gr_state in ("ONLINE", "RECOVERING", "ERROR", "OFFLINE"):
+        if row.gr_state in ("ONLINE", "RECOVERING", "ERROR"):
             return row.gr_state
         if "PodInitializing" in (row.gr_detail or ""):
             return "PODINITIALIZING"
         if row.phase == "Pending" or (row.phase == "Running" and row.ready == "false"):
             return "PODINITIALIZING"
+        if _is_offline_gr_token(row.gr_state) or row.deleting == "yes":
+            return "OFFLINE"
         return "OFFLINE"
 
     def _resolve_gr_role(row: K8sPodRow) -> tuple[int, str]:
@@ -1012,6 +1059,510 @@ def _resolve_failovers(
     }]
 
 
+def _component_short_name(pod: str) -> str:
+    """Human label for a drained companion pod."""
+    # Check specialized components before '-mysql-' — cluster names often
+    # contain 'mysql' as a substring (e.g. adv-mysql-v-scale-...-haproxy-0).
+    if "-haproxy-" in pod:
+        return f"haproxy-{pod.split('-haproxy-')[-1]}"
+    if "binlog-server" in pod or "-binlog-" in pod:
+        return "binlog-server"
+    if "-router-" in pod:
+        return f"router-{pod.split('-router-')[-1]}"
+    if re.search(r"-mysql-\d+$", pod):
+        return f"mysql-{pod.rsplit('-mysql-', 1)[-1]}"
+    return pod.rsplit("-", 1)[-1]
+
+
+def _load_killing_events(run_dir: Path | None) -> list[dict[str, str]]:
+    """Load Pod Killing events from k8s_monitor/k8s_events.tsv."""
+    if run_dir is None:
+        return []
+    path = run_dir / "k8s_monitor" / "k8s_events.tsv"
+    if not path.is_file():
+        return []
+    events: list[dict[str, str]] = []
+    with path.open(encoding="utf-8", errors="replace", newline="") as f:
+        for raw in csv.DictReader(f, delimiter="\t"):
+            if (raw.get("reason") or "") != "Killing":
+                continue
+            obj = raw.get("object") or ""
+            ts = raw.get("event_ts") or raw.get("poll_ts") or ""
+            if not obj or not ts or not _VALID_TS_RE.match(ts):
+                continue
+            events.append({"timestamp": ts, "object": obj})
+    return events
+
+
+def _detect_secondary_drains(
+    k8s_rows: list[K8sPodRow],
+    run_dir: Path | None = None,
+    companion_window_sec: float = 60.0,
+    failovers: list[dict[str, str]] | None = None,
+    failover_overlap_sec: float = 90.0,
+) -> list[dict[str, str]]:
+    """Detect SECONDARY mysql pods entering deleting=yes (rolling drain).
+
+    Companion HAProxy / binlog pods killed within companion_window_sec are
+    appended to the label, e.g. 'Secondary Drain mysql-0 (+ haproxy-0, binlog-server)'.
+
+    Drains of the old PRIMARY that already have a Failover label (same pod /
+    near the same timestamp) are omitted to avoid duplicate markers.
+    """
+    last_role: dict[str, str] = {}
+    prev_deleting: dict[str, str] = {}
+    drains: list[dict[str, str]] = []
+
+    for row in sorted(k8s_rows, key=lambda r: (r.timestamp, r.pod)):
+        if "-mysql-" not in row.pod:
+            continue
+        if row.gr_role in ("PRIMARY", "SECONDARY"):
+            last_role[row.pod] = row.gr_role
+
+        prev = prev_deleting.get(row.pod, "no")
+        prev_deleting[row.pod] = row.deleting
+        if prev == "yes" or row.deleting != "yes":
+            continue
+        if last_role.get(row.pod) != "SECONDARY":
+            continue
+
+        short = row.pod.split("-mysql-")[-1]
+        drains.append({
+            "timestamp": row.timestamp,
+            "pod": short,
+            "full_pod": row.pod,
+            "label": f"Secondary Drain mysql-{short}",
+        })
+
+    if not drains:
+        return drains
+
+    killings = _load_killing_events(run_dir)
+    for drain in drains:
+        center = _parse_utc(drain["timestamp"])
+        companions: list[str] = []
+        companion_times: list[str] = []
+        seen: set[str] = set()
+        for ev in killings:
+            obj = ev["object"]
+            if drain["full_pod"] in obj:
+                continue
+            if not any(tok in obj for tok in ("haproxy", "binlog", "router")):
+                continue
+            try:
+                delta = abs((_parse_utc(ev["timestamp"]) - center).total_seconds())
+            except Exception:
+                continue
+            if delta > companion_window_sec:
+                continue
+            name = _component_short_name(obj)
+            if name not in seen:
+                seen.add(name)
+                companions.append(name)
+                companion_times.append(ev["timestamp"])
+        companions.sort(
+            key=lambda n: (
+                0 if n.startswith("haproxy") else 1 if n.startswith("binlog") else 2,
+                n,
+            )
+        )
+        drain["companions"] = ",".join(companions)
+        drain["companion_first_ts"] = min(companion_times) if companion_times else ""
+        if companions:
+            drain["label"] = (
+                f"Secondary Drain mysql-{drain['pod']} (+ {', '.join(companions)})"
+            )
+
+    # Skip drains covered by an existing Failover label (old primary drain).
+    if failovers:
+        kept: list[dict[str, str]] = []
+        for drain in drains:
+            drain_ts = _parse_utc(drain["timestamp"])
+            redundant = False
+            for fo in failovers:
+                if drain["pod"] != fo.get("from", ""):
+                    continue
+                try:
+                    delta = abs((drain_ts - _parse_utc(fo["timestamp"])).total_seconds())
+                except Exception:
+                    continue
+                if delta <= failover_overlap_sec:
+                    redundant = True
+                    break
+            if not redundant:
+                kept.append(drain)
+        drains = kept
+
+    return drains
+
+
+def _short_node_name(node: str) -> str:
+    """Short DOKS node label (last hyphen segment), e.g. 37mtj7."""
+    node = (node or "").strip()
+    if not node or node == "?":
+        return "?"
+    return node.rsplit("-", 1)[-1]
+
+
+def _slug_vcpu(slug: str) -> int | None:
+    m = re.search(r"(\d+)vcpu", (slug or "").lower())
+    return int(m.group(1)) if m else None
+
+
+def _relative_slug_label(slug: str, known_slugs: set[str]) -> str:
+    """Label placement as 'new node' / 'old node' when the run has two sizes.
+
+    Larger vCPU slug => new node; smaller => old node. Falls back to the raw
+    slug when size can't be ranked.
+    """
+    slug = (slug or "").strip()
+    if not slug or slug == "?":
+        return "?"
+    sized = sorted(
+        {(v, s) for s in known_slugs if (v := _slug_vcpu(s)) is not None},
+        key=lambda x: x[0],
+    )
+    v = _slug_vcpu(slug)
+    if v is None or len(sized) < 2:
+        return slug
+    min_v, max_v = sized[0][0], sized[-1][0]
+    if v == max_v and max_v != min_v:
+        return "new node"
+    if v == min_v and max_v != min_v:
+        return "old node"
+    return slug
+
+
+def _collect_run_slugs(k8s_rows: list[K8sPodRow]) -> set[str]:
+    return {r.slug for r in k8s_rows if r.slug and r.slug not in ("?", "")}
+
+
+def _resolve_mysql_on_node(
+    k8s_rows: list[K8sPodRow],
+    node: str,
+    at_ts: str,
+) -> tuple[str, str] | None:
+    """Find which mysql-* shares `node` near `at_ts`.
+
+    Prefer same-timestamp occupancy; else the soonest occupancy after at_ts;
+    else the latest occupancy before at_ts.
+    Returns (mysql_short, slug) or None.
+    """
+    if not node or node == "?":
+        return None
+    node_short = _short_node_name(node)
+
+    def _node_match(doks: str) -> bool:
+        return doks == node or doks.endswith(node_short) or _short_node_name(doks) == node_short
+
+    at_exact: list[tuple[str, str]] = []
+    after: list[tuple[str, str, str]] = []  # ts, short, slug
+    before: list[tuple[str, str, str]] = []
+
+    for row in k8s_rows:
+        if "-mysql-" not in row.pod:
+            continue
+        if not _VALID_TS_RE.match(row.timestamp):
+            continue
+        if not _node_match(row.doks_node or ""):
+            continue
+        short = row.pod.split("-mysql-")[-1]
+        slug = row.slug or "?"
+        if row.timestamp == at_ts:
+            at_exact.append((short, slug))
+        elif row.timestamp > at_ts:
+            after.append((row.timestamp, short, slug))
+        else:
+            before.append((row.timestamp, short, slug))
+
+    if at_exact:
+        # Prefer Running/ready if multiple, else first.
+        return at_exact[0]
+    if after:
+        after.sort(key=lambda x: x[0])
+        return after[0][1], after[0][2]
+    if before:
+        before.sort(key=lambda x: x[0])
+        return before[-1][1], before[-1][2]
+    return None
+
+
+def _format_host_placement(
+    k8s_rows: list[K8sPodRow],
+    node: str,
+    at_ts: str,
+    known_slugs: set[str] | None = None,
+) -> str:
+    """Human placement label: 'mysql-1 (new node)' or node short fallback."""
+    known = known_slugs if known_slugs is not None else _collect_run_slugs(k8s_rows)
+    resolved = _resolve_mysql_on_node(k8s_rows, node, at_ts)
+    if resolved:
+        short, slug = resolved
+        return f"mysql-{short} ({_relative_slug_label(slug, known)})"
+    return _short_node_name(node)
+
+
+def _load_pod_scheduled_nodes(run_dir: Path | None) -> list[dict[str, str]]:
+    """Pod Scheduled events with assigned node from k8s_events.tsv."""
+    if run_dir is None:
+        return []
+    path = run_dir / "k8s_monitor" / "k8s_events.tsv"
+    if not path.is_file():
+        return []
+    assign_re = re.compile(r"Successfully assigned\s+\S+\s+to\s+(\S+)")
+    out: list[dict[str, str]] = []
+    with path.open(encoding="utf-8", errors="replace", newline="") as f:
+        for raw in csv.DictReader(f, delimiter="\t"):
+            if (raw.get("reason") or "") != "Scheduled":
+                continue
+            obj = raw.get("object") or ""
+            ts = raw.get("event_ts") or raw.get("poll_ts") or ""
+            msg = raw.get("message") or ""
+            if not obj or not ts or not _VALID_TS_RE.match(ts):
+                continue
+            m = assign_re.search(msg)
+            if not m:
+                continue
+            out.append({
+                "timestamp": ts,
+                "object": obj,
+                "name": _component_short_name(obj),
+                "node": m.group(1),
+                "node_short": _short_node_name(m.group(1)),
+            })
+    return out
+
+
+def _detect_haproxy_recoveries(run_dir: Path | None) -> list[dict[str, str]]:
+    """When each HAProxy endpoint becomes ready again, with the node it landed on.
+
+    Uses endpoints_monitor.tsv for ready-set gains and Scheduled events for node.
+    Works for any run that captured those monitor files.
+    """
+    if run_dir is None:
+        return []
+    ep_path = run_dir / "k8s_monitor" / "endpoints_monitor.tsv"
+    if not ep_path.is_file():
+        return []
+
+    by_ts: dict[str, set[str]] = {}
+    with ep_path.open(encoding="utf-8", errors="replace", newline="") as f:
+        for raw in csv.DictReader(f, delimiter="\t"):
+            svc = raw.get("service") or ""
+            if "haproxy" not in svc:
+                continue
+            ts = raw.get("timestamp") or ""
+            pod = raw.get("pod") or ""
+            state = raw.get("state") or ""
+            if not ts or not pod or state != "ready":
+                continue
+            if not _VALID_TS_RE.match(ts):
+                continue
+            short = _component_short_name(pod)
+            by_ts.setdefault(ts, set()).add(short)
+
+    scheduled = _load_pod_scheduled_nodes(run_dir)
+    recoveries: list[dict[str, str]] = []
+    prev_ready: set[str] | None = None
+    for ts in sorted(by_ts):
+        ready = by_ts[ts]
+        if prev_ready is None:
+            # First sample is baseline membership — not a recovery.
+            prev_ready = ready
+            continue
+        gained = ready - prev_ready
+        for name in sorted(gained):
+            # Prefer Scheduled at/before recovery; fall back to any Scheduled for pod.
+            node_short = "?"
+            node_full = ""
+            best_ts = ""
+            for ev in scheduled:
+                if ev["name"] != name:
+                    continue
+                if ev["timestamp"] > ts:
+                    continue
+                if not best_ts or ev["timestamp"] >= best_ts:
+                    best_ts = ev["timestamp"]
+                    node_short = ev["node_short"]
+                    node_full = ev["node"]
+            recoveries.append({
+                "timestamp": ts,
+                "name": name,
+                "node": node_full,
+                "node_short": node_short,
+                "label": f"{name} ready on {node_short}",
+            })
+        prev_ready = ready
+    return recoveries
+
+
+def _detect_binlog_recoveries(run_dir: Path | None) -> list[dict[str, str]]:
+    """Binlog-server reschedule recovery (Scheduled after Killing), if present."""
+    if run_dir is None:
+        return []
+    path = run_dir / "k8s_monitor" / "k8s_events.tsv"
+    if not path.is_file():
+        return []
+
+    killings: list[str] = []
+    recovers: list[dict[str, str]] = []
+    seen_after_kill: set[str] = set()
+    assign_re = re.compile(r"Successfully assigned\s+\S+\s+to\s+(\S+)")
+
+    with path.open(encoding="utf-8", errors="replace", newline="") as f:
+        rows = list(csv.DictReader(f, delimiter="\t"))
+
+    for raw in sorted(rows, key=lambda r: r.get("event_ts") or r.get("poll_ts") or ""):
+        obj = raw.get("object") or ""
+        if "binlog" not in obj:
+            continue
+        ts = raw.get("event_ts") or raw.get("poll_ts") or ""
+        if not ts or not _VALID_TS_RE.match(ts):
+            continue
+        reason = raw.get("reason") or ""
+        name = _component_short_name(obj)
+        if reason == "Killing":
+            killings.append(ts)
+            seen_after_kill.discard(name)
+            continue
+        if reason != "Scheduled" or not killings:
+            continue
+        # Only count Scheduled that occur after a prior kill for this component.
+        try:
+            last_kill = max(
+                (k for k in killings if _parse_utc(k) <= _parse_utc(ts)),
+                default="",
+            )
+        except Exception:
+            last_kill = ""
+        if not last_kill:
+            continue
+        # One recovery per kill cycle.
+        key = f"{name}:{last_kill}"
+        if key in seen_after_kill:
+            continue
+        seen_after_kill.add(key)
+        m = assign_re.search(raw.get("message") or "")
+        node = m.group(1) if m else ""
+        recovers.append({
+            "timestamp": ts,
+            "name": name,
+            "node": node,
+            "node_short": _short_node_name(node),
+            "label": f"{name} ready on {_short_node_name(node)}",
+        })
+    return recovers
+
+
+def _drain_failover_summary_rows(
+    k8s_rows: list[K8sPodRow],
+    run_dir: Path | None,
+    failovers: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Chronological drain/failover summary rows for the vertical-scale table.
+
+    Includes failover-window companions (e.g. haproxy-1) that were folded into
+    the Failover event-band label and would otherwise be invisible, plus
+    HAProxy/binlog recovery (ready again + node).
+    """
+    # Unfiltered drains — keep companions for failover-overlap rows.
+    all_drains = _detect_secondary_drains(k8s_rows, run_dir, failovers=None)
+    chart_drains = _detect_secondary_drains(k8s_rows, run_dir, failovers=failovers)
+    chart_keys = {(d["pod"], d["timestamp"]) for d in chart_drains}
+
+    rows: list[dict[str, str]] = []
+
+    for drain in all_drains:
+        if (drain["pod"], drain["timestamp"]) in chart_keys:
+            companions = [
+                c.strip() for c in (drain.get("companions") or "").split(",") if c.strip()
+            ]
+            what = f"mysql-{drain['pod']} drain"
+            if companions:
+                what += " + " + " + ".join(companions)
+            rows.append({
+                "sort_ts": drain["timestamp"],
+                "time": drain["timestamp"][11:19],
+                "what": what,
+            })
+
+    for fo in failovers:
+        from_short = fo.get("from", "?")
+        to_short = fo.get("to", "?")
+        fo_ts = fo["timestamp"]
+        # Companions from the overlapping old-primary drain get their own row(s)
+        # when they occur at a different timestamp than the failover itself.
+        companions: list[str] = []
+        companion_first = ""
+        for drain in all_drains:
+            if drain["pod"] != from_short:
+                continue
+            try:
+                delta = abs(
+                    (_parse_utc(drain["timestamp"]) - _parse_utc(fo_ts)).total_seconds()
+                )
+            except Exception:
+                continue
+            if delta > 90:
+                continue
+            companions = [
+                c.strip() for c in (drain.get("companions") or "").split(",") if c.strip()
+            ]
+            companion_first = drain.get("companion_first_ts") or ""
+            break
+
+        if companions and companion_first and companion_first[11:19] != fo_ts[11:19]:
+            rows.append({
+                "sort_ts": companion_first,
+                "time": companion_first[11:19],
+                "what": f"{' + '.join(companions)} killed",
+            })
+        elif companions:
+            # Same second as failover — keep companions on the failover row.
+            rows.append({
+                "sort_ts": fo_ts,
+                "time": fo_ts[11:19],
+                "what": (
+                    f"{' + '.join(companions)} killed, then "
+                    f"Failover mysql-{from_short} → mysql-{to_short}"
+                ),
+            })
+            continue
+
+        rows.append({
+            "sort_ts": fo_ts,
+            "time": fo_ts[11:19],
+            "what": f"Failover mysql-{from_short} → mysql-{to_short}",
+        })
+
+    # Recoveries only for components mentioned as drained/killed above.
+    mentioned: dict[str, str] = {}  # name -> earliest kill/drain sort_ts
+    for r in rows:
+        what = r["what"]
+        for token in re.findall(r"\b(haproxy-\d+|binlog-server)\b", what):
+            if token not in mentioned or r["sort_ts"] < mentioned[token]:
+                mentioned[token] = r["sort_ts"]
+
+    known_slugs = _collect_run_slugs(k8s_rows)
+    for rec in _detect_haproxy_recoveries(run_dir) + _detect_binlog_recoveries(run_dir):
+        kill_ts = mentioned.get(rec["name"])
+        if not kill_ts:
+            continue
+        if rec["timestamp"] < kill_ts:
+            continue
+        placement = _format_host_placement(
+            k8s_rows, rec.get("node") or "", rec["timestamp"], known_slugs,
+        )
+        rows.append({
+            "sort_ts": rec["timestamp"],
+            "time": rec["timestamp"][11:19],
+            "what": f"{rec['name']} ready on {placement}",
+        })
+
+    rows.sort(key=lambda r: r["sort_ts"])
+    return rows
+
+
 def _format_node_size(row: K8sPodRow) -> str | None:
     """Return e.g. '8 vCPU · 32 GB' when vCPU (and optionally RAM) are known."""
     if not row.vcpus or not row.vcpus.isdigit():
@@ -1206,6 +1757,7 @@ def _overlay_qps_offline_segments(
 def _collect_scale_events(
     timing: ScaleTiming,
     failovers: list[dict[str, str]],
+    drains: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     if timing.scale_start_utc:
@@ -1228,6 +1780,13 @@ def _collect_scale_events(
             "label": fo["label"],
             "color": "#cf222e",
             "bg": "rgba(255,235,233,0.95)",
+        })
+    for drain in drains or []:
+        events.append({
+            "x": drain["timestamp"],
+            "label": drain["label"],
+            "color": "#0969da",
+            "bg": "rgba(221,244,255,0.95)",
         })
     return events
 
@@ -1260,8 +1819,9 @@ def _add_scale_event_vlines(
     timing: ScaleTiming,
     failovers: list[dict[str, str]],
     rows: list[int],
+    drains: list[dict[str, str]] | None = None,
 ) -> None:
-    """Add scale start, scale complete, and failover vertical markers to subplot rows."""
+    """Add scale start/complete, failover, and secondary-drain markers to subplot rows."""
     for row_idx in rows:
         if timing.scale_start_utc:
             _add_subplot_vline(
@@ -1277,6 +1837,11 @@ def _add_scale_event_vlines(
             _add_subplot_vline(
                 fig, fo["timestamp"], row_idx,
                 color="#cf222e", dash="dot", width=2,
+            )
+        for drain in drains or []:
+            _add_subplot_vline(
+                fig, drain["timestamp"], row_idx,
+                color="#0969da", dash="dot", width=2,
             )
 
 
@@ -1329,11 +1894,12 @@ def _prepare_event_band(
     failovers: list[dict[str, str]],
     t_start: str,
     t_end: str,
+    drains: list[dict[str, str]] | None = None,
 ) -> tuple[int, list[dict[str, Any]]]:
     """Return (band_height_px, events with row assignments)."""
     row_h = 26
     band_pad = 8
-    events = _collect_scale_events(timing, failovers)
+    events = _collect_scale_events(timing, failovers, drains)
     if not events or not t_start or not t_end:
         return 0, []
     n_rows = _assign_event_rows(events, t_start, t_end)
@@ -1377,9 +1943,10 @@ def _add_timeline_event_band(
     plot_h_px: int,
     t_start: str,
     t_end: str,
+    drains: list[dict[str, str]] | None = None,
 ) -> int:
-    """Place scale/failover labels above the plot with connector lines to y=1."""
-    band_h, events = _prepare_event_band(timing, failovers, t_start, t_end)
+    """Place scale/failover/drain labels above the plot with connector lines to y=1."""
+    band_h, events = _prepare_event_band(timing, failovers, t_start, t_end, drains)
     if events:
         _render_event_band(fig, events, plot_h_px)
     return band_h
@@ -1426,49 +1993,21 @@ def _filter_k8s_rows_for_pods(
 
 
 POD_BADGE_STYLES: dict[str, dict[str, str]] = {
+    "PRIMARY": {"bg": "rgba(218,251,225,0.95)", "color": "#116329", "border": "#116329"},
+    "SECONDARY": {"bg": "rgba(221,244,255,0.95)", "color": "#0969da", "border": "#0969da"},
+    # Legacy aliases kept for older call sites / CSS fallbacks.
     "old primary": {"bg": "rgba(221,244,255,0.95)", "color": "#0969da", "border": "#0969da"},
     "new primary": {"bg": "rgba(218,251,225,0.95)", "color": "#116329", "border": "#116329"},
-    "SECONDARY": {"bg": "rgba(221,244,255,0.95)", "color": "#0969da", "border": "#0969da"},
 }
 
 
-def _extract_pod_restart_old_roles(k8s_rows: list[K8sPodRow]) -> dict[str, str]:
-    """Return pod -> GR role immediately before a rolling node migration restart."""
-    pod_last_stable: dict[str, dict[str, str]] = {}
-    pod_tracking: dict[str, dict[str, Any]] = {}
-    old_roles: dict[str, str] = {}
-
-    for row in k8s_rows:
-        pod = row.pod
-        if pod not in pod_last_stable:
-            if row.ready == "true" and row.gr_state == "ONLINE":
-                pod_last_stable[pod] = {
-                    "node": row.doks_node,
-                    "gr_role": row.gr_role,
-                }
-            continue
-
-        stable = pod_last_stable[pod]
-        if pod not in pod_tracking:
-            if row.deleting == "yes" or (row.ready == "false" and row.gr_state != "ONLINE"):
-                pod_tracking[pod] = {
-                    "old_node": stable["node"],
-                    "old_role": stable["gr_role"],
-                }
-            continue
-
-        track = pod_tracking[pod]
-        new_node = row.doks_node
-        if (
-            row.gr_state == "ONLINE"
-            and new_node
-            and new_node != track["old_node"]
-        ):
-            old_roles[pod] = track["old_role"]
-            del pod_tracking[pod]
-            pod_last_stable[pod] = {"node": new_node, "gr_role": row.gr_role}
-
-    return old_roles
+def _latest_gr_roles(k8s_rows: list[K8sPodRow]) -> dict[str, str]:
+    """Return pod -> latest known PRIMARY/SECONDARY role from member status."""
+    latest: dict[str, str] = {}
+    for row in sorted(k8s_rows, key=lambda r: r.timestamp):
+        if row.gr_role in ("PRIMARY", "SECONDARY"):
+            latest[row.pod] = row.gr_role
+    return latest
 
 
 def _compute_pod_badge_labels(
@@ -1476,23 +2015,12 @@ def _compute_pod_badge_labels(
     pods: list[str],
     pod_short: dict[str, str],
 ) -> dict[str, str]:
-    """Map mysql-N -> badge text matching the rolling-restart table style."""
-    restart_old_roles = _extract_pod_restart_old_roles(k8s_rows)
-    final_primary = ""
-    for row in sorted(k8s_rows, key=lambda r: r.timestamp):
-        if row.gr_role == "PRIMARY":
-            final_primary = row.pod
-
+    """Map mysql-N -> badge text from the latest GR member role."""
+    latest_roles = _latest_gr_roles(k8s_rows)
     labels: dict[str, str] = {}
     for pod in pods:
         y_id = f"mysql-{pod_short[pod]}"
-        old_role = restart_old_roles.get(pod, "")
-        if old_role == "PRIMARY":
-            labels[y_id] = "old primary"
-        elif pod == final_primary:
-            labels[y_id] = "new primary"
-        else:
-            labels[y_id] = "SECONDARY"
+        labels[y_id] = latest_roles.get(pod, "SECONDARY")
     return labels
 
 
@@ -1547,6 +2075,7 @@ def _build_pod_timeline_figure(
     pod_badge_labels: dict[str, str] | None = None,
     cluster_tl: dict[str, str] | None = None,
     qps_down_intervals: list[tuple[datetime, datetime]] | None = None,
+    drains: list[dict[str, str]] | None = None,
 ) -> go.Figure | None:
     """Build a single Plotly horizontal-bar Gantt with optional bar text, event lines, and annotations."""
     _TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T")
@@ -1588,8 +2117,13 @@ def _build_pod_timeline_figure(
                 (_parse_utc(seg["end"]) - _parse_utc(seg["start"])).total_seconds() * 1000,
                 1,
             )
+            dur_sec = max(
+                (_parse_utc(seg["end"]) - _parse_utc(seg["start"])).total_seconds(),
+                0,
+            )
             hover = (
                 f"{y_id}<br>{seg['start'][11:19]}–{seg['end'][11:19]} UTC"
+                f"<br>Duration: {_fmt_duration(dur_sec)}"
                 f"<br><b>{html_mod.escape(display)}</b>"
             )
 
@@ -1637,7 +2171,7 @@ def _build_pod_timeline_figure(
     right_margin = 24 if legend_count <= 4 else 130
 
     event_band_h, event_items = _prepare_event_band(
-        timing, failovers, t_start, t_end,
+        timing, failovers, t_start, t_end, drains,
     )
     top_margin = title_h + event_band_h + 14
     total_h = max(280, plot_h + top_margin + bottom_margin + 20)
@@ -1659,6 +2193,11 @@ def _build_pod_timeline_figure(
         fig.add_vline(
             x=fo["timestamp"], line_dash="dot",
             line_color="#cf222e", line_width=2,
+        )
+    for drain in drains or []:
+        fig.add_vline(
+            x=drain["timestamp"], line_dash="dot",
+            line_color="#0969da", line_width=2,
         )
 
     legend_count = len(legend_seen)
@@ -1737,6 +2276,7 @@ def build_k8s_status_bars(
     horizontal = _is_horizontal_scale(timing)
     vertical = _is_vertical_scale(timing)
     failovers = _resolve_failovers(k8s_rows, run_dir)
+    drains = _detect_secondary_drains(k8s_rows, run_dir, failovers=failovers)
     qps_down = _qps_down_intervals(metrics or [])
 
     role_colors = {"PRIMARY": "#2da44e", "SECONDARY": "#0969da"}
@@ -1749,16 +2289,14 @@ def build_k8s_status_bars(
     def _resolve_state(row: K8sPodRow) -> str | None:
         if row.gr_state in ("ONLINE", "RECOVERING", "ERROR"):
             return row.gr_state
-        if row.gr_state == "OFFLINE":
-            return None
-        if row.gr_state.upper() == "UNKNOWN":
-            return None
+        # PodInitializing is more specific than a failed GR lookup placeholder.
         if "PodInitializing" in (row.gr_detail or ""):
             return "POD INITIALIZING"
         if row.phase == "Pending" or (row.phase == "Running" and row.ready == "false"):
             return "POD INITIALIZING"
-        if not row.gr_state or not row.gr_state.strip("\t? "):
-            return None
+        # Monitor writes "?\t?\t" (and deleting=yes) while the member is offline.
+        if _is_offline_gr_token(row.gr_state) or row.deleting == "yes":
+            return "OFFLINE"
         return None
 
     def _gr_role_key(row: K8sPodRow) -> str | None:
@@ -1771,6 +2309,7 @@ def build_k8s_status_bars(
         k8s_rows=k8s_rows, timing=timing, failovers=failovers,
         pods=pods, pod_short=pod_short,
         pod_badge_labels=pod_badge_labels,
+        drains=drains,
     )
 
     role_fig = _build_pod_timeline_figure(
@@ -1903,6 +2442,7 @@ def build_replication_queue_figure(
     k8s_rows: list[K8sPodRow],
     timing: ScaleTiming,
     failovers: list[dict[str, str]],
+    drains: list[dict[str, str]] | None = None,
 ) -> go.Figure | None:
     """Line charts for GR certification and applier queue depth."""
     pods, pod_short = _discover_mysql_pods(k8s_rows)
@@ -1973,7 +2513,7 @@ def build_replication_queue_figure(
     if not has_data:
         return None
 
-    _add_scale_event_vlines(fig, timing, failovers, [1, 2])
+    _add_scale_event_vlines(fig, timing, failovers, [1, 2], drains)
 
     fig.update_layout(
         height=560,
@@ -2002,8 +2542,9 @@ def render_replication_lag_section(
         return ""
     k8s_rows = _filter_k8s_rows_for_pods(k8s_rows, pods)
     failovers = _resolve_failovers(k8s_rows, run_dir)
+    drains = _detect_secondary_drains(k8s_rows, run_dir, failovers=failovers)
 
-    queue_fig = build_replication_queue_figure(k8s_rows, timing, failovers)
+    queue_fig = build_replication_queue_figure(k8s_rows, timing, failovers, drains)
     ro_fig = _build_pod_timeline_figure(
         "Read-Only Status (read_only / super_read_only)",
         k8s_rows=k8s_rows,
@@ -2016,6 +2557,7 @@ def render_replication_lag_section(
         label_fn=_read_only_gantt_label,
         show_bar_text=True,
         carry_forward=True,
+        drains=drains,
     )
 
     if queue_fig is None and ro_fig is None:
@@ -2385,7 +2927,7 @@ def render_node_join_timeline(k8s_rows: list[K8sPodRow], timing: ScaleTiming) ->
 
         role_badge = ""
         if final_role == "PRIMARY":
-            role_badge = '<span style="background:#dafbe1;color:#116329;padding:2px 8px;border-radius:4px;font-size:0.8rem;font-weight:600;">new primary</span>'
+            role_badge = '<span style="background:#dafbe1;color:#116329;padding:2px 8px;border-radius:4px;font-size:0.8rem;font-weight:600;">PRIMARY</span>'
         elif final_role == "SECONDARY":
             role_badge = '<span style="background:#ddf4ff;color:#0969da;padding:2px 8px;border-radius:4px;font-size:0.8rem;font-weight:600;">SECONDARY</span>'
 
@@ -2514,6 +3056,7 @@ def render_vertical_scale_timeline(
 
     # Failover — prefer failover_time.txt when available
     failovers = _resolve_failovers(k8s_rows, run_dir)
+    latest_roles = _latest_gr_roles(k8s_rows)
 
     rows_html = ""
     for i, m in enumerate(pod_migrations):
@@ -2549,10 +3092,10 @@ def render_vertical_scale_timeline(
                 total_downtime = _fmt_duration(delta)
 
         role_badge = ""
-        old_role = m.get("old_role", "")
-        if old_role == "PRIMARY":
-            role_badge = ' <span style="background:#ddf4ff;color:#0969da;padding:2px 6px;border-radius:4px;font-size:0.75rem;font-weight:600;">old primary</span>'
-        elif old_role == "SECONDARY":
+        latest_role = latest_roles.get(m["pod"], "")
+        if latest_role == "PRIMARY":
+            role_badge = ' <span style="background:#dafbe1;color:#116329;padding:2px 6px;border-radius:4px;font-size:0.75rem;font-weight:600;">PRIMARY</span>'
+        elif latest_role == "SECONDARY":
             role_badge = ' <span style="background:#ddf4ff;color:#0969da;padding:2px 6px;border-radius:4px;font-size:0.75rem;font-weight:600;">SECONDARY</span>'
 
         slug_change = f"{html_mod.escape(m['old_slug'])} → {html_mod.escape(m['new_slug'])}" if m["new_slug"] else "–"
@@ -2589,6 +3132,27 @@ def render_vertical_scale_timeline(
           <tbody>{fo_rows}</tbody>
         </table>"""
 
+    event_summary_html = ""
+    summary_rows = _drain_failover_summary_rows(k8s_rows, run_dir, failovers)
+    if summary_rows:
+        body = "".join(
+            f"<tr>"
+            f"<td>{html_mod.escape(r['time'])}</td>"
+            f"<td>{html_mod.escape(r['what'])}</td>"
+            f"</tr>"
+            for r in summary_rows
+        )
+        event_summary_html = f"""
+        <h3 style="margin-top:1.2rem;">Drain &amp; Failover Events</h3>
+        <p style="margin:0.35rem 0 0.6rem;font-size:0.88rem;color:#57606a;">
+          Chronological view of secondary drains (with co-drained HAProxy / binlog),
+          primary failover, and when HAProxy / binlog came back (with the node they landed on).
+        </p>
+        <table class="kv">
+          <thead><tr><th>Time (UTC)</th><th>What happened</th></tr></thead>
+          <tbody>{body}</tbody>
+        </table>"""
+
     return f"""
     <section>
       <h2>Rolling Restart Timeline (Vertical Scale)</h2>
@@ -2608,7 +3172,171 @@ def render_vertical_scale_timeline(
         </thead>
         <tbody>{rows_html}</tbody>
       </table>
+      {event_summary_html}
       {failover_html}
+    </section>
+    """
+
+
+def _find_cr_snapshot(run_dir: Path) -> Path | None:
+    matches = sorted(run_dir.glob("cr_snapshot*.yaml")) + sorted(run_dir.glob("cr_snapshot*.yml"))
+    return matches[0] if matches else None
+
+
+def _yaml_scalar_map(yaml_text: str) -> dict[str, str]:
+    """Best-effort path→scalar map from a CR YAML (no PyYAML dependency)."""
+    values: dict[str, str] = {}
+    stack: list[tuple[int, str]] = [(-1, "")]
+    lines = yaml_text.splitlines()
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            i += 1
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        stripped = raw.strip()
+        if stripped.startswith("- "):
+            i += 1
+            continue
+
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1] if stack else ""
+
+        if ":" not in stripped:
+            i += 1
+            continue
+        key, _, rest = stripped.partition(":")
+        key = key.strip()
+        rest = rest.strip()
+        path = f"{parent}.{key}" if parent else key
+
+        if rest in ("|", ">"):
+            block: list[str] = []
+            i += 1
+            while i < len(lines):
+                blk = lines[i]
+                if not blk.strip():
+                    block.append("")
+                    i += 1
+                    continue
+                blk_indent = len(blk) - len(blk.lstrip(" "))
+                if blk_indent <= indent:
+                    break
+                block.append(blk[indent + 2:] if len(blk) > indent + 2 else blk.lstrip())
+                i += 1
+            values[path] = "\n".join(block).rstrip()
+            stack.append((indent, path))
+            continue
+
+        if rest:
+            values[path] = rest.strip().strip('"').strip("'")
+            stack.append((indent, path))
+            i += 1
+            continue
+
+        stack.append((indent, path))
+        i += 1
+    return values
+
+
+def _cr_config_kv(configuration: str) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    for line in configuration.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("["):
+            continue
+        if "=" in stripped:
+            k, _, v = stripped.partition("=")
+            rows.append((f"mysql.configuration.{k.strip()}", v.strip()))
+    return rows
+
+
+def render_cr_snapshot(run_dir: Path) -> str:
+    """Collapsible CR snapshot table (phase-breakdown style) after Run Overview."""
+    path = _find_cr_snapshot(run_dir)
+    if path is None:
+        return """
+    <section>
+      <details class="impact-details">
+        <summary>PerconaServerMySQL CR Snapshot</summary>
+        <p class="details-note"><em>No cr_snapshot*.yaml found in this run directory.</em></p>
+      </details>
+    </section>"""
+
+    text = path.read_text(encoding="utf-8", errors="replace")
+    values = _yaml_scalar_map(text)
+
+    preferred = [
+        ("metadata.name", "Name"),
+        ("metadata.namespace", "Namespace"),
+        ("spec.crVersion", "CR Version"),
+        ("spec.mysql.image", "MySQL Image"),
+        ("spec.mysql.clusterType", "Cluster Type"),
+        ("spec.mysql.size", "MySQL Size"),
+        ("spec.mysql.gracePeriod", "Grace Period"),
+        ("spec.mysql.autoRecovery", "Auto Recovery"),
+        ("spec.mysql.resources.requests.cpu", "CPU Request"),
+        ("spec.mysql.resources.requests.memory", "Memory Request"),
+        ("spec.mysql.resources.limits.memory", "Memory Limit"),
+        ("spec.mysql.livenessProbe.initialDelaySeconds", "Liveness initialDelaySeconds"),
+        ("spec.mysql.livenessProbe.periodSeconds", "Liveness periodSeconds"),
+        ("spec.mysql.livenessProbe.failureThreshold", "Liveness failureThreshold"),
+        ("spec.mysql.livenessProbe.timeoutSeconds", "Liveness timeoutSeconds"),
+        ("spec.mysql.readinessProbe.initialDelaySeconds", "Readiness initialDelaySeconds"),
+        ("spec.mysql.readinessProbe.periodSeconds", "Readiness periodSeconds"),
+        ("spec.mysql.readinessProbe.failureThreshold", "Readiness failureThreshold"),
+        ("spec.mysql.readinessProbe.timeoutSeconds", "Readiness timeoutSeconds"),
+        ("spec.proxy.haproxy.size", "HAProxy Size"),
+        ("spec.proxy.haproxy.image", "HAProxy Image"),
+        ("spec.pmm.enabled", "PMM Enabled"),
+        ("spec.pmm.image", "PMM Image"),
+        ("spec.pmm.serverHost", "PMM Server Host"),
+        ("status.state", "Status State"),
+        ("status.mysql.ready", "MySQL Ready"),
+    ]
+
+    rows: list[tuple[str, str]] = []
+    for path_key, label in preferred:
+        if path_key in values:
+            rows.append((label, values[path_key]))
+
+    # Promote interesting mysqld configuration knobs into the table.
+    config_text = values.get("spec.mysql.configuration", "")
+    interesting_cfg = {
+        "replica_parallel_workers",
+        "max_connections",
+        "innodb_buffer_pool_size",
+        "innodb_redo_log_capacity",
+        "loose_group_replication_member_expel_timeout",
+        "loose_group_replication_autorejoin_tries",
+        "loose_group_replication_paxos_single_leader",
+        "loose_group_replication_transaction_size_limit",
+        "loose_group_replication_message_cache_size",
+    }
+    for cfg_key, cfg_val in _cr_config_kv(config_text):
+        short = cfg_key.rsplit(".", 1)[-1]
+        if short in interesting_cfg:
+            rows.append((short, cfg_val))
+
+    if not rows:
+        rows.append(("Snapshot file", path.name))
+
+    body = "".join(
+        f"<tr><td>{html_mod.escape(k)}</td><td><code>{html_mod.escape(v)}</code></td></tr>"
+        for k, v in rows
+    )
+    return f"""
+    <section>
+      <details class="impact-details">
+        <summary>PerconaServerMySQL CR Snapshot ({html_mod.escape(path.name)})</summary>
+        <p class="details-note">Key fields from the CR captured during this run.</p>
+        <table class="phase-table">
+          <thead><tr><th>Setting</th><th>Value</th></tr></thead>
+          <tbody>{body}</tbody>
+        </table>
+      </details>
     </section>
     """
 
@@ -2889,8 +3617,11 @@ def generate_report(run_dir: Path, output_path: Path | None = None) -> Path:
         ("Before", f"{timing.initial_size} · {timing.initial_nodes} node{'s' if timing.initial_nodes != 1 else ''} · {timing.initial_storage_gib} GiB"),
         ("After", f"{timing.target_size or timing.initial_size} · {timing.target_nodes or timing.initial_nodes} node{'s' if (timing.target_nodes or timing.initial_nodes) != 1 else ''} · {timing.target_storage_gib or timing.initial_storage_gib} GiB"),
         ("Scale Duration", _fmt_duration(timing.scale_duration_sec)),
+        ("TPC-C Scale", conf.get("TPCC_SCALE", "N/A")),
+        ("TPC-C Tables", conf.get("TPCC_TABLES", "N/A")),
+        ("TPC-C Data", _fmt_tpcc_data_gib(conf)),
         ("TPC-C Threads", conf.get("TPCC_THREADS", "N/A")),
-        ("TPC-C Duration", _fmt_duration(int(conf.get("TPCC_MAX_TIME", "0")))),
+        ("TPC-C Duration", _fmt_duration(int(conf.get("TPCC_MAX_TIME", "0") or "0"))),
         ("Report Interval", f"{conf.get('TPCC_REPORT_INTERVAL', '1')}s"),
     ]
     overview_rows = "".join(
@@ -2916,6 +3647,8 @@ def generate_report(run_dir: Path, output_path: Path | None = None) -> Path:
     <h2 class="section-title">Run Overview</h2>
     <table class="kv"><tbody>{overview_rows}</tbody></table>
   </section>
+
+  {render_cr_snapshot(run_dir)}
 
   <section>
     <h2 class="section-title">TPC-C Metrics & Temporal Activity Timeline</h2>
