@@ -328,8 +328,8 @@ gr_lookup() {
 #   replica_parallel_workers \t replica_parallel_active
 #
 # replica_parallel_workers = @@GLOBAL.replica_parallel_workers (configured)
-# replica_parallel_active  = GR applier workers with a non-empty
-#   LAST_APPLIED_TRANSACTION (busy/used workers)
+# replica_parallel_active  = GR applier workers currently applying
+#   (APPLYING_TRANSACTION <> '', applier channel only)
 refresh_readonly_status() {
   : > "${READONLY_TMP}"
 
@@ -352,8 +352,8 @@ refresh_readonly_status() {
              @@GLOBAL.replica_parallel_workers,
              (SELECT COUNT(*)
                 FROM performance_schema.replication_applier_status_by_worker
-               WHERE CHANNEL_NAME LIKE 'group_replication%'
-                 AND LAST_APPLIED_TRANSACTION <> '');
+               WHERE CHANNEL_NAME = 'group_replication_applier'
+                 AND APPLYING_TRANSACTION <> '');
     " 2>/dev/null)" || continue
     echo "${ro_raw}" | while IFS=$'\t' read -r host ro sro rpw_cfg rpw_active; do
       [[ -z "${host}" ]] && continue
