@@ -1,5 +1,7 @@
 results
 reports
+TPCC/sysbench-tpcc/
+src/sysbench/
 ci-artifacts
 ci/benchmark-target.conf
 control.local.conf

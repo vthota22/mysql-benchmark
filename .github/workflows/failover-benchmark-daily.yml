@@ -43,6 +43,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: false
 
       - name: Load CI target config (optional)
         run: |
