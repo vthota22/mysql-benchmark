@@ -23,13 +23,9 @@ on:
   workflow_dispatch:
     inputs:
       git_branch:
-        description: "Git branch to sync on droplet before run (empty = config default)"
+        description: "Git branch to sync on droplet before run (empty = main_2)"
         required: false
         default: ""
-      skip_git_sync:
-        description: "Skip git pull on droplet (leave UNCHECKED for normal runs)"
-        type: boolean
-        default: false
 
 concurrency:
   group: failover-benchmark
@@ -99,17 +95,20 @@ jobs:
         env:
           CI_SSH_KEY_FILE: ${{ runner.temp }}/ci-ssh/benchmark_ci_key
           BENCHMARK_DROPLET_HOST: ${{ vars.BENCHMARK_DROPLET_HOST }}
-          BENCHMARK_DROPLET_USER: ${{ vars.BENCHMARK_DROPLET_USER }}
+          BENCHMARK_DROPLET_USER: ${{ vars.BENCHMARK_DROPLET_USER || 'root' }}
           BENCHMARK_REMOTE_REPO: ${{ vars.BENCHMARK_REMOTE_REPO }}
           BENCHMARK_DROPLET_GIT_BRANCH: ${{ inputs.git_branch != '' && inputs.git_branch || vars.BENCHMARK_DROPLET_GIT_BRANCH || 'main_2' }}
-          CI_GIT_SYNC: ${{ inputs.skip_git_sync && '0' || '1' }}
+          CI_GIT_SYNC: "1"
           CI_ARTIFACTS_DIR: ${{ github.workspace }}/ci-artifacts
         run: |
           set -euo pipefail
-          echo "CI_GIT_SYNC=${CI_GIT_SYNC}"
+          echo "CI_GIT_SYNC=${CI_GIT_SYNC} (always enabled)"
           echo "BENCHMARK_DROPLET_HOST=${BENCHMARK_DROPLET_HOST}"
+          echo "BENCHMARK_DROPLET_USER=${BENCHMARK_DROPLET_USER:-root}"
           echo "BENCHMARK_REMOTE_REPO=${BENCHMARK_REMOTE_REPO}"
           echo "BENCHMARK_DROPLET_GIT_BRANCH=${BENCHMARK_DROPLET_GIT_BRANCH}"
+          echo "CI_SSH_KEY_FILE=${CI_SSH_KEY_FILE}"
+          test -f "${CI_SSH_KEY_FILE}" && echo "SSH key file: OK" || echo "SSH key file: MISSING"
           chmod +x scripts/ci_failover_benchmark.sh
           ./scripts/ci_failover_benchmark.sh || {
             echo "Benchmark script failed. Dumping diagnostics..."

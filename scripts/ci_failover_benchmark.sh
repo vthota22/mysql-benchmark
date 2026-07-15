@@ -284,19 +284,41 @@ _preflight_remote() {
 }
 
 _start_run() {
-  local repo_q conf_q ctl_q start_out results_dir
+  local repo_q conf_q ctl_q start_out status_out results_dir
   repo_q="$(printf '%q' "${REMOTE_REPO}")"
   conf_q="$(printf '%q' "$(_remote_conf_path)")"
   ctl_q="$(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh")"
+
+  status_out="$(_ssh_capture "failover_run_ctl status (pre-start)" \
+    "set -euo pipefail; cd ${repo_q}; BENCHMARK_CONF=${conf_q} ${ctl_q} status")"
+  _parse_status "${status_out}"
+
+  if [[ "${RUNNING:-0}" == "1" && -n "${RESULTS_DIR:-}" ]]; then
+    CI_EXPECTED_RESULTS_DIR="${RESULTS_DIR}"
+    echo "--- Benchmark already running on droplet; attaching to ${CI_EXPECTED_RESULTS_DIR} ---"
+    return 0
+  fi
+
   echo "--- Starting failover benchmark on droplet ---"
   start_out="$(_ssh_capture "failover_run_ctl start" "set -euo pipefail; cd ${repo_q}; BENCHMARK_CONF=${conf_q} ${ctl_q} start")"
   echo "${start_out}"
 
   results_dir="$(sed -n 's/.*results_dir=\([^[:space:]]*\).*/\1/p' <<< "${start_out}" | tail -1)"
   if [[ -z "${results_dir}" ]]; then
-    echo "ERROR: could not parse results_dir from failover_run_ctl start output" >&2
+    echo "WARN: could not parse results_dir from start output; querying status" >&2
+    sleep 2
+    status_out="$(_ssh_capture "failover_run_ctl status (post-start)" \
+      "set -euo pipefail; cd ${repo_q}; BENCHMARK_CONF=${conf_q} ${ctl_q} status")"
+    echo "${status_out}"
+    results_dir="$(sed -n 's/^results_dir=//p' <<< "${status_out}" | tail -1)"
+    _parse_status "${status_out}"
+  fi
+
+  if [[ -z "${results_dir}" ]]; then
+    echo "ERROR: could not determine results_dir after start" >&2
     return 1
   fi
+
   CI_EXPECTED_RESULTS_DIR="${results_dir}"
   echo "Tracking new run: ${CI_EXPECTED_RESULTS_DIR}"
 }
