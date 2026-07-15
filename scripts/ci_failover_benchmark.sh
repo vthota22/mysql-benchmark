@@ -20,16 +20,22 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFIG_FILE="${CI_BENCHMARK_CONFIG:-${REPO_ROOT}/ci/benchmark-target.conf}"
 ARTIFACTS_DIR="${CI_ARTIFACTS_DIR:-${REPO_ROOT}/ci-artifacts}"
 SSH_KEY_FILE="${CI_SSH_KEY_FILE:-}"
+DIAG_DIR="${ARTIFACTS_DIR}/diagnostics"
 
 DROPLET_HOST=""
 DROPLET_USER="root"
 DROPLET_SSH_PORT=22
 REMOTE_REPO=""
 REMOTE_BENCHMARK_CONF="benchmark.conf"
-CI_GIT_SYNC=0
+CI_GIT_SYNC=1
 DROPLET_GIT_BRANCH=""
 CI_POLL_INTERVAL_SEC=60
 CI_MAX_WAIT_SEC=10800
+
+RUNNING=""
+COMPLETED=""
+RESULTS_DIR=""
+REPORT_PATH=""
 
 _load_kv_file() {
   local file="$1"
@@ -74,14 +80,45 @@ _apply_env_overrides() {
   [[ -n "${CI_MAX_WAIT_SEC_OVERRIDE:-}" ]] && CI_MAX_WAIT_SEC="${CI_MAX_WAIT_SEC_OVERRIDE}"
 }
 
+_normalize_ci_flags() {
+  local git_sync_from_env="${1:-}"
+
+  if [[ -n "${git_sync_from_env}" ]]; then
+    CI_GIT_SYNC="${git_sync_from_env}"
+  else
+    CI_GIT_SYNC="${CI_GIT_SYNC:-1}"
+  fi
+  case "${CI_GIT_SYNC}" in
+    1|true|yes|on) CI_GIT_SYNC=1 ;;
+    0|false|no|off) CI_GIT_SYNC=0 ;;
+    *)
+      echo "ERROR: invalid CI_GIT_SYNC='${CI_GIT_SYNC}' (use 0 or 1)" >&2
+      exit 1
+      ;;
+  esac
+
+  DROPLET_GIT_BRANCH="${DROPLET_GIT_BRANCH:-main_2}"
+}
+
+_validate_required() {
+  if [[ -z "${BENCHMARK_SSH_PRIVATE_KEY:-}" && ( -z "${SSH_KEY_FILE}" || ! -f "${SSH_KEY_FILE}" ) ]]; then
+    echo "ERROR: BENCHMARK_SSH_PRIVATE_KEY is required (or set CI_SSH_KEY_FILE)" >&2
+    exit 1
+  fi
+  if [[ -z "${DROPLET_HOST}" ]]; then
+    echo "ERROR: BENCHMARK_DROPLET_HOST is required (repository variable or ci/benchmark-target.conf)" >&2
+    exit 1
+  fi
+  if [[ -z "${REMOTE_REPO}" ]]; then
+    echo "ERROR: BENCHMARK_REMOTE_REPO is required (repository variable or ci/benchmark-target.conf)" >&2
+    exit 1
+  fi
+}
+
 _setup_ssh_key() {
   if [[ -n "${SSH_KEY_FILE}" && -f "${SSH_KEY_FILE}" ]]; then
     chmod 600 "${SSH_KEY_FILE}"
     return 0
-  fi
-  if [[ -z "${BENCHMARK_SSH_PRIVATE_KEY:-}" ]]; then
-    echo "ERROR: set BENCHMARK_SSH_PRIVATE_KEY or CI_SSH_KEY_FILE" >&2
-    exit 1
   fi
   SSH_KEY_FILE="$(mktemp)"
   chmod 600 "${SSH_KEY_FILE}"
@@ -97,6 +134,19 @@ _ssh() {
     -p "${DROPLET_SSH_PORT}" \
     "${DROPLET_USER}@${DROPLET_HOST}" \
     "$@"
+}
+
+_ssh_capture() {
+  local label="$1"
+  shift
+  local out rc=0
+  out="$(_ssh "$@" 2>&1)" || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    echo "ERROR: remote command failed (${label}, exit ${rc})" >&2
+    echo "${out}" >&2
+    return "${rc}"
+  fi
+  printf '%s' "${out}"
 }
 
 _scp_from() {
@@ -119,28 +169,99 @@ _remote_conf_path() {
   echo "${repo}/${conf}"
 }
 
-_sync_repo() {
-  if [[ "${CI_GIT_SYNC}" != "1" ]]; then
-    return 0
-  fi
-  local repo_q branch_cmd=""
-  repo_q="$(printf '%q' "${REMOTE_REPO}")"
-  if [[ -n "${DROPLET_GIT_BRANCH}" ]]; then
-    branch_cmd="git fetch origin ${DROPLET_GIT_BRANCH} && git checkout ${DROPLET_GIT_BRANCH} && git pull --ff-only origin ${DROPLET_GIT_BRANCH}"
-  else
-    branch_cmd="git pull --ff-only"
-  fi
-  echo "--- Syncing droplet repo (${REMOTE_REPO}) ---"
-  _ssh "set -euo pipefail; cd ${repo_q}; ${branch_cmd}"
+_log_runtime_config() {
+  echo "=== CI failover benchmark ==="
+  echo "Droplet:  ${DROPLET_USER}@${DROPLET_HOST}:${DROPLET_SSH_PORT}"
+  echo "Repo:     ${REMOTE_REPO}"
+  echo "Config:   $(_remote_conf_path)"
+  echo "CI_GIT_SYNC=${CI_GIT_SYNC}"
+  echo "DROPLET_GIT_BRANCH=${DROPLET_GIT_BRANCH}"
+  echo "CI_SKIP_START=${CI_SKIP_START:-0}"
+  echo "CI_MAX_WAIT_SEC=${CI_MAX_WAIT_SEC}"
+  echo ""
 }
 
-_start_run() {
+_dump_failure_diagnostics() {
+  local reason="${1:-unknown failure}"
+  mkdir -p "${DIAG_DIR}"
+  {
+    echo "reason=${reason}"
+    echo "droplet=${DROPLET_USER}@${DROPLET_HOST}"
+    echo "remote_repo=${REMOTE_REPO}"
+    echo "ci_git_sync=${CI_GIT_SYNC}"
+    echo "droplet_git_branch=${DROPLET_GIT_BRANCH}"
+    echo "results_dir=${RESULTS_DIR:-}"
+    echo "failed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "${DIAG_DIR}/failure_reason.env"
+
   local repo_q conf_q ctl_q
   repo_q="$(printf '%q' "${REMOTE_REPO}")"
   conf_q="$(printf '%q' "$(_remote_conf_path)")"
   ctl_q="$(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh")"
+
+  {
+    echo "----- remote: ctl status -----"
+    _ssh "cd ${repo_q} && BENCHMARK_CONF=${conf_q} ${ctl_q} status" 2>&1 || true
+    echo
+    echo "----- remote: repo HEAD -----"
+    _ssh "cd ${repo_q} && git rev-parse --abbrev-ref HEAD && git rev-parse --short HEAD && git status -sb" 2>&1 || true
+    echo
+    echo "----- remote: control_wrapper.log (tail 100) -----"
+    _ssh "tail -n 100 ${repo_q}/results/control_wrapper.log" 2>&1 || true
+    if [[ -n "${RESULTS_DIR:-}" ]]; then
+      echo
+      echo "----- remote: ${RESULTS_DIR}/full_run.log (tail 100) -----"
+      _ssh "tail -n 100 ${repo_q}/${RESULTS_DIR}/full_run.log" 2>&1 || true
+    fi
+  } > "${DIAG_DIR}/remote_diagnostics.txt" 2>&1 || true
+
+  if [[ -n "${RESULTS_DIR:-}" ]]; then
+    _fetch_artifacts "${RESULTS_DIR}" || true
+  fi
+
+  echo "Diagnostics written to ${DIAG_DIR}/"
+}
+
+_sync_repo() {
+  if [[ "${CI_GIT_SYNC}" != "1" ]]; then
+    echo "--- Skipping git sync (CI_GIT_SYNC=0); using existing droplet checkout ---"
+    _ssh_capture "repo HEAD" "set -euo pipefail; cd $(printf '%q' "${REMOTE_REPO}"); git rev-parse --abbrev-ref HEAD; git rev-parse --short HEAD" \
+      | sed 's/^/  /' || return 1
+    return 0
+  fi
+
+  local repo_q branch_cmd=""
+  repo_q="$(printf '%q' "${REMOTE_REPO}")"
+  branch_cmd="git fetch origin ${DROPLET_GIT_BRANCH} && git checkout ${DROPLET_GIT_BRANCH} && git pull --ff-only origin ${DROPLET_GIT_BRANCH}"
+  echo "--- Syncing droplet repo (${REMOTE_REPO}) to branch ${DROPLET_GIT_BRANCH} ---"
+  _ssh_capture "git sync" "set -euo pipefail; cd ${repo_q}; ${branch_cmd}"
+}
+
+_preflight_remote() {
+  local repo_q conf_q ctl_q run_q
+  repo_q="$(printf '%q' "${REMOTE_REPO}")"
+  conf_q="$(printf '%q' "$(_remote_conf_path)")"
+  ctl_q="$(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh")"
+  run_q="$(printf '%q' "${REMOTE_REPO}/run_failover_benchmark.sh")"
+
+  echo "--- Preflight checks on droplet ---"
+  _ssh_capture "SSH connectivity" "echo SSH_OK" >/dev/null
+  _ssh_capture "repo path" "test -d ${repo_q} && echo REPO_OK" | grep -q REPO_OK
+  _ssh_capture "benchmark.conf" "test -f ${conf_q} && echo CONF_OK" | grep -q CONF_OK
+  _ssh_capture "ctl script" "test -x ${ctl_q} && echo CTL_OK" | grep -q CTL_OK
+  _ssh_capture "run script" "test -x ${run_q} && echo RUN_OK" | grep -q RUN_OK
+  echo "Preflight OK"
+  echo ""
+}
+
+_start_run() {
+  local repo_q conf_q ctl_q start_out
+  repo_q="$(printf '%q' "${REMOTE_REPO}")"
+  conf_q="$(printf '%q' "$(_remote_conf_path)")"
+  ctl_q="$(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh")"
   echo "--- Starting failover benchmark on droplet ---"
-  _ssh "set -euo pipefail; cd ${repo_q}; BENCHMARK_CONF=${conf_q} ${ctl_q} start"
+  start_out="$(_ssh_capture "failover_run_ctl start" "set -euo pipefail; cd ${repo_q}; BENCHMARK_CONF=${conf_q} ${ctl_q} start")"
+  echo "${start_out}"
 }
 
 _parse_status() {
@@ -171,7 +292,7 @@ _poll_until_complete() {
 
   echo "--- Waiting for benchmark completion (poll=${CI_POLL_INTERVAL_SEC}s, max=${CI_MAX_WAIT_SEC}s) ---"
   while [[ "${elapsed}" -lt "${CI_MAX_WAIT_SEC}" ]]; do
-    status_out="$(_ssh "set -euo pipefail; cd ${repo_q}; BENCHMARK_CONF=${conf_q} ${ctl_q} status" || true)"
+    status_out="$(_ssh "set -euo pipefail; cd ${repo_q}; BENCHMARK_CONF=${conf_q} ${ctl_q} status" 2>&1 || true)"
     _parse_status "${status_out}"
     echo "[${elapsed}s] running=${RUNNING:-?} completed=${COMPLETED:-?} results_dir=${RESULTS_DIR:-}"
 
@@ -188,7 +309,7 @@ _poll_until_complete() {
         return 0
       fi
       echo "ERROR: benchmark process stopped before completion marker" >&2
-      _ssh "tail -n 80 $(printf '%q' "${REMOTE_REPO}/${RESULTS_DIR}/full_run.log")" >&2 || true
+      _dump_failure_diagnostics "benchmark exited before completion marker"
       return 1
     fi
 
@@ -197,6 +318,7 @@ _poll_until_complete() {
   done
 
   echo "ERROR: timed out after ${CI_MAX_WAIT_SEC}s" >&2
+  _dump_failure_diagnostics "timed out waiting for benchmark"
   return 1
 }
 
@@ -236,28 +358,15 @@ _fetch_artifacts() {
 }
 
 main() {
-  local git_sync_env="${CI_GIT_SYNC:-}"
+  local git_sync_from_env="${CI_GIT_SYNC:-}"
 
   _load_kv_file "${CONFIG_FILE}"
   _apply_env_overrides
-  if [[ -n "${git_sync_env}" ]]; then
-    CI_GIT_SYNC="${git_sync_env}"
-  fi
-
-  if [[ -z "${DROPLET_HOST}" || -z "${REMOTE_REPO}" ]]; then
-    echo "ERROR: DROPLET_HOST and REMOTE_REPO required (config or env)" >&2
-    exit 1
-  fi
-
+  _normalize_ci_flags "${git_sync_from_env}"
+  _validate_required
   _setup_ssh_key
-
-  echo "=== CI failover benchmark ==="
-  echo "Droplet:  ${DROPLET_USER}@${DROPLET_HOST}:${DROPLET_SSH_PORT}"
-  echo "Repo:     ${REMOTE_REPO}"
-  echo "Config:   $(_remote_conf_path)"
-  echo ""
-
-  _ssh "echo SSH_OK"
+  _log_runtime_config
+  _preflight_remote
   _sync_repo
 
   if [[ "${CI_SKIP_START:-0}" != "1" ]]; then
@@ -265,17 +374,20 @@ main() {
   fi
 
   local status_out
-  status_out="$(_ssh "cd $(printf '%q' "${REMOTE_REPO}") && BENCHMARK_CONF=$(printf '%q' "$(_remote_conf_path)") $(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh") status")"
+  status_out="$(_ssh_capture "failover_run_ctl status" \
+    "cd $(printf '%q' "${REMOTE_REPO}") && BENCHMARK_CONF=$(printf '%q' "$(_remote_conf_path)") $(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh") status")"
   _parse_status "${status_out}"
 
   if [[ "${COMPLETED:-0}" != "1" ]]; then
     _poll_until_complete
-    status_out="$(_ssh "cd $(printf '%q' "${REMOTE_REPO}") && BENCHMARK_CONF=$(printf '%q' "$(_remote_conf_path)") $(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh") status")"
+    status_out="$(_ssh_capture "failover_run_ctl status" \
+      "cd $(printf '%q' "${REMOTE_REPO}") && BENCHMARK_CONF=$(printf '%q' "$(_remote_conf_path)") $(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh") status")"
     _parse_status "${status_out}"
   fi
 
   if [[ -z "${RESULTS_DIR:-}" ]]; then
     echo "ERROR: no results_dir from ctl status" >&2
+    _dump_failure_diagnostics "missing results_dir"
     exit 1
   fi
 
@@ -283,6 +395,7 @@ main() {
 
   if [[ ! -f "${ARTIFACTS_DIR}/${RESULTS_DIR##*/}/failover_report.html" ]]; then
     echo "ERROR: HTML report was not fetched" >&2
+    _dump_failure_diagnostics "html report missing"
     exit 1
   fi
 
@@ -290,4 +403,14 @@ main() {
   echo "=== CI failover benchmark complete ==="
 }
 
+_cleanup_on_exit() {
+  local rc=$?
+  trap - EXIT
+  if [[ ${rc} -ne 0 ]]; then
+    _dump_failure_diagnostics "exit ${rc}" 2>/dev/null || true
+  fi
+  exit "${rc}"
+}
+
+trap '_cleanup_on_exit' EXIT
 main "$@"

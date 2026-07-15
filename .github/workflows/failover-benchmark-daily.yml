@@ -27,7 +27,7 @@ on:
         required: false
         default: ""
       skip_git_sync:
-        description: "Skip git pull on droplet"
+        description: "Skip git pull on droplet (leave unchecked for normal runs)"
         type: boolean
         default: false
 
@@ -55,18 +55,61 @@ jobs:
             echo "No ci/benchmark-target.conf — using repository variables / workflow defaults"
           fi
 
+      - name: Validate required configuration
+        run: |
+          set -euo pipefail
+          missing=0
+          if [[ -z "${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}" ]]; then
+            echo "ERROR: missing secret BENCHMARK_SSH_PRIVATE_KEY"
+            missing=1
+          fi
+          if [[ -z "${{ vars.BENCHMARK_DROPLET_HOST }}" ]]; then
+            echo "ERROR: missing variable BENCHMARK_DROPLET_HOST"
+            missing=1
+          fi
+          if [[ -z "${{ vars.BENCHMARK_REMOTE_REPO }}" ]]; then
+            echo "ERROR: missing variable BENCHMARK_REMOTE_REPO (e.g. /root/mysql-benchmark)"
+            missing=1
+          fi
+          if [[ "${missing}" -ne 0 ]]; then
+            exit 1
+          fi
+          echo "Required secrets/variables present."
+
       - name: Run failover benchmark on droplet
         env:
           BENCHMARK_SSH_PRIVATE_KEY: ${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}
           BENCHMARK_DROPLET_HOST: ${{ vars.BENCHMARK_DROPLET_HOST }}
           BENCHMARK_DROPLET_USER: ${{ vars.BENCHMARK_DROPLET_USER }}
           BENCHMARK_REMOTE_REPO: ${{ vars.BENCHMARK_REMOTE_REPO }}
-          BENCHMARK_DROPLET_GIT_BRANCH: ${{ inputs.git_branch != '' && inputs.git_branch || vars.BENCHMARK_DROPLET_GIT_BRANCH }}
+          BENCHMARK_DROPLET_GIT_BRANCH: ${{ inputs.git_branch != '' && inputs.git_branch || vars.BENCHMARK_DROPLET_GIT_BRANCH || 'main_2' }}
           CI_GIT_SYNC: ${{ inputs.skip_git_sync && '0' || '1' }}
           CI_ARTIFACTS_DIR: ${{ github.workspace }}/ci-artifacts
         run: |
+          set -euo pipefail
+          echo "CI_GIT_SYNC=${CI_GIT_SYNC}"
+          echo "BENCHMARK_DROPLET_HOST=${BENCHMARK_DROPLET_HOST}"
+          echo "BENCHMARK_REMOTE_REPO=${BENCHMARK_REMOTE_REPO}"
+          echo "BENCHMARK_DROPLET_GIT_BRANCH=${BENCHMARK_DROPLET_GIT_BRANCH}"
           chmod +x scripts/ci_failover_benchmark.sh
-          ./scripts/ci_failover_benchmark.sh
+          ./scripts/ci_failover_benchmark.sh || {
+            echo "Benchmark script failed. Dumping diagnostics..."
+            if [[ -d "${CI_ARTIFACTS_DIR}" ]]; then
+              find "${CI_ARTIFACTS_DIR}" -maxdepth 4 -type f | sed 's/^/ - /'
+              if [[ -f "${CI_ARTIFACTS_DIR}/diagnostics/remote_diagnostics.txt" ]]; then
+                echo "----- remote_diagnostics.txt -----"
+                cat "${CI_ARTIFACTS_DIR}/diagnostics/remote_diagnostics.txt"
+              fi
+              while IFS= read -r f; do
+                [[ -n "${f}" && -f "${f}" ]] || continue
+                echo "----- ${f} (tail -100) -----"
+                tail -100 "${f}" || true
+              done < <(find "${CI_ARTIFACTS_DIR}" \( -name '*.log' -o -name 'failover_kpi.csv' -o -name 'remote_diagnostics.txt' \) | head -n 8)
+            else
+              echo "No CI artifacts directory found: ${CI_ARTIFACTS_DIR}"
+            fi
+            exit 1
+          }
 
       - name: Upload benchmark artifacts
         if: always()
