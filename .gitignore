@@ -1,5 +1,7 @@
 results
 reports
+ci-artifacts
+ci/benchmark-target.conf
 control.local.conf
 benchmark.conf
 control/.report_cache

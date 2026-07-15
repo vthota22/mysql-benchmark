@@ -1,0 +1,91 @@
+# Scheduled failover benchmark — GitHub Actions orchestrates; droplet executes the harness.
+#
+# Required GitHub repository secrets:
+#   BENCHMARK_SSH_PRIVATE_KEY   — private key with SSH access to the benchmark droplet
+#
+# Optional repository variables (Settings → Secrets and variables → Actions → Variables):
+#   BENCHMARK_DROPLET_HOST        — overrides ci/benchmark-target.conf
+#   BENCHMARK_DROPLET_USER        — default: root
+#   BENCHMARK_REMOTE_REPO         — default: /root/mysql-benchmark
+#   BENCHMARK_DROPLET_GIT_BRANCH  — branch to git pull on droplet before run (e.g. main_2)
+#
+# One-time droplet setup (not done by this workflow):
+#   git clone <repo> /root/mysql-benchmark && cd /root/mysql-benchmark && ./setup_benchmark.sh
+#   cp benchmark.conf.example benchmark.conf  # fill credentials + failover settings
+#   prepare TPC-C data once (SKIP_PREPARE=1 for daily runs)
+
+name: Daily Failover Benchmark
+
+on:
+  schedule:
+    # 02:00 UTC daily — adjust for your timezone / cluster maintenance windows
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      git_branch:
+        description: "Git branch to sync on droplet before run (empty = config default)"
+        required: false
+        default: ""
+      skip_git_sync:
+        description: "Skip git pull on droplet"
+        type: boolean
+        default: false
+
+concurrency:
+  group: failover-benchmark
+  cancel-in-progress: false
+
+jobs:
+  failover-benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Load CI target config (optional)
+        run: |
+          if [[ -f ci/benchmark-target.conf ]]; then
+            echo "Using ci/benchmark-target.conf"
+          else
+            echo "No ci/benchmark-target.conf — using repository variables / workflow defaults"
+          fi
+
+      - name: Run failover benchmark on droplet
+        env:
+          BENCHMARK_SSH_PRIVATE_KEY: ${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}
+          BENCHMARK_DROPLET_HOST: ${{ vars.BENCHMARK_DROPLET_HOST }}
+          BENCHMARK_DROPLET_USER: ${{ vars.BENCHMARK_DROPLET_USER }}
+          BENCHMARK_REMOTE_REPO: ${{ vars.BENCHMARK_REMOTE_REPO }}
+          BENCHMARK_DROPLET_GIT_BRANCH: ${{ inputs.git_branch != '' && inputs.git_branch || vars.BENCHMARK_DROPLET_GIT_BRANCH }}
+          CI_GIT_SYNC: ${{ inputs.skip_git_sync && '0' || '1' }}
+          CI_ARTIFACTS_DIR: ${{ github.workspace }}/ci-artifacts
+        run: |
+          chmod +x scripts/ci_failover_benchmark.sh
+          ./scripts/ci_failover_benchmark.sh
+
+      - name: Upload benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failover-report-${{ github.run_id }}
+          path: |
+            ci-artifacts/
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Summarize KPIs
+        if: success()
+        run: |
+          kpi="$(find ci-artifacts -name failover_kpi.csv | head -1)"
+          if [[ -n "${kpi}" ]]; then
+            echo "### Failover KPIs" >> "${GITHUB_STEP_SUMMARY}"
+            echo '```csv' >> "${GITHUB_STEP_SUMMARY}"
+            head -20 "${kpi}" >> "${GITHUB_STEP_SUMMARY}"
+            echo '```' >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          report="$(find ci-artifacts -name failover_report.html | head -1)"
+          if [[ -n "${report}" ]]; then
+            echo "HTML report saved to workflow artifacts: ${report}" >> "${GITHUB_STEP_SUMMARY}"
+          fi

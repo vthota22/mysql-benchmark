@@ -1,0 +1,20 @@
+# Static benchmark droplet target for CI / GitHub Actions.
+# Copy to ci/benchmark-target.conf (gitignored) or set equivalent env vars in GHA.
+#
+# Secrets (SSH private key, DB passwords) must NOT go here — keep benchmark.conf on the droplet.
+
+DROPLET_HOST=your-droplet-ip-or-hostname
+DROPLET_USER=root
+DROPLET_SSH_PORT=22
+
+# Repo path on the droplet (run_failover_benchmark.sh must exist here)
+REMOTE_REPO=/root/mysql-benchmark
+REMOTE_BENCHMARK_CONF=benchmark.conf
+
+# Optional: git sync on droplet before each scheduled run
+CI_GIT_SYNC=1
+DROPLET_GIT_BRANCH=main_2
+
+# Wait for benchmark completion (failover can run 30–90+ minutes)
+CI_POLL_INTERVAL_SEC=60
+CI_MAX_WAIT_SEC=10800
