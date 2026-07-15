@@ -102,7 +102,7 @@ _normalize_ci_flags() {
 
 _validate_required() {
   if [[ -z "${BENCHMARK_SSH_PRIVATE_KEY:-}" && ( -z "${SSH_KEY_FILE}" || ! -f "${SSH_KEY_FILE}" ) ]]; then
-    echo "ERROR: BENCHMARK_SSH_PRIVATE_KEY is required (or set CI_SSH_KEY_FILE)" >&2
+    echo "ERROR: provide CI_SSH_KEY_FILE or BENCHMARK_SSH_PRIVATE_KEY" >&2
     exit 1
   fi
   if [[ -z "${DROPLET_HOST}" ]]; then
@@ -118,11 +118,33 @@ _validate_required() {
 _setup_ssh_key() {
   if [[ -n "${SSH_KEY_FILE}" && -f "${SSH_KEY_FILE}" ]]; then
     chmod 600 "${SSH_KEY_FILE}"
-    return 0
+  elif [[ -n "${BENCHMARK_SSH_PRIVATE_KEY:-}" ]]; then
+    mkdir -p "${ARTIFACTS_DIR}/.ssh"
+    SSH_KEY_FILE="${ARTIFACTS_DIR}/.ssh/benchmark_ci_key"
+    chmod 700 "${ARTIFACTS_DIR}/.ssh"
+    # Preserve multiline key material from env (GitHub secret).
+    printf '%s\n' "${BENCHMARK_SSH_PRIVATE_KEY}" > "${SSH_KEY_FILE}"
+    chmod 600 "${SSH_KEY_FILE}"
+  else
+    echo "ERROR: no SSH private key provided (CI_SSH_KEY_FILE or BENCHMARK_SSH_PRIVATE_KEY)" >&2
+    exit 1
   fi
-  SSH_KEY_FILE="$(mktemp)"
-  chmod 600 "${SSH_KEY_FILE}"
-  printf '%s\n' "${BENCHMARK_SSH_PRIVATE_KEY}" > "${SSH_KEY_FILE}"
+
+  if [[ ! -s "${SSH_KEY_FILE}" ]]; then
+    echo "ERROR: SSH key file is empty: ${SSH_KEY_FILE}" >&2
+    exit 1
+  fi
+  if ! grep -qE 'BEGIN (OPENSSH |RSA |EC |DSA )?PRIVATE KEY' "${SSH_KEY_FILE}"; then
+    echo "ERROR: SSH key file does not look like a private key: ${SSH_KEY_FILE}" >&2
+    echo "       Paste the full private key into secret BENCHMARK_SSH_PRIVATE_KEY (not the .pub file)." >&2
+    exit 1
+  fi
+  if ! ssh-keygen -y -f "${SSH_KEY_FILE}" >/dev/null 2>&1; then
+    echo "ERROR: SSH private key is invalid or passphrase-protected: ${SSH_KEY_FILE}" >&2
+    echo "       Use an unencrypted deploy key for CI." >&2
+    exit 1
+  fi
+  echo "SSH key loaded: ${SSH_KEY_FILE} ($(wc -c < "${SSH_KEY_FILE}") bytes)"
 }
 
 _ssh() {
@@ -191,9 +213,15 @@ _dump_failure_diagnostics() {
     echo "ci_git_sync=${CI_GIT_SYNC}"
     echo "droplet_git_branch=${DROPLET_GIT_BRANCH}"
     echo "results_dir=${RESULTS_DIR:-}"
+    echo "ssh_key_file=${SSH_KEY_FILE:-}"
     echo "failed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } > "${DIAG_DIR}/failure_reason.env"
 
+  if [[ -z "${SSH_KEY_FILE:-}" || ! -f "${SSH_KEY_FILE}" ]]; then
+    echo "Skipping remote SSH diagnostics (SSH key file not configured)." > "${DIAG_DIR}/remote_diagnostics.txt"
+    echo "Diagnostics written to ${DIAG_DIR}/"
+    return 0
+  fi
   local repo_q conf_q ctl_q
   repo_q="$(printf '%q' "${REMOTE_REPO}")"
   conf_q="$(printf '%q' "$(_remote_conf_path)")"
