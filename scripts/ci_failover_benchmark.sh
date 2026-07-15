@@ -31,6 +31,7 @@ CI_GIT_SYNC=1
 DROPLET_GIT_BRANCH=""
 CI_POLL_INTERVAL_SEC=60
 CI_MAX_WAIT_SEC=10800
+CI_EXPECTED_RESULTS_DIR=""
 
 RUNNING=""
 COMPLETED=""
@@ -283,13 +284,21 @@ _preflight_remote() {
 }
 
 _start_run() {
-  local repo_q conf_q ctl_q start_out
+  local repo_q conf_q ctl_q start_out results_dir
   repo_q="$(printf '%q' "${REMOTE_REPO}")"
   conf_q="$(printf '%q' "$(_remote_conf_path)")"
   ctl_q="$(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh")"
   echo "--- Starting failover benchmark on droplet ---"
   start_out="$(_ssh_capture "failover_run_ctl start" "set -euo pipefail; cd ${repo_q}; BENCHMARK_CONF=${conf_q} ${ctl_q} start")"
   echo "${start_out}"
+
+  results_dir="$(sed -n 's/.*results_dir=\([^[:space:]]*\).*/\1/p' <<< "${start_out}" | tail -1)"
+  if [[ -z "${results_dir}" ]]; then
+    echo "ERROR: could not parse results_dir from failover_run_ctl start output" >&2
+    return 1
+  fi
+  CI_EXPECTED_RESULTS_DIR="${results_dir}"
+  echo "Tracking new run: ${CI_EXPECTED_RESULTS_DIR}"
 }
 
 _parse_status() {
@@ -319,19 +328,37 @@ _poll_until_complete() {
   ctl_q="$(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh")"
 
   echo "--- Waiting for benchmark completion (poll=${CI_POLL_INTERVAL_SEC}s, max=${CI_MAX_WAIT_SEC}s) ---"
+  if [[ -n "${CI_EXPECTED_RESULTS_DIR}" ]]; then
+    echo "Expected results dir: ${CI_EXPECTED_RESULTS_DIR}"
+  fi
+
   while [[ "${elapsed}" -lt "${CI_MAX_WAIT_SEC}" ]]; do
     status_out="$(_ssh "set -euo pipefail; cd ${repo_q}; BENCHMARK_CONF=${conf_q} ${ctl_q} status" 2>&1 || true)"
     _parse_status "${status_out}"
     echo "[${elapsed}s] running=${RUNNING:-?} completed=${COMPLETED:-?} results_dir=${RESULTS_DIR:-}"
 
+    if [[ -n "${CI_EXPECTED_RESULTS_DIR}" && -n "${RESULTS_DIR:-}" && "${RESULTS_DIR}" != "${CI_EXPECTED_RESULTS_DIR}" ]]; then
+      if [[ "${COMPLETED:-0}" == "1" && "${RUNNING:-0}" != "1" ]]; then
+        echo "[${elapsed}s] ignoring stale completed run ${RESULTS_DIR}; waiting for ${CI_EXPECTED_RESULTS_DIR}"
+        sleep "${CI_POLL_INTERVAL_SEC}"
+        elapsed=$((elapsed + CI_POLL_INTERVAL_SEC))
+        continue
+      fi
+    fi
+
     if [[ "${COMPLETED:-0}" == "1" && -n "${RESULTS_DIR:-}" ]]; then
-      echo "Benchmark completed: ${RESULTS_DIR}"
-      return 0
+      if [[ -z "${CI_EXPECTED_RESULTS_DIR}" || "${RESULTS_DIR}" == "${CI_EXPECTED_RESULTS_DIR}" ]]; then
+        echo "Benchmark completed: ${RESULTS_DIR}"
+        return 0
+      fi
     fi
-    if [[ "${RUNNING:-0}" != "1" && "${COMPLETED:-0}" == "1" ]]; then
-      return 0
-    fi
+
     if [[ "${RUNNING:-0}" != "1" && -n "${RESULTS_DIR:-}" ]]; then
+      if [[ -n "${CI_EXPECTED_RESULTS_DIR}" && "${RESULTS_DIR}" != "${CI_EXPECTED_RESULTS_DIR}" ]]; then
+        sleep "${CI_POLL_INTERVAL_SEC}"
+        elapsed=$((elapsed + CI_POLL_INTERVAL_SEC))
+        continue
+      fi
       if _ssh "grep -q '=== Failover benchmark complete ===' $(printf '%q' "${REMOTE_REPO}/${RESULTS_DIR}/full_run.log") 2>/dev/null"; then
         echo "Benchmark completed (log marker): ${RESULTS_DIR}"
         return 0
@@ -356,9 +383,10 @@ _fetch_artifacts() {
   local local_run_dir="${ARTIFACTS_DIR}/${results_dir##*/}"
 
   rm -rf "${local_run_dir}"
-  mkdir -p "${ARTIFACTS_DIR}"
+  mkdir -p "${local_run_dir}"
 
   echo "--- Fetching results from droplet ---"
+  echo "Remote: ${remote_base}"
   _scp_from "${remote_base}/failover_kpi.csv" "${local_run_dir}/failover_kpi.csv" 2>/dev/null \
     || echo "WARN: failover_kpi.csv not found"
   _scp_from "${remote_base}/failover_comparison.txt" "${local_run_dir}/failover_comparison.txt" 2>/dev/null \
@@ -369,9 +397,13 @@ _fetch_artifacts() {
   local report_rel="advanced/graphs/failover_report.html"
   if [[ -n "${REPORT_PATH:-}" ]]; then
     report_rel="${REPORT_PATH#${results_dir}/}"
+    report_rel="${report_rel#/}"
   fi
-  _scp_from "${remote_base}/${report_rel}" "${local_run_dir}/failover_report.html" 2>/dev/null \
-    || echo "WARN: failover_report.html not found at ${report_rel}"
+  if ! _scp_from "${remote_base}/${report_rel}" "${local_run_dir}/failover_report.html" 2>/dev/null; then
+    echo "WARN: failover_report.html not found at ${report_rel}; trying default path"
+    _scp_from "${remote_base}/advanced/graphs/failover_report.html" "${local_run_dir}/failover_report.html" 2>/dev/null \
+      || echo "WARN: default failover_report.html path also missing"
+  fi
 
   {
     echo "results_dir=${results_dir}"
@@ -399,6 +431,8 @@ main() {
 
   if [[ "${CI_SKIP_START:-0}" != "1" ]]; then
     _start_run
+  else
+    echo "--- CI_SKIP_START=1: not launching a new benchmark ---"
   fi
 
   local status_out
@@ -406,16 +440,32 @@ main() {
     "cd $(printf '%q' "${REMOTE_REPO}") && BENCHMARK_CONF=$(printf '%q' "$(_remote_conf_path)") $(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh") status")"
   _parse_status "${status_out}"
 
-  if [[ "${COMPLETED:-0}" != "1" ]]; then
+  # Always poll when we started a new run; do not trust stale completed=1 from older runs.
+  if [[ "${CI_SKIP_START:-0}" != "1" ]]; then
+    _poll_until_complete
+    status_out="$(_ssh_capture "failover_run_ctl status" \
+      "cd $(printf '%q' "${REMOTE_REPO}") && BENCHMARK_CONF=$(printf '%q' "$(_remote_conf_path)") $(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh") status")"
+    _parse_status "${status_out}"
+  elif [[ "${COMPLETED:-0}" != "1" ]]; then
     _poll_until_complete
     status_out="$(_ssh_capture "failover_run_ctl status" \
       "cd $(printf '%q' "${REMOTE_REPO}") && BENCHMARK_CONF=$(printf '%q' "$(_remote_conf_path)") $(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh") status")"
     _parse_status "${status_out}"
   fi
 
+  if [[ -n "${CI_EXPECTED_RESULTS_DIR}" ]]; then
+    RESULTS_DIR="${CI_EXPECTED_RESULTS_DIR}"
+  fi
+
   if [[ -z "${RESULTS_DIR:-}" ]]; then
     echo "ERROR: no results_dir from ctl status" >&2
     _dump_failure_diagnostics "missing results_dir"
+    exit 1
+  fi
+
+  if [[ "${COMPLETED:-0}" != "1" ]]; then
+    echo "ERROR: benchmark did not complete successfully for ${RESULTS_DIR}" >&2
+    _dump_failure_diagnostics "benchmark not completed"
     exit 1
   fi
 

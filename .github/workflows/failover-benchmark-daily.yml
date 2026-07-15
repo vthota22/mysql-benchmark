@@ -27,7 +27,7 @@ on:
         required: false
         default: ""
       skip_git_sync:
-        description: "Skip git pull on droplet (leave unchecked for normal runs)"
+        description: "Skip git pull on droplet (leave UNCHECKED for normal runs)"
         type: boolean
         default: false
 
