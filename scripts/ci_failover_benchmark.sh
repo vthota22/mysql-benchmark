@@ -102,23 +102,31 @@ _normalize_ci_flags() {
 }
 
 _validate_required() {
-  if [[ -z "${BENCHMARK_SSH_PRIVATE_KEY:-}" && ( -z "${SSH_KEY_FILE}" || ! -f "${SSH_KEY_FILE}" ) ]]; then
-    echo "ERROR: provide CI_SSH_KEY_FILE or BENCHMARK_SSH_PRIVATE_KEY" >&2
-    exit 1
+  echo "Validating required inputs..."
+  if [[ -z "${SSH_KEY_FILE}" || ! -f "${SSH_KEY_FILE}" ]]; then
+    if [[ -z "${BENCHMARK_SSH_PRIVATE_KEY:-}" ]]; then
+      echo "ERROR: provide CI_SSH_KEY_FILE or BENCHMARK_SSH_PRIVATE_KEY"
+      exit 1
+    fi
+  else
+    echo "  SSH key file: ${SSH_KEY_FILE}"
   fi
   if [[ -z "${DROPLET_HOST}" ]]; then
-    echo "ERROR: BENCHMARK_DROPLET_HOST is required (repository variable or ci/benchmark-target.conf)" >&2
+    echo "ERROR: BENCHMARK_DROPLET_HOST is required (repository variable or ci/benchmark-target.conf)"
     exit 1
   fi
+  echo "  DROPLET_HOST=${DROPLET_HOST}"
   if [[ -z "${REMOTE_REPO}" ]]; then
-    echo "ERROR: BENCHMARK_REMOTE_REPO is required (repository variable or ci/benchmark-target.conf)" >&2
+    echo "ERROR: BENCHMARK_REMOTE_REPO is required (repository variable or ci/benchmark-target.conf)"
     exit 1
   fi
+  echo "  REMOTE_REPO=${REMOTE_REPO}"
 }
 
 _setup_ssh_key() {
+  echo "Setting up SSH key..."
   if [[ -n "${SSH_KEY_FILE}" && -f "${SSH_KEY_FILE}" ]]; then
-    chmod 600 "${SSH_KEY_FILE}"
+    chmod 600 "${SSH_KEY_FILE}" || true
   elif [[ -n "${BENCHMARK_SSH_PRIVATE_KEY:-}" ]]; then
     mkdir -p "${ARTIFACTS_DIR}/.ssh"
     SSH_KEY_FILE="${ARTIFACTS_DIR}/.ssh/benchmark_ci_key"
@@ -127,25 +135,49 @@ _setup_ssh_key() {
     printf '%s\n' "${BENCHMARK_SSH_PRIVATE_KEY}" > "${SSH_KEY_FILE}"
     chmod 600 "${SSH_KEY_FILE}"
   else
-    echo "ERROR: no SSH private key provided (CI_SSH_KEY_FILE or BENCHMARK_SSH_PRIVATE_KEY)" >&2
+    echo "ERROR: no SSH private key provided (CI_SSH_KEY_FILE or BENCHMARK_SSH_PRIVATE_KEY)"
     exit 1
   fi
 
+  # GitHub secrets sometimes include Windows CRLF; strip CR so ssh-keygen accepts the key.
+  if command -v sed >/dev/null 2>&1; then
+    sed -i 's/\r$//' "${SSH_KEY_FILE}" 2>/dev/null \
+      || sed -i.bak 's/\r$//' "${SSH_KEY_FILE}" 2>/dev/null \
+      || true
+  fi
+  # Ensure trailing newline.
+  if [[ -s "${SSH_KEY_FILE}" ]] && [[ "$(tail -c1 "${SSH_KEY_FILE}" | wc -l)" -eq 0 ]]; then
+    printf '\n' >> "${SSH_KEY_FILE}"
+  fi
+  chmod 600 "${SSH_KEY_FILE}"
+
   if [[ ! -s "${SSH_KEY_FILE}" ]]; then
-    echo "ERROR: SSH key file is empty: ${SSH_KEY_FILE}" >&2
+    echo "ERROR: SSH key file is empty: ${SSH_KEY_FILE}"
     exit 1
   fi
-  if ! grep -qE 'BEGIN (OPENSSH |RSA |EC |DSA )?PRIVATE KEY' "${SSH_KEY_FILE}"; then
-    echo "ERROR: SSH key file does not look like a private key: ${SSH_KEY_FILE}" >&2
-    echo "       Paste the full private key into secret BENCHMARK_SSH_PRIVATE_KEY (not the .pub file)." >&2
+
+  local first_line
+  first_line="$(head -1 "${SSH_KEY_FILE}" | tr -d '\r')"
+  echo "  key header: ${first_line}"
+  echo "  key bytes: $(wc -c < "${SSH_KEY_FILE}" | tr -d ' ')"
+
+  if [[ "${first_line}" != *"PRIVATE KEY"* ]]; then
+    echo "ERROR: SSH key file does not look like a private key"
+    echo "       Expected a line like: -----BEGIN OPENSSH PRIVATE KEY-----"
+    echo "       Got: ${first_line}"
+    echo "       Paste the full private key into secret BENCHMARK_SSH_PRIVATE_KEY (not the .pub file)."
     exit 1
   fi
-  if ! ssh-keygen -y -f "${SSH_KEY_FILE}" >/dev/null 2>&1; then
-    echo "ERROR: SSH private key is invalid or passphrase-protected: ${SSH_KEY_FILE}" >&2
-    echo "       Use an unencrypted deploy key for CI." >&2
+
+  local pubkey
+  if ! pubkey="$(ssh-keygen -y -f "${SSH_KEY_FILE}" 2>&1)"; then
+    echo "ERROR: SSH private key is invalid or passphrase-protected"
+    echo "       ssh-keygen says: ${pubkey}"
+    echo "       Use an unencrypted key (ssh-keygen -N \"\")."
     exit 1
   fi
-  echo "SSH key loaded: ${SSH_KEY_FILE} ($(wc -c < "${SSH_KEY_FILE}") bytes)"
+  echo "  pubkey fingerprint: $(ssh-keygen -lf "${SSH_KEY_FILE}" 2>/dev/null | awk '{print $1" "$2}' || true)"
+  echo "SSH key loaded OK"
 }
 
 _ssh() {
@@ -221,14 +253,24 @@ _dump_failure_diagnostics() {
     echo "droplet_git_branch=${DROPLET_GIT_BRANCH}"
     echo "results_dir=${RESULTS_DIR:-}"
     echo "ssh_key_file=${SSH_KEY_FILE:-}"
+    echo "ssh_key_exists=$([ -f "${SSH_KEY_FILE:-}" ] && echo yes || echo no)"
     echo "failed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } > "${DIAG_DIR}/failure_reason.env"
+  echo "Wrote ${DIAG_DIR}/failure_reason.env"
+  cat "${DIAG_DIR}/failure_reason.env"
 
   if [[ -z "${SSH_KEY_FILE:-}" || ! -f "${SSH_KEY_FILE}" ]]; then
-    echo "Skipping remote SSH diagnostics (SSH key file not configured)." > "${DIAG_DIR}/remote_diagnostics.txt"
+    echo "Skipping remote SSH diagnostics (SSH key file not configured)." | tee "${DIAG_DIR}/remote_diagnostics.txt"
     echo "Diagnostics written to ${DIAG_DIR}/"
     return 0
   fi
+
+  if ! ssh-keygen -y -f "${SSH_KEY_FILE}" >/dev/null 2>&1; then
+    echo "Skipping remote SSH diagnostics (SSH key failed ssh-keygen -y)." | tee "${DIAG_DIR}/remote_diagnostics.txt"
+    echo "Diagnostics written to ${DIAG_DIR}/"
+    return 0
+  fi
+
   local repo_q conf_q ctl_q
   repo_q="$(printf '%q' "${REMOTE_REPO}")"
   conf_q="$(printf '%q' "$(_remote_conf_path)")"
@@ -556,7 +598,10 @@ _cleanup_on_exit() {
   local rc=$?
   trap - EXIT
   if [[ ${rc} -ne 0 ]]; then
-    _dump_failure_diagnostics "exit ${rc}" 2>/dev/null || true
+    echo ""
+    echo "=== FAILURE (exit ${rc}) — collecting diagnostics ==="
+    # Do not swallow stderr; we need to see why setup/SSH failed.
+    _dump_failure_diagnostics "exit ${rc}" || true
   fi
   exit "${rc}"
 }

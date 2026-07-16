@@ -77,17 +77,25 @@ jobs:
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/ci-ssh"
           chmod 700 "${RUNNER_TEMP}/ci-ssh"
-          # Write multiline secret to file (more reliable than passing via env to bash).
-          printf '%s\n' "${BENCHMARK_SSH_PRIVATE_KEY}" > "${RUNNER_TEMP}/ci-ssh/benchmark_ci_key"
-          chmod 600 "${RUNNER_TEMP}/ci-ssh/benchmark_ci_key"
-          if [[ ! -s "${RUNNER_TEMP}/ci-ssh/benchmark_ci_key" ]]; then
+          KEY_FILE="${RUNNER_TEMP}/ci-ssh/benchmark_ci_key"
+          # Write multiline secret; strip CR (Windows pastes break ssh-keygen).
+          printf '%s\n' "${BENCHMARK_SSH_PRIVATE_KEY}" > "${KEY_FILE}"
+          sed -i 's/\r$//' "${KEY_FILE}"
+          # Ensure trailing newline
+          if [[ "$(tail -c1 "${KEY_FILE}" | wc -l)" -eq 0 ]]; then
+            printf '\n' >> "${KEY_FILE}"
+          fi
+          chmod 600 "${KEY_FILE}"
+          if [[ ! -s "${KEY_FILE}" ]]; then
             echo "ERROR: SSH key file is empty after write"
             exit 1
           fi
-          ssh-keygen -y -f "${RUNNER_TEMP}/ci-ssh/benchmark_ci_key" > "${RUNNER_TEMP}/ci-ssh/benchmark_ci_key.pub"
-          echo "SSH key installed for CI ($(wc -c < "${RUNNER_TEMP}/ci-ssh/benchmark_ci_key") bytes)"
+          echo "Key header: $(head -1 "${KEY_FILE}")"
+          echo "Key bytes: $(wc -c < "${KEY_FILE}" | tr -d ' ')"
+          ssh-keygen -y -f "${KEY_FILE}" > "${KEY_FILE}.pub"
+          echo "SSH key installed for CI"
           echo "Public key fingerprint:"
-          ssh-keygen -lf "${RUNNER_TEMP}/ci-ssh/benchmark_ci_key.pub"
+          ssh-keygen -lf "${KEY_FILE}.pub"
         env:
           BENCHMARK_SSH_PRIVATE_KEY: ${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}
 
