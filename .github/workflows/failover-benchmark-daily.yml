@@ -108,26 +108,17 @@ jobs:
           echo "BENCHMARK_REMOTE_REPO=${BENCHMARK_REMOTE_REPO}"
           echo "BENCHMARK_DROPLET_GIT_BRANCH=${BENCHMARK_DROPLET_GIT_BRANCH}"
           echo "CI_SSH_KEY_FILE=${CI_SSH_KEY_FILE}"
-          test -f "${CI_SSH_KEY_FILE}" && echo "SSH key file: OK" || echo "SSH key file: MISSING"
-          chmod +x scripts/ci_failover_benchmark.sh
-          ./scripts/ci_failover_benchmark.sh || {
-            echo "Benchmark script failed. Dumping diagnostics..."
-            if [[ -d "${CI_ARTIFACTS_DIR}" ]]; then
-              find "${CI_ARTIFACTS_DIR}" -maxdepth 4 -type f | sed 's/^/ - /'
-              if [[ -f "${CI_ARTIFACTS_DIR}/diagnostics/remote_diagnostics.txt" ]]; then
-                echo "----- remote_diagnostics.txt -----"
-                cat "${CI_ARTIFACTS_DIR}/diagnostics/remote_diagnostics.txt"
-              fi
-              while IFS= read -r f; do
-                [[ -n "${f}" && -f "${f}" ]] || continue
-                echo "----- ${f} (tail -100) -----"
-                tail -100 "${f}" || true
-              done < <(find "${CI_ARTIFACTS_DIR}" \( -name '*.log' -o -name 'failover_kpi.csv' -o -name 'remote_diagnostics.txt' \) | head -n 8)
-            else
-              echo "No CI artifacts directory found: ${CI_ARTIFACTS_DIR}"
-            fi
+          test -f "${CI_SSH_KEY_FILE}" && echo "SSH key file: OK ($(wc -c < "${CI_SSH_KEY_FILE}") bytes)" || {
+            echo "SSH key file: MISSING"
             exit 1
           }
+          chmod +x scripts/ci_failover_benchmark.sh
+          # stdbuf -oL: line-buffered logs so GHA shows progress while polling
+          if command -v stdbuf >/dev/null 2>&1; then
+            stdbuf -oL -eL ./scripts/ci_failover_benchmark.sh
+          else
+            ./scripts/ci_failover_benchmark.sh
+          fi
 
       - name: Upload benchmark artifacts
         if: always()

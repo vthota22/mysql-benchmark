@@ -169,7 +169,13 @@ _ssh_capture() {
     echo "${out}" >&2
     return "${rc}"
   fi
-  printf '%s' "${out}"
+  # Always end with newline so callers can parse safely.
+  printf '%s\n' "${out}"
+}
+
+_step() {
+  echo ""
+  echo ">>> $*"
 }
 
 _scp_from() {
@@ -251,19 +257,46 @@ _dump_failure_diagnostics() {
   echo "Diagnostics written to ${DIAG_DIR}/"
 }
 
+_remote_contains() {
+  local label="$1"
+  local needle="$2"
+  shift 2
+  local out
+  out="$(_ssh_capture "${label}" "$@")" || return 1
+  if [[ "${out}" != *"${needle}"* ]]; then
+    echo "ERROR: preflight '${label}' missing expected marker '${needle}'" >&2
+    echo "${out}" >&2
+    return 1
+  fi
+  return 0
+}
+
 _sync_repo() {
+  local repo_q branch_q out
+  repo_q="$(printf '%q' "${REMOTE_REPO}")"
+  branch_q="$(printf '%q' "${DROPLET_GIT_BRANCH}")"
+
   if [[ "${CI_GIT_SYNC}" != "1" ]]; then
-    echo "--- Skipping git sync (CI_GIT_SYNC=0); using existing droplet checkout ---"
-    _ssh_capture "repo HEAD" "set -euo pipefail; cd $(printf '%q' "${REMOTE_REPO}"); git rev-parse --abbrev-ref HEAD; git rev-parse --short HEAD" \
-      | sed 's/^/  /' || return 1
+    _step "Skipping git sync (CI_GIT_SYNC=0)"
+    out="$(_ssh_capture "repo HEAD" "set -euo pipefail; cd ${repo_q}; git rev-parse --abbrev-ref HEAD; git rev-parse --short HEAD")" || return 1
+    echo "${out}" | sed 's/^/  /'
     return 0
   fi
 
-  local repo_q branch_cmd=""
-  repo_q="$(printf '%q' "${REMOTE_REPO}")"
-  branch_cmd="git fetch origin ${DROPLET_GIT_BRANCH} && git checkout ${DROPLET_GIT_BRANCH} && git pull --ff-only origin ${DROPLET_GIT_BRANCH}"
-  echo "--- Syncing droplet repo (${REMOTE_REPO}) to branch ${DROPLET_GIT_BRANCH} ---"
-  _ssh_capture "git sync" "set -euo pipefail; cd ${repo_q}; ${branch_cmd}"
+  _step "Syncing droplet repo to origin/${DROPLET_GIT_BRANCH}"
+  # Prefer fetch + hard reset over pull: avoids ff-only failures and dirty-index edge cases.
+  # benchmark.conf is gitignored and is preserved.
+  out="$(_ssh_capture "git sync" "set -euo pipefail
+    cd ${repo_q}
+    git remote -v
+    git fetch --prune origin ${branch_q}
+    git checkout ${branch_q} 2>/dev/null || git checkout -B ${branch_q} origin/${branch_q}
+    git reset --hard origin/${branch_q}
+    git rev-parse --abbrev-ref HEAD
+    git rev-parse --short HEAD
+    git status -sb
+  ")" || return 1
+  echo "${out}" | sed 's/^/  /'
 }
 
 _preflight_remote() {
@@ -273,14 +306,37 @@ _preflight_remote() {
   ctl_q="$(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh")"
   run_q="$(printf '%q' "${REMOTE_REPO}/run_failover_benchmark.sh")"
 
-  echo "--- Preflight checks on droplet ---"
-  _ssh_capture "SSH connectivity" "echo SSH_OK" >/dev/null
-  _ssh_capture "repo path" "test -d ${repo_q} && echo REPO_OK" | grep -q REPO_OK
-  _ssh_capture "benchmark.conf" "test -f ${conf_q} && echo CONF_OK" | grep -q CONF_OK
-  _ssh_capture "ctl script" "test -x ${ctl_q} && echo CTL_OK" | grep -q CTL_OK
-  _ssh_capture "run script" "test -x ${run_q} && echo RUN_OK" | grep -q RUN_OK
+  _step "Preflight checks on droplet"
+  # Avoid `cmd | grep -q` (SIGPIPE + pipefail can abort the script under set -e).
+  _remote_contains "SSH connectivity" "SSH_OK" "echo SSH_OK"
+  _remote_contains "repo path" "REPO_OK" "test -d ${repo_q} && echo REPO_OK"
+  _remote_contains "benchmark.conf" "CONF_OK" "test -f ${conf_q} && echo CONF_OK"
+  _remote_contains "ctl script" "CTL_OK" "test -x ${ctl_q} && echo CTL_OK"
+  _remote_contains "run script" "RUN_OK" "test -x ${run_q} && echo RUN_OK"
   echo "Preflight OK"
-  echo ""
+}
+
+_ctl_status() {
+  local repo_q conf_q ctl_q
+  repo_q="$(printf '%q' "${REMOTE_REPO}")"
+  conf_q="$(printf '%q' "$(_remote_conf_path)")"
+  ctl_q="$(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh")"
+  _ssh_capture "failover_run_ctl status" \
+    "set -euo pipefail; cd ${repo_q}; BENCHMARK_CONF=${conf_q} ${ctl_q} status"
+}
+
+_attach_if_running() {
+  local status_out
+  status_out="$(_ctl_status)" || return 1
+  echo "${status_out}" | sed 's/^/  /'
+  _parse_status "${status_out}"
+
+  if [[ "${RUNNING:-0}" == "1" && -n "${RESULTS_DIR:-}" ]]; then
+    CI_EXPECTED_RESULTS_DIR="${RESULTS_DIR}"
+    echo "Benchmark already running — attaching to ${CI_EXPECTED_RESULTS_DIR}"
+    return 0
+  fi
+  return 1
 }
 
 _start_run() {
@@ -289,17 +345,11 @@ _start_run() {
   conf_q="$(printf '%q' "$(_remote_conf_path)")"
   ctl_q="$(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh")"
 
-  status_out="$(_ssh_capture "failover_run_ctl status (pre-start)" \
-    "set -euo pipefail; cd ${repo_q}; BENCHMARK_CONF=${conf_q} ${ctl_q} status")"
-  _parse_status "${status_out}"
-
-  if [[ "${RUNNING:-0}" == "1" && -n "${RESULTS_DIR:-}" ]]; then
-    CI_EXPECTED_RESULTS_DIR="${RESULTS_DIR}"
-    echo "--- Benchmark already running on droplet; attaching to ${CI_EXPECTED_RESULTS_DIR} ---"
+  if _attach_if_running; then
     return 0
   fi
 
-  echo "--- Starting failover benchmark on droplet ---"
+  _step "Starting failover benchmark on droplet"
   start_out="$(_ssh_capture "failover_run_ctl start" "set -euo pipefail; cd ${repo_q}; BENCHMARK_CONF=${conf_q} ${ctl_q} start")"
   echo "${start_out}"
 
@@ -307,15 +357,14 @@ _start_run() {
   if [[ -z "${results_dir}" ]]; then
     echo "WARN: could not parse results_dir from start output; querying status" >&2
     sleep 2
-    status_out="$(_ssh_capture "failover_run_ctl status (post-start)" \
-      "set -euo pipefail; cd ${repo_q}; BENCHMARK_CONF=${conf_q} ${ctl_q} status")"
+    status_out="$(_ctl_status)" || return 1
     echo "${status_out}"
     results_dir="$(sed -n 's/^results_dir=//p' <<< "${status_out}" | tail -1)"
     _parse_status "${status_out}"
   fi
 
-  if [[ -z "${results_dir}" ]]; then
-    echo "ERROR: could not determine results_dir after start" >&2
+  if [[ -z "${results_dir}" || "${results_dir}" == "results/failover_pending" ]]; then
+    echo "ERROR: could not determine results_dir after start (got '${results_dir:-}')" >&2
     return 1
   fi
 
@@ -441,39 +490,36 @@ _fetch_artifacts() {
 
 main() {
   local git_sync_from_env="${CI_GIT_SYNC:-}"
+  local status_out
 
+  _step "Load config / validate"
   _load_kv_file "${CONFIG_FILE}"
   _apply_env_overrides
   _normalize_ci_flags "${git_sync_from_env}"
   _validate_required
   _setup_ssh_key
   _log_runtime_config
+
   _preflight_remote
-  _sync_repo
 
-  if [[ "${CI_SKIP_START:-0}" != "1" ]]; then
-    _start_run
+  # If a run is already in progress, attach and skip git sync (avoid disrupting the live harness).
+  _step "Check for in-progress benchmark"
+  if [[ "${CI_SKIP_START:-0}" != "1" ]] && _attach_if_running; then
+    echo "Skipping git sync because a run is already in progress."
   else
-    echo "--- CI_SKIP_START=1: not launching a new benchmark ---"
+    _sync_repo
+    if [[ "${CI_SKIP_START:-0}" != "1" ]]; then
+      _start_run
+    else
+      _step "CI_SKIP_START=1 — not launching a new benchmark"
+    fi
   fi
 
-  local status_out
-  status_out="$(_ssh_capture "failover_run_ctl status" \
-    "cd $(printf '%q' "${REMOTE_REPO}") && BENCHMARK_CONF=$(printf '%q' "$(_remote_conf_path)") $(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh") status")"
+  # Always poll for the tracked run; never treat a stale completed=1 as success.
+  _poll_until_complete
+  status_out="$(_ctl_status)" || true
+  echo "${status_out}" | sed 's/^/  /'
   _parse_status "${status_out}"
-
-  # Always poll when we started a new run; do not trust stale completed=1 from older runs.
-  if [[ "${CI_SKIP_START:-0}" != "1" ]]; then
-    _poll_until_complete
-    status_out="$(_ssh_capture "failover_run_ctl status" \
-      "cd $(printf '%q' "${REMOTE_REPO}") && BENCHMARK_CONF=$(printf '%q' "$(_remote_conf_path)") $(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh") status")"
-    _parse_status "${status_out}"
-  elif [[ "${COMPLETED:-0}" != "1" ]]; then
-    _poll_until_complete
-    status_out="$(_ssh_capture "failover_run_ctl status" \
-      "cd $(printf '%q' "${REMOTE_REPO}") && BENCHMARK_CONF=$(printf '%q' "$(_remote_conf_path)") $(printf '%q' "${REMOTE_REPO}/scripts/failover_run_ctl.sh") status")"
-    _parse_status "${status_out}"
-  fi
 
   if [[ -n "${CI_EXPECTED_RESULTS_DIR}" ]]; then
     RESULTS_DIR="${CI_EXPECTED_RESULTS_DIR}"
@@ -481,26 +527,29 @@ main() {
 
   if [[ -z "${RESULTS_DIR:-}" ]]; then
     echo "ERROR: no results_dir from ctl status" >&2
-    _dump_failure_diagnostics "missing results_dir"
     exit 1
   fi
 
-  if [[ "${COMPLETED:-0}" != "1" ]]; then
-    echo "ERROR: benchmark did not complete successfully for ${RESULTS_DIR}" >&2
-    _dump_failure_diagnostics "benchmark not completed"
-    exit 1
+  # Confirm completion for the tracked directory (not some older run).
+  if [[ "${COMPLETED:-0}" != "1" || ( -n "${CI_EXPECTED_RESULTS_DIR}" && "${RESULTS_DIR}" != "${CI_EXPECTED_RESULTS_DIR}" ) ]]; then
+    # Re-check completion marker directly for the expected dir.
+    if ! _ssh "grep -q '=== Failover benchmark complete ===' $(printf '%q' "${REMOTE_REPO}/${RESULTS_DIR}/full_run.log") 2>/dev/null"; then
+      echo "ERROR: benchmark did not complete successfully for ${RESULTS_DIR}" >&2
+      exit 1
+    fi
+    COMPLETED=1
   fi
 
   _fetch_artifacts "${RESULTS_DIR}"
 
   if [[ ! -f "${ARTIFACTS_DIR}/${RESULTS_DIR##*/}/failover_report.html" ]]; then
     echo "ERROR: HTML report was not fetched" >&2
-    _dump_failure_diagnostics "html report missing"
     exit 1
   fi
 
   echo ""
   echo "=== CI failover benchmark complete ==="
+  echo "Results: ${RESULTS_DIR}"
 }
 
 _cleanup_on_exit() {
