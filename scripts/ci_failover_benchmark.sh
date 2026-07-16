@@ -71,14 +71,17 @@ _load_kv_file() {
 }
 
 _apply_env_overrides() {
-  [[ -n "${BENCHMARK_DROPLET_HOST:-}" ]] && DROPLET_HOST="${BENCHMARK_DROPLET_HOST}"
-  [[ -n "${BENCHMARK_DROPLET_USER:-}" ]] && DROPLET_USER="${BENCHMARK_DROPLET_USER}"
-  [[ -n "${BENCHMARK_DROPLET_SSH_PORT:-}" ]] && DROPLET_SSH_PORT="${BENCHMARK_DROPLET_SSH_PORT}"
-  [[ -n "${BENCHMARK_REMOTE_REPO:-}" ]] && REMOTE_REPO="${BENCHMARK_REMOTE_REPO}"
-  [[ -n "${BENCHMARK_REMOTE_BENCHMARK_CONF:-}" ]] && REMOTE_BENCHMARK_CONF="${BENCHMARK_REMOTE_BENCHMARK_CONF}"
-  [[ -n "${BENCHMARK_DROPLET_GIT_BRANCH:-}" ]] && DROPLET_GIT_BRANCH="${BENCHMARK_DROPLET_GIT_BRANCH}"
-  [[ -n "${CI_POLL_INTERVAL_SEC_OVERRIDE:-}" ]] && CI_POLL_INTERVAL_SEC="${CI_POLL_INTERVAL_SEC_OVERRIDE}"
-  [[ -n "${CI_MAX_WAIT_SEC_OVERRIDE:-}" ]] && CI_MAX_WAIT_SEC="${CI_MAX_WAIT_SEC_OVERRIDE}"
+  # IMPORTANT: under `set -e`, a function's exit status is the last command.
+  # A failing `[[ -n ... ]] && ...` as the last line would abort the script.
+  if [[ -n "${BENCHMARK_DROPLET_HOST:-}" ]]; then DROPLET_HOST="${BENCHMARK_DROPLET_HOST}"; fi
+  if [[ -n "${BENCHMARK_DROPLET_USER:-}" ]]; then DROPLET_USER="${BENCHMARK_DROPLET_USER}"; fi
+  if [[ -n "${BENCHMARK_DROPLET_SSH_PORT:-}" ]]; then DROPLET_SSH_PORT="${BENCHMARK_DROPLET_SSH_PORT}"; fi
+  if [[ -n "${BENCHMARK_REMOTE_REPO:-}" ]]; then REMOTE_REPO="${BENCHMARK_REMOTE_REPO}"; fi
+  if [[ -n "${BENCHMARK_REMOTE_BENCHMARK_CONF:-}" ]]; then REMOTE_BENCHMARK_CONF="${BENCHMARK_REMOTE_BENCHMARK_CONF}"; fi
+  if [[ -n "${BENCHMARK_DROPLET_GIT_BRANCH:-}" ]]; then DROPLET_GIT_BRANCH="${BENCHMARK_DROPLET_GIT_BRANCH}"; fi
+  if [[ -n "${CI_POLL_INTERVAL_SEC_OVERRIDE:-}" ]]; then CI_POLL_INTERVAL_SEC="${CI_POLL_INTERVAL_SEC_OVERRIDE}"; fi
+  if [[ -n "${CI_MAX_WAIT_SEC_OVERRIDE:-}" ]]; then CI_MAX_WAIT_SEC="${CI_MAX_WAIT_SEC_OVERRIDE}"; fi
+  return 0
 }
 
 _normalize_ci_flags() {
@@ -536,8 +539,11 @@ main() {
 
   _step "Load config / validate"
   _load_kv_file "${CONFIG_FILE}"
+  echo "  config file loaded (or missing): ${CONFIG_FILE}"
   _apply_env_overrides
+  echo "  env overrides applied (host=${DROPLET_HOST} repo=${REMOTE_REPO})"
   _normalize_ci_flags "${git_sync_from_env}"
+  echo "  flags normalized (CI_GIT_SYNC=${CI_GIT_SYNC} branch=${DROPLET_GIT_BRANCH})"
   _validate_required
   _setup_ssh_key
   _log_runtime_config
