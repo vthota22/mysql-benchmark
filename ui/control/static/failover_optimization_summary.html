@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Failover optimization — stakeholder summary</title>
+  <style>
+    :root {
+      --bg: #0f172a; --card: #1e293b; --text: #e2e8f0; --muted: #94a3b8;
+      --accent: #38bdf8; --border: #334155; --warn: #fbbf24;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg); color: var(--text); margin: 0; padding: 1.5rem 1.25rem 3rem;
+      line-height: 1.55; max-width: 1200px; margin-inline: auto;
+    }
+    h1 { font-size: 1.65rem; margin: 0 0 0.35rem; }
+    h2 { font-size: 1.05rem; color: var(--accent); margin: 0 0 0.75rem; }
+    .subtitle { color: var(--muted); margin-bottom: 1.25rem; }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+      padding: 1rem 1.25rem; margin-bottom: 1rem;
+    }
+    .muted { color: var(--muted); font-size: 0.88rem; }
+    .table-scroll { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    th, td { padding: 0.5rem 0.65rem; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+    th { color: var(--muted); font-weight: 500; white-space: nowrap; }
+    td { font-variant-numeric: tabular-nums; }
+    a { color: var(--accent); }
+    .badge-warn {
+      display: inline-block; margin-left: 0.35rem; padding: 0.05rem 0.35rem;
+      border-radius: 4px; background: rgba(251,191,36,0.15); color: var(--warn);
+      font-size: 0.72rem; font-weight: 600;
+    }
+    ul { margin: 0.5rem 0 0; padding-left: 1.2rem; color: var(--muted); }
+    li { margin: 0.35rem 0; }
+  </style>
+</head>
+<body>
+  <h1>Failover optimization — stakeholder summary</h1>
+  <p class="subtitle">
+    Cluster: <strong>vt-failover-multi</strong> · 3-node Advanced · slug
+    <code>mysql-g-16vcpu-128gb-800GIB</code> · mixed TPC-C · 16 threads · ~5&nbsp;GB data
+  </p>
+
+  <div class="card">
+    <h2>Source reports</h2>
+    <div class="table-scroll"><table><thead><tr><th>Run</th><th>Phase</th><th>Report</th><th>Started (UTC)</th></tr></thead><tbody><tr><td>Before · Jul 5 03:16 UTC</td><td>Before optimization</td><td><a href="/reports/results/failover_20260705_031654/advanced/graphs/failover_report.html">failover_20260705_031654</a></td><td>2026-07-05 03:16 UTC</td></tr><tr><td>Before · Jul 7 00:58 UTC</td><td>Before optimization</td><td><a href="/reports/results/failover_20260707_005811/advanced/graphs/failover_report.html">failover_20260707_005811</a></td><td>2026-07-07 00:58 UTC</td></tr><tr><td>After 5k · Jul 5 09:24 UTC</td><td>After 5k</td><td><a href="/reports/results/failover_20260705_092431/advanced/graphs/failover_report.html">failover_20260705_092431</a></td><td>2026-07-05 09:24 UTC</td></tr><tr><td>After 5k · Jul 6 17:42 UTC</td><td>After 5k</td><td><a href="/reports/results/failover_20260706_174206/advanced/graphs/failover_report.html">failover_20260706_174206</a></td><td>2026-07-06 17:42 UTC</td></tr></tbody></table></div>
+  </div>
+
+  <div class="card">
+    <h2>Executive comparison</h2>
+    <p class="muted" style="margin-top:0">
+      Median and min–max across all iterations in each phase (6 before, 6 after).
+      <strong>Time to promote (valid)</strong> excludes false positives where promote &lt; 1&nbsp;s
+      but failure detection &gt; 5&nbsp;s (GR already elected before the client VIP saw outage — sub-second
+      promote is not a real improvement). Raw median including those artifacts is shown in the next column.
+    </p>
+    <div class="table-scroll"><table><thead><tr><th>Configuration</th><th>Iters</th><th>Detect failure</th><th>Promote (valid median · range)</th><th>Promote (raw median · range)</th><th>Total outage (detect + promote)</th><th>Baseline TPS</th><th>Baseline p95 latency</th></tr></thead><tbody><tr><td>Before optimization</td><td>6</td><td>median 1.19 s · range 102 ms – 446.85 s</td><td>median 40.25 s · range 5.75 s – 68 s</td><td>median 26.38 s · range 250 ms – 68 s</td><td>median 65.76 s · range 13.68 s – 452.60 s</td><td>median 405 s · range 333 s – 443 s</td><td>median 88 s · range 79 s – 125 s</td></tr><tr><td>After optimization (5k + parallel applier)</td><td>6</td><td>median 1 s · range 102 ms – 77.60 s</td><td>median 20.50 s · range 8.75 s – 26.75 s</td><td>median 20.50 s · range 500 ms – 26.75 s</td><td>median 21.55 s · range 11.18 s – 78.10 s</td><td>median 363 s · range 258 s – 445 s</td><td>median 178 s · range 78 s – 401 s</td></tr></tbody></table></div>
+    <ul>
+      <li>Before valid promote median: <strong>median 40.25 s · range 5.75 s – 68 s</strong>
+        (1 false-positive iteration(s) excluded from valid column)</li>
+      <li>After valid promote median: <strong>median 20.50 s · range 8.75 s – 26.75 s</strong>
+        (1 false-positive iteration(s) excluded)</li>
+      <li>Total outage median improved from <strong>median 65.76 s · range 13.68 s – 452.60 s</strong>
+        to <strong>median 21.55 s · range 11.18 s – 78.10 s</strong></li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>Phase medians — promote sub-components</h2>
+    <div class="table-scroll"><table><thead><tr><th>Configuration</th><th>GR election (median · range)</th><th>HAProxy routing (median · range)</th><th>Replication / apply lag (median · range)</th><th>Promote valid (median · range)</th></tr></thead><tbody><tr><td>Before optimization</td><td>median 125 ms · range 0 ms – 1 s</td><td>median 2.88 s · range 0 ms – 67.75 s</td><td>median 3.88 s · range 0 ms – 60.25 s</td><td>median 40.25 s · range 5.75 s – 68 s</td></tr><tr><td>After optimization (5k + parallel applier)</td><td>median 0 ms · range 0 ms – 500 ms</td><td>median 6.12 s · range 500 ms – 26.25 s</td><td>median 0 ms · range 0 ms – 19.25 s</td><td>median 20.50 s · range 8.75 s – 26.75 s</td></tr></tbody></table></div>
+  </div>
+
+  <p class="muted">Generated by <code>scripts/generate_failover_stakeholder_report.py</code>.
+  Open individual runs from the links above for charts and cluster internals.</p>
+</body>
+</html>

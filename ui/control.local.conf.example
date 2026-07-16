@@ -1,0 +1,22 @@
+# Control UI — local or App Platform
+#
+#   cp control.local.conf.example control.local.conf
+#   python3 control_ui.py
+#
+# On App Platform, prefer env vars instead of this file:
+#   BENCHMARK_DROPLET_MAP, BENCHMARK_REMOTE_REPO, BENCHMARK_SSH_PRIVATE_KEY
+
+DROPLET_HOST=209.38.88.104
+DROPLET_NAME=high2
+DROPLET_USER=root
+DROPLET_SSH_PORT=22
+# DROPLET_SSH_KEY=~/.ssh/mysql-benchmark-gha
+
+# Global droplet picker (name:ip, comma-separated)
+DROPLET_MAP=high2:209.38.88.104,multi:174.138.56.251
+
+REMOTE_REPO=/root/mysql-benchmark
+REMOTE_BENCHMARK_CONF=benchmark.conf
+
+# RUNS_MIN_ID=failover_20260702_020852
+# COMPARE_RUNS_LIMIT=6

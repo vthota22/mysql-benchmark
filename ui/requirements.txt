@@ -1,0 +1,2 @@
+# Stdlib-only UI server (http.server + system ssh/scp).
+# Keep empty / pin nothing unless you add dependencies later.

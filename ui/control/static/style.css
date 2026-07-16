@@ -33,12 +33,76 @@ body {
 }
 
 header, main {
-  max-width: 960px;
+  max-width: 1100px;
   margin: 0 auto;
   padding: 1.25rem;
 }
 
+.tab-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 1.25rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.tab-bar .tab {
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 8px 8px 0 0;
+  background: transparent;
+  color: var(--muted);
+  padding: 0.65rem 1rem;
+  margin-bottom: -1px;
+}
+
+.tab-bar .tab:hover {
+  color: var(--text);
+  background: rgba(59, 130, 246, 0.08);
+}
+
+.tab-bar .tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.tab-panel {
+  display: none;
+}
+
+.tab-panel.active {
+  display: block;
+}
+
 header h1 { margin: 0 0 0.25rem; font-size: 1.5rem; }
+
+.header-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.global-droplet-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  min-width: 220px;
+}
+
+.global-droplet-picker span {
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.global-droplet-picker select {
+  min-width: 220px;
+}
 
 .muted { color: var(--muted); }
 
@@ -75,6 +139,7 @@ header h1 { margin: 0 0 0.25rem; font-size: 1.5rem; }
 
 .field input[type="text"],
 .field input[type="number"],
+.field input[type="password"],
 .field select {
   width: 100%;
   padding: 0.45rem 0.55rem;
@@ -143,10 +208,103 @@ button:disabled {
   padding: 0.6rem 0.75rem;
   border-radius: 8px;
   border: 1px solid var(--border);
+  white-space: pre-wrap;
 }
 
 .message.ok { border-color: var(--ok); }
 .message.err { border-color: var(--err); }
+
+.prepare-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem 1.5rem;
+  align-items: flex-end;
+  margin-bottom: 1rem;
+}
+
+.profile-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-width: min(100%, 320px);
+}
+
+.profile-picker span {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.profile-picker select {
+  padding: 0.45rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+}
+
+.prepare-estimate {
+  flex: 1;
+  margin: 0;
+  font-size: 0.92rem;
+  align-self: center;
+}
+
+.prepare-watch-note {
+  margin: 0.35rem 0 0;
+  font-size: 0.88rem;
+}
+
+.prepare-droplet-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  margin-top: 0.75rem;
+}
+
+.prepare-droplet-cards.muted {
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.prepare-droplet-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.65rem 0.85rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1rem;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.prepare-droplet-card.active-watch {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.25);
+}
+
+.prepare-droplet-card .card-main {
+  flex: 1;
+  min-width: 200px;
+}
+
+.prepare-droplet-card .card-title {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.prepare-droplet-card .card-meta {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.prepare-droplet-card button.linkish {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 0.2rem 0;
+  font-size: 0.85rem;
+}
 
 .log {
   max-height: 360px;
@@ -169,14 +327,23 @@ button:disabled {
 
 .report-links a,
 .runs-list a,
-.top-nav a {
+.compare-table a,
+.top-nav a,
+.link-button {
   color: var(--accent);
   text-decoration: none;
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
 }
 
 .report-links a:hover,
 .runs-list a:hover,
-.top-nav a:hover {
+.compare-table a:hover,
+.top-nav a:hover,
+.link-button:hover {
   text-decoration: underline;
 }
 
@@ -197,6 +364,16 @@ button:disabled {
 .section-head .muted {
   margin: 0;
   flex: 1 1 240px;
+}
+
+.reports-head-actions {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.6rem;
+}
+
+.reports-head-actions .profile-picker {
+  min-width: 220px;
 }
 
 .runs-list .run-block {
@@ -252,6 +429,12 @@ button:disabled {
   margin-left: 0.35rem;
 }
 
+.badge.failed {
+  background: rgba(239, 68, 68, 0.15);
+  color: var(--err);
+  margin-left: 0.35rem;
+}
+
 .btn-generate {
   border: 1px solid var(--accent);
   background: transparent;
@@ -274,6 +457,63 @@ button:disabled {
 .btn-generate:disabled {
   opacity: 0.6;
   cursor: not-allowed;
+}
+
+.hidden {
+  display: none;
+}
+
+.compare-slice {
+  margin-bottom: 1.5rem;
+}
+
+.compare-slice:last-child {
+  margin-bottom: 0;
+}
+
+.compare-slice h3 {
+  margin: 0 0 0.65rem;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.compare-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+
+.compare-table th,
+.compare-table td {
+  padding: 0.55rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.compare-table thead th {
+  background: rgba(0, 0, 0, 0.15);
+  white-space: nowrap;
+}
+
+.compare-table tbody th {
+  font-weight: 500;
+  min-width: 220px;
+}
+
+.compare-table tbody tr:last-child th,
+.compare-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.compare-table td {
+  font-variant-numeric: tabular-nums;
 }
 
 @media (max-width: 640px) {

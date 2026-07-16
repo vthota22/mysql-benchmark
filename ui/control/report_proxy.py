@@ -2,13 +2,40 @@
 
 from __future__ import annotations
 
+import re
 import shlex
+from datetime import datetime, timezone
 from pathlib import Path
 
 from control.ssh_backend import SshBackend
 
 CACHE_DIR = Path(__file__).resolve().parent / ".report_cache"
 PRIMARY_REPORT_SUFFIX = "advanced/graphs/failover_report.html"
+_RUN_TS_RE = re.compile(r"^failover_(\d{8})_(\d{6})$")
+
+
+def run_timestamp_meta(run_id: str) -> dict[str, str]:
+    """Parse ``failover_YYYYMMDD_HHMMSS`` into ISO + display strings (UTC)."""
+    match = _RUN_TS_RE.match((run_id or "").strip())
+    if not match:
+        return {"started_at": "", "started_display": ""}
+    try:
+        dt = datetime.strptime(f"{match.group(1)}{match.group(2)}", "%Y%m%d%H%M%S").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return {"started_at": "", "started_display": ""}
+    return {
+        "started_at": dt.isoformat().replace("+00:00", "Z"),
+        "started_display": dt.strftime("%Y-%m-%d %H:%M:%S UTC"),
+    }
+
+
+def run_id_at_or_after(run_id: str, min_run_id: str) -> bool:
+    """True when run_id is min_run_id or a newer failover_* directory."""
+    if not min_run_id:
+        return True
+    return run_id >= min_run_id
 
 
 def validate_results_path(rel_path: str) -> str:
@@ -70,6 +97,12 @@ class ReportProxy:
         rel = validate_results_path(rel_path)
         return f"{self.backend.config.remote_repo.rstrip('/')}/{rel}"
 
+    def _cache_root(self) -> Path:
+        # Keep each droplet's reports in a separate subtree so run dirs with the
+        # same name on different droplets never collide in the local cache.
+        host = self.backend.config.host or "default"
+        return CACHE_DIR / host
+
     def remote_mtime(self, rel_path: str) -> int:
         remote = self._remote_path(rel_path)
         result = self.backend.run(
@@ -83,7 +116,7 @@ class ReportProxy:
 
     def fetch_to_cache(self, rel_path: str) -> Path:
         rel = validate_results_path(rel_path)
-        cache_path = CACHE_DIR / rel
+        cache_path = self._cache_root() / rel
         meta_path = cache_path.with_suffix(cache_path.suffix + ".remote_mtime")
 
         remote_mtime = self.remote_mtime(rel)
@@ -132,9 +165,11 @@ class ReportProxy:
         latest_results_dir: str = "",
         running_results_dir: str = "",
         running: bool = False,
+        runs_min_id: str = "",
     ) -> list[dict]:
         limit = max(1, min(limit, 100))
-        result = self.backend.ctl("list", str(limit))
+        fetch_limit = 100 if runs_min_id else limit
+        result = self.backend.ctl("list", str(fetch_limit))
         if result.returncode != 0:
             return []
 
@@ -190,9 +225,11 @@ class ReportProxy:
 
         runs: list[dict] = []
         for run in by_run.values():
+            if not run_id_at_or_after(run["run_id"], runs_min_id):
+                continue
             run["primary_report"] = pick_primary_report(run["reports"])
             runs.append(run)
-        return runs
+        return runs[:limit]
 
     def generate_html_reports(self, results_dir: str) -> None:
         results_dir = validate_results_path(results_dir)
