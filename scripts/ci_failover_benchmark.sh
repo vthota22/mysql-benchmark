@@ -23,6 +23,7 @@ SSH_KEY_FILE="${CI_SSH_KEY_FILE:-}"
 DIAG_DIR="${ARTIFACTS_DIR}/diagnostics"
 
 DROPLET_HOST=""
+DROPLET_NAME=""
 DROPLET_USER="root"
 DROPLET_SSH_PORT=22
 REMOTE_REPO=""
@@ -74,6 +75,7 @@ _apply_env_overrides() {
   # IMPORTANT: under `set -e`, a function's exit status is the last command.
   # A failing `[[ -n ... ]] && ...` as the last line would abort the script.
   if [[ -n "${BENCHMARK_DROPLET_HOST:-}" ]]; then DROPLET_HOST="${BENCHMARK_DROPLET_HOST}"; fi
+  if [[ -n "${BENCHMARK_DROPLET_NAME:-}" ]]; then DROPLET_NAME="${BENCHMARK_DROPLET_NAME}"; fi
   if [[ -n "${BENCHMARK_DROPLET_USER:-}" ]]; then DROPLET_USER="${BENCHMARK_DROPLET_USER}"; fi
   if [[ -n "${BENCHMARK_DROPLET_SSH_PORT:-}" ]]; then DROPLET_SSH_PORT="${BENCHMARK_DROPLET_SSH_PORT}"; fi
   if [[ -n "${BENCHMARK_REMOTE_REPO:-}" ]]; then REMOTE_REPO="${BENCHMARK_REMOTE_REPO}"; fi
@@ -235,6 +237,9 @@ _remote_conf_path() {
 
 _log_runtime_config() {
   echo "=== CI failover benchmark ==="
+  if [[ -n "${DROPLET_NAME}" ]]; then
+    echo "Name:     ${DROPLET_NAME}"
+  fi
   echo "Droplet:  ${DROPLET_USER}@${DROPLET_HOST}:${DROPLET_SSH_PORT}"
   echo "Repo:     ${REMOTE_REPO}"
   echo "Config:   $(_remote_conf_path)"
@@ -250,6 +255,7 @@ _dump_failure_diagnostics() {
   mkdir -p "${DIAG_DIR}"
   {
     echo "reason=${reason}"
+    echo "droplet_name=${DROPLET_NAME:-}"
     echo "droplet=${DROPLET_USER}@${DROPLET_HOST}"
     echo "remote_repo=${REMOTE_REPO}"
     echo "ci_git_sync=${CI_GIT_SYNC}"

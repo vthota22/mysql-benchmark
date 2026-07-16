@@ -2,6 +2,10 @@
 # Copy to ci/benchmark-target.conf (gitignored) or set equivalent env vars in GHA.
 #
 # Secrets (SSH private key, DB passwords) must NOT go here — keep benchmark.conf on the droplet.
+#
+# GitHub Actions (recommended): set repository variable BENCHMARK_DROPLET_MAP
+#   high1:104.236.21.112,high2:209.38.88.104,high3:142.93.200.182
+# Same format as DROPLET_MAP in control.local.conf. Runs in parallel (matrix).
 
 DROPLET_HOST=your-droplet-ip-or-hostname
 DROPLET_USER=root

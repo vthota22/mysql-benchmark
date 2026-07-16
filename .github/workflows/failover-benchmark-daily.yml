@@ -1,40 +1,122 @@
-# Scheduled failover benchmark — GitHub Actions orchestrates; droplet executes the harness.
+# Scheduled failover benchmark — GitHub Actions orchestrates; droplets execute the harness.
 #
 # Required GitHub repository secrets:
-#   BENCHMARK_SSH_PRIVATE_KEY   — private key with SSH access to the benchmark droplet
+#   BENCHMARK_SSH_PRIVATE_KEY   — private key with SSH access to all benchmark droplets
 #
-# Optional repository variables (Settings → Secrets and variables → Actions → Variables):
-#   BENCHMARK_DROPLET_HOST        — overrides ci/benchmark-target.conf
-#   BENCHMARK_DROPLET_USER        — default: root
-#   BENCHMARK_REMOTE_REPO         — default: /root/mysql-benchmark
-#   BENCHMARK_DROPLET_GIT_BRANCH  — branch to git pull on droplet before run (e.g. main_2)
+# Required repository variables (Settings → Secrets and variables → Actions → Variables):
+#   BENCHMARK_DROPLET_MAP       — name:host pairs, comma-separated (parallel matrix)
+#                                 e.g. high2:209.38.88.104,multi:174.138.56.251
+#   BENCHMARK_REMOTE_REPO       — e.g. /root/mysql-benchmark
 #
-# One-time droplet setup (not done by this workflow):
-#   git clone <repo> /root/mysql-benchmark && cd /root/mysql-benchmark && ./setup_benchmark.sh
-#   cp benchmark.conf.example benchmark.conf  # fill credentials + failover settings
-#   prepare TPC-C data once (SKIP_PREPARE=1 for daily runs)
+# Optional variables:
+#   BENCHMARK_DROPLET_HOST      — fallback single droplet if MAP is unset
+#   BENCHMARK_DROPLET_USER      — default: root
+#   BENCHMARK_DROPLET_GIT_BRANCH — default: main_2
+#
+# Each droplet uses its own gitignored benchmark.conf (same as the control UI).
 
-name: Daily Failover Benchmark
+name: Failover Benchmark (every 3h)
 
 on:
   schedule:
-    # 02:00 UTC daily — adjust for your timezone / cluster maintenance windows
-    - cron: "0 2 * * *"
+    # Every 3 hours (UTC). A full failover run can approach the 180m job timeout;
+    # per-droplet concurrency waits rather than cancelling in-progress jobs.
+    - cron: "0 */3 * * *"
   workflow_dispatch:
     inputs:
       git_branch:
         description: "Git branch to sync on droplet before run (empty = main_2)"
         required: false
         default: ""
+      droplet:
+        description: "Run only this droplet name from BENCHMARK_DROPLET_MAP (empty = all)"
+        required: false
+        default: ""
 
 concurrency:
-  group: failover-benchmark
+  group: failover-benchmark-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Build droplet matrix
+        id: set-matrix
+        env:
+          DROPLET_MAP: ${{ vars.BENCHMARK_DROPLET_MAP }}
+          DROPLET_HOST: ${{ vars.BENCHMARK_DROPLET_HOST }}
+          FILTER_NAME: ${{ inputs.droplet }}
+        run: |
+          set -euo pipefail
+          raw="${DROPLET_MAP:-}"
+          if [[ -z "${raw}" && -n "${DROPLET_HOST:-}" ]]; then
+            raw="default:${DROPLET_HOST}"
+            echo "BENCHMARK_DROPLET_MAP unset — using single BENCHMARK_DROPLET_HOST"
+          fi
+          if [[ -z "${raw}" ]]; then
+            echo "ERROR: set BENCHMARK_DROPLET_MAP or BENCHMARK_DROPLET_HOST"
+            exit 1
+          fi
+
+          python3 <<'PY'
+          import json, os, re, sys
+
+          raw = os.environ.get("DROPLET_MAP", "")
+          filt = os.environ.get("FILTER_NAME", "").strip()
+
+          entries = []
+          seen_hosts = set()
+          for chunk in raw.split(","):
+              chunk = chunk.strip()
+              if not chunk:
+                  continue
+              if ":" in chunk:
+                  name, host = chunk.split(":", 1)
+              else:
+                  name = host = chunk
+              name = name.strip()
+              host = host.strip()
+              if not host:
+                  continue
+              if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name):
+                  print(f"ERROR: invalid droplet name '{name}' (use letters, digits, -, _, .)", file=sys.stderr)
+                  sys.exit(1)
+              if host in seen_hosts:
+                  continue
+              seen_hosts.add(host)
+              entries.append({"name": name, "host": host})
+
+          if filt:
+              entries = [e for e in entries if e["name"] == filt]
+              if not entries:
+                  print(f"ERROR: droplet '{filt}' not found in BENCHMARK_DROPLET_MAP", file=sys.stderr)
+                  sys.exit(1)
+
+          if not entries:
+              print("ERROR: no droplets parsed from BENCHMARK_DROPLET_MAP", file=sys.stderr)
+              sys.exit(1)
+
+          matrix = {"include": entries}
+          print(json.dumps(matrix))
+          print(f"Matrix: {len(entries)} droplet(s): " + ", ".join(f"{e['name']}@{e['host']}" for e in entries))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"matrix={json.dumps(matrix)}\n")
+          PY
+
   failover-benchmark:
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+
+    concurrency:
+      group: failover-${{ matrix.name }}-${{ github.workflow }}
+      cancel-in-progress: false
 
     steps:
       - name: Checkout repository
@@ -43,33 +125,18 @@ jobs:
           persist-credentials: false
           submodules: false
 
-      - name: Load CI target config (optional)
-        run: |
-          if [[ -f ci/benchmark-target.conf ]]; then
-            echo "Using ci/benchmark-target.conf"
-          else
-            echo "No ci/benchmark-target.conf — using repository variables / workflow defaults"
-          fi
-
       - name: Validate required configuration
         run: |
           set -euo pipefail
-          missing=0
           if [[ -z "${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}" ]]; then
             echo "ERROR: missing secret BENCHMARK_SSH_PRIVATE_KEY"
-            missing=1
-          fi
-          if [[ -z "${{ vars.BENCHMARK_DROPLET_HOST }}" ]]; then
-            echo "ERROR: missing variable BENCHMARK_DROPLET_HOST"
-            missing=1
-          fi
-          if [[ -z "${{ vars.BENCHMARK_REMOTE_REPO }}" ]]; then
-            echo "ERROR: missing variable BENCHMARK_REMOTE_REPO (e.g. /root/mysql-benchmark)"
-            missing=1
-          fi
-          if [[ "${missing}" -ne 0 ]]; then
             exit 1
           fi
+          if [[ -z "${{ vars.BENCHMARK_REMOTE_REPO }}" ]]; then
+            echo "ERROR: missing variable BENCHMARK_REMOTE_REPO"
+            exit 1
+          fi
+          echo "Droplet: ${{ matrix.name }} @ ${{ matrix.host }}"
           echo "Required secrets/variables present."
 
       - name: Install SSH key
@@ -78,23 +145,14 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/ci-ssh"
           chmod 700 "${RUNNER_TEMP}/ci-ssh"
           KEY_FILE="${RUNNER_TEMP}/ci-ssh/benchmark_ci_key"
-          # Write multiline secret; strip CR (Windows pastes break ssh-keygen).
           printf '%s\n' "${BENCHMARK_SSH_PRIVATE_KEY}" > "${KEY_FILE}"
           sed -i 's/\r$//' "${KEY_FILE}"
-          # Ensure trailing newline
           if [[ "$(tail -c1 "${KEY_FILE}" | wc -l)" -eq 0 ]]; then
             printf '\n' >> "${KEY_FILE}"
           fi
           chmod 600 "${KEY_FILE}"
-          if [[ ! -s "${KEY_FILE}" ]]; then
-            echo "ERROR: SSH key file is empty after write"
-            exit 1
-          fi
-          echo "Key header: $(head -1 "${KEY_FILE}")"
-          echo "Key bytes: $(wc -c < "${KEY_FILE}" | tr -d ' ')"
           ssh-keygen -y -f "${KEY_FILE}" > "${KEY_FILE}.pub"
-          echo "SSH key installed for CI"
-          echo "Public key fingerprint:"
+          echo "SSH key OK for ${{ matrix.name }}"
           ssh-keygen -lf "${KEY_FILE}.pub"
         env:
           BENCHMARK_SSH_PRIVATE_KEY: ${{ secrets.BENCHMARK_SSH_PRIVATE_KEY }}
@@ -102,26 +160,17 @@ jobs:
       - name: Run failover benchmark on droplet
         env:
           CI_SSH_KEY_FILE: ${{ runner.temp }}/ci-ssh/benchmark_ci_key
-          BENCHMARK_DROPLET_HOST: ${{ vars.BENCHMARK_DROPLET_HOST }}
+          BENCHMARK_DROPLET_NAME: ${{ matrix.name }}
+          BENCHMARK_DROPLET_HOST: ${{ matrix.host }}
           BENCHMARK_DROPLET_USER: ${{ vars.BENCHMARK_DROPLET_USER || 'root' }}
           BENCHMARK_REMOTE_REPO: ${{ vars.BENCHMARK_REMOTE_REPO }}
           BENCHMARK_DROPLET_GIT_BRANCH: ${{ inputs.git_branch != '' && inputs.git_branch || vars.BENCHMARK_DROPLET_GIT_BRANCH || 'main_2' }}
           CI_GIT_SYNC: "1"
-          CI_ARTIFACTS_DIR: ${{ github.workspace }}/ci-artifacts
+          CI_ARTIFACTS_DIR: ${{ github.workspace }}/ci-artifacts/${{ matrix.name }}
         run: |
           set -euo pipefail
-          echo "CI_GIT_SYNC=${CI_GIT_SYNC} (always enabled)"
-          echo "BENCHMARK_DROPLET_HOST=${BENCHMARK_DROPLET_HOST}"
-          echo "BENCHMARK_DROPLET_USER=${BENCHMARK_DROPLET_USER:-root}"
-          echo "BENCHMARK_REMOTE_REPO=${BENCHMARK_REMOTE_REPO}"
-          echo "BENCHMARK_DROPLET_GIT_BRANCH=${BENCHMARK_DROPLET_GIT_BRANCH}"
-          echo "CI_SSH_KEY_FILE=${CI_SSH_KEY_FILE}"
-          test -f "${CI_SSH_KEY_FILE}" && echo "SSH key file: OK ($(wc -c < "${CI_SSH_KEY_FILE}") bytes)" || {
-            echo "SSH key file: MISSING"
-            exit 1
-          }
+          echo "=== ${{ matrix.name }} @ ${{ matrix.host }} ==="
           chmod +x scripts/ci_failover_benchmark.sh
-          # stdbuf -oL: line-buffered logs so GHA shows progress while polling
           if command -v stdbuf >/dev/null 2>&1; then
             stdbuf -oL -eL ./scripts/ci_failover_benchmark.sh
           else
@@ -132,23 +181,22 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: failover-report-${{ github.run_id }}
-          path: |
-            ci-artifacts/
+          name: failover-report-${{ matrix.name }}-${{ github.run_id }}
+          path: ci-artifacts/${{ matrix.name }}/
           retention-days: 90
           if-no-files-found: warn
 
       - name: Summarize KPIs
         if: success()
         run: |
-          kpi="$(find ci-artifacts -name failover_kpi.csv | head -1)"
+          kpi="$(find "ci-artifacts/${{ matrix.name }}" -name failover_kpi.csv 2>/dev/null | head -1)"
           if [[ -n "${kpi}" ]]; then
-            echo "### Failover KPIs" >> "${GITHUB_STEP_SUMMARY}"
+            echo "### ${{ matrix.name }} — Failover KPIs" >> "${GITHUB_STEP_SUMMARY}"
             echo '```csv' >> "${GITHUB_STEP_SUMMARY}"
             head -20 "${kpi}" >> "${GITHUB_STEP_SUMMARY}"
             echo '```' >> "${GITHUB_STEP_SUMMARY}"
           fi
-          report="$(find ci-artifacts -name failover_report.html | head -1)"
+          report="$(find "ci-artifacts/${{ matrix.name }}" -name failover_report.html 2>/dev/null | head -1)"
           if [[ -n "${report}" ]]; then
-            echo "HTML report saved to workflow artifacts: ${report}" >> "${GITHUB_STEP_SUMMARY}"
+            echo "Artifact: failover-report-${{ matrix.name }}-${{ github.run_id }}" >> "${GITHUB_STEP_SUMMARY}"
           fi
