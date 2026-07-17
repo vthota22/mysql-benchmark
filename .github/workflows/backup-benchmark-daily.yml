@@ -1,0 +1,145 @@
+# Scheduled backup benchmark — stub CI until backup-benchmarking/ is merged.
+#
+# Required repository variables:
+#   BENCHMARK_REMOTE_REPO
+#   BACKUP_DROPLET_MAP   (optional; falls back to BENCHMARK_DROPLET_MAP)
+#   BENCHMARK_DROPLET_HOST (optional fallback if maps unset)
+#
+# scripts/ci_backup_benchmark.sh currently exits 0 immediately (stub).
+
+name: Backup Benchmark (every 3h)
+
+on:
+  schedule:
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      droplet:
+        description: "Run only this droplet name from the map (empty = all)"
+        required: false
+        default: ""
+
+concurrency:
+  group: backup-benchmark-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Build droplet matrix
+        id: set-matrix
+        env:
+          DROPLET_MAP: ${{ vars.BACKUP_DROPLET_MAP || vars.BENCHMARK_DROPLET_MAP }}
+          DROPLET_HOST: ${{ vars.BENCHMARK_DROPLET_HOST }}
+          FILTER_NAME: ${{ inputs.droplet }}
+        run: |
+          set -euo pipefail
+          raw="${DROPLET_MAP:-}"
+          if [[ -z "${raw}" && -n "${DROPLET_HOST:-}" ]]; then
+            raw="default:${DROPLET_HOST}"
+            echo "Map unset — using single BENCHMARK_DROPLET_HOST"
+          fi
+          if [[ -z "${raw}" ]]; then
+            echo "ERROR: set BACKUP_DROPLET_MAP or BENCHMARK_DROPLET_MAP (or BENCHMARK_DROPLET_HOST)"
+            exit 1
+          fi
+
+          python3 <<'PY'
+          import json, os, re, sys
+
+          raw = os.environ.get("DROPLET_MAP", "")
+          filt = os.environ.get("FILTER_NAME", "").strip()
+
+          entries = []
+          seen_hosts = set()
+          for chunk in raw.split(","):
+              chunk = chunk.strip()
+              if not chunk:
+                  continue
+              if ":" in chunk:
+                  name, host = chunk.split(":", 1)
+              else:
+                  name = host = chunk
+              name = name.strip()
+              host = host.strip()
+              if not host:
+                  continue
+              if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name):
+                  print(f"ERROR: invalid droplet name '{name}'", file=sys.stderr)
+                  sys.exit(1)
+              if host in seen_hosts:
+                  continue
+              seen_hosts.add(host)
+              entries.append({"name": name, "host": host})
+
+          if filt:
+              entries = [e for e in entries if e["name"] == filt]
+              if not entries:
+                  print(f"ERROR: droplet '{filt}' not found in map", file=sys.stderr)
+                  sys.exit(1)
+
+          if not entries:
+              print("ERROR: no droplets parsed from map", file=sys.stderr)
+              sys.exit(1)
+
+          matrix = {"include": entries}
+          print(json.dumps(matrix))
+          print(f"Matrix: {len(entries)} droplet(s): " + ", ".join(f"{e['name']}@{e['host']}" for e in entries))
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"matrix={json.dumps(matrix)}\n")
+          PY
+
+  backup-benchmark:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+
+    concurrency:
+      group: backup-${{ matrix.name }}-${{ github.workflow }}
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          submodules: false
+
+      - name: Run backup CI stub
+        env:
+          BENCHMARK_DROPLET_NAME: ${{ matrix.name }}
+          BENCHMARK_DROPLET_HOST: ${{ matrix.host }}
+          BENCHMARK_DROPLET_USER: ${{ vars.BENCHMARK_DROPLET_USER || 'root' }}
+          BENCHMARK_REMOTE_REPO: ${{ vars.BENCHMARK_REMOTE_REPO || '/root/mysql-benchmark' }}
+          CI_ARTIFACTS_DIR: ${{ github.workspace }}/ci-artifacts/${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          echo "=== backup stub: ${{ matrix.name }} @ ${{ matrix.host }} ==="
+          chmod +x scripts/ci_backup_benchmark.sh
+          ./scripts/ci_backup_benchmark.sh
+
+      - name: Upload stub diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backup-stub-${{ matrix.name }}-${{ github.run_id }}
+          path: ci-artifacts/${{ matrix.name }}/
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Summarize
+        if: success()
+        run: |
+          echo "### ${{ matrix.name }} — Backup (stub)" >> "${GITHUB_STEP_SUMMARY}"
+          echo "ci_backup_benchmark.sh exited 0 (stub; no remote harness yet)." >> "${GITHUB_STEP_SUMMARY}"
+          if [[ -f "ci-artifacts/${{ matrix.name }}/diagnostics/stub_status.env" ]]; then
+            echo '```' >> "${GITHUB_STEP_SUMMARY}"
+            cat "ci-artifacts/${{ matrix.name }}/diagnostics/stub_status.env" >> "${GITHUB_STEP_SUMMARY}"
+            echo '```' >> "${GITHUB_STEP_SUMMARY}"
+          fi
