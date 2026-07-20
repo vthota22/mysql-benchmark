@@ -4,7 +4,8 @@
 #   python3 control_ui.py
 #
 # On App Platform, prefer env vars instead of this file:
-#   BENCHMARK_DROPLET_MAP, BENCHMARK_REMOTE_REPO, BENCHMARK_SSH_PRIVATE_KEY
+#   BENCHMARK_DROPLET_MAP (failover), BENCHMARK_BACKUP_DROPLET_MAP,
+#   BENCHMARK_SCALING_DROPLET_MAP, BENCHMARK_REMOTE_REPO, BENCHMARK_SSH_PRIVATE_KEY
 
 DROPLET_HOST=209.38.88.104
 DROPLET_NAME=high2
@@ -12,8 +13,12 @@ DROPLET_USER=root
 DROPLET_SSH_PORT=22
 # DROPLET_SSH_KEY=~/.ssh/mysql-benchmark-gha
 
-# Global droplet picker (name:ip, comma-separated)
+# Failover map — first entry is the locked Active droplet default
 DROPLET_MAP=high2:209.38.88.104,multi:174.138.56.251
+
+# Feature-specific maps — first entry is the locked Active droplet for that feature
+BACKUP_DROPLET_MAP=multi:174.138.56.251
+SCALING_DROPLET_MAP=high2:209.38.88.104
 
 REMOTE_REPO=/root/mysql-benchmark
 REMOTE_BENCHMARK_CONF=benchmark.conf

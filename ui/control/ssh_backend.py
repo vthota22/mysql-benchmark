@@ -20,14 +20,30 @@ class DropletConfig:
     runs_min_id: str = ""
     name: str = ""
     compare_runs_limit: int = 6
-    # Additional droplets to browse reports from, as ((name, host), ...).
+    # Default / failover droplet map (name, host).
     droplets: tuple[tuple[str, str], ...] = ()
+    # Per-feature maps; missing/empty features fall back as documented in droplets_for_feature().
+    backup_droplets: tuple[tuple[str, str], ...] = ()
+    scaling_droplets: tuple[tuple[str, str], ...] = ()
 
     @property
     def remote_conf_path(self) -> str:
         repo = self.remote_repo.rstrip("/")
         conf = self.remote_conf.lstrip("/")
         return f"{repo}/{conf}"
+
+    def droplets_for_feature(self, feature_id: str = "failover") -> tuple[tuple[str, str], ...]:
+        """Return the droplet map for a feature.
+
+        Failover uses ``DROPLET_MAP`` / ``FAILOVER_DROPLET_MAP``.
+        Backup / scaling use their dedicated maps only (no silent fallback to failover).
+        """
+        fid = (feature_id or "failover").strip().lower() or "failover"
+        if fid == "backup":
+            return self.backup_droplets
+        if fid == "scaling":
+            return self.scaling_droplets
+        return self.droplets
 
     def with_overrides(self, overrides: dict[str, str]) -> DropletConfig:
         """Return a copy with optional droplet SSH fields replaced."""
@@ -49,7 +65,10 @@ class DropletConfig:
             ssh_port=port,
             runs_min_id=self.runs_min_id,
             name=name,
+            compare_runs_limit=self.compare_runs_limit,
             droplets=self.droplets,
+            backup_droplets=self.backup_droplets,
+            scaling_droplets=self.scaling_droplets,
         )
 
 
@@ -145,7 +164,10 @@ def resolve_droplet_config(config_path: Path | None = None) -> DropletConfig:
         "DROPLET_SSH_PORT": _env_first("BENCHMARK_DROPLET_SSH_PORT", "DROPLET_SSH_PORT"),
         "REMOTE_REPO": _env_first("BENCHMARK_REMOTE_REPO", "REMOTE_REPO"),
         "REMOTE_BENCHMARK_CONF": _env_first("BENCHMARK_REMOTE_BENCHMARK_CONF", "REMOTE_BENCHMARK_CONF"),
-        "DROPLET_MAP": _env_first("BENCHMARK_DROPLET_MAP", "DROPLET_MAP"),
+        "DROPLET_MAP": _env_first("BENCHMARK_DROPLET_MAP", "DROPLET_MAP", "FAILOVER_DROPLET_MAP", "BENCHMARK_FAILOVER_DROPLET_MAP"),
+        "FAILOVER_DROPLET_MAP": _env_first("BENCHMARK_FAILOVER_DROPLET_MAP", "FAILOVER_DROPLET_MAP"),
+        "BACKUP_DROPLET_MAP": _env_first("BENCHMARK_BACKUP_DROPLET_MAP", "BACKUP_DROPLET_MAP"),
+        "SCALING_DROPLET_MAP": _env_first("BENCHMARK_SCALING_DROPLET_MAP", "SCALING_DROPLET_MAP"),
         "RUNS_MIN_ID": _env_first("RUNS_MIN_ID"),
         "COMPARE_RUNS_LIMIT": _env_first("COMPARE_RUNS_LIMIT"),
         "DROPLET_SSH_KEY": _env_first("CI_SSH_KEY_FILE", "DROPLET_SSH_KEY"),
@@ -158,9 +180,14 @@ def resolve_droplet_config(config_path: Path | None = None) -> DropletConfig:
     if ssh_key:
         values["DROPLET_SSH_KEY"] = ssh_key
 
+    # Prefer explicit FAILOVER_DROPLET_MAP when set; else DROPLET_MAP.
+    failover_map_raw = values.get("FAILOVER_DROPLET_MAP") or values.get("DROPLET_MAP") or ""
+    if failover_map_raw and not values.get("DROPLET_MAP"):
+        values["DROPLET_MAP"] = failover_map_raw
+
     # If only MAP is set, default host is the first entry.
-    if not values.get("DROPLET_HOST") and values.get("DROPLET_MAP"):
-        mapped = parse_droplet_map(values["DROPLET_MAP"])
+    if not values.get("DROPLET_HOST") and failover_map_raw:
+        mapped = parse_droplet_map(failover_map_raw)
         if mapped:
             values.setdefault("DROPLET_NAME", mapped[0][0])
             values["DROPLET_HOST"] = mapped[0][1]
@@ -189,6 +216,9 @@ def _build_droplet_config(values: dict[str, str], *, source: str) -> DropletConf
     if runs_min_id and not runs_min_id.startswith("failover_"):
         runs_min_id = f"failover_{runs_min_id}"
 
+    failover_raw = values.get("FAILOVER_DROPLET_MAP") or values.get("DROPLET_MAP") or ""
+    failover_droplets = parse_droplet_map(failover_raw)
+
     return DropletConfig(
         host=values["DROPLET_HOST"],
         user=values["DROPLET_USER"],
@@ -199,7 +229,9 @@ def _build_droplet_config(values: dict[str, str], *, source: str) -> DropletConf
         runs_min_id=runs_min_id,
         name=values.get("DROPLET_NAME", "").strip(),
         compare_runs_limit=max(1, min(int(values.get("COMPARE_RUNS_LIMIT", "6") or "6"), 12)),
-        droplets=parse_droplet_map(values.get("DROPLET_MAP", "")),
+        droplets=failover_droplets,
+        backup_droplets=parse_droplet_map(values.get("BACKUP_DROPLET_MAP", "")),
+        scaling_droplets=parse_droplet_map(values.get("SCALING_DROPLET_MAP", "")),
     )
 
 

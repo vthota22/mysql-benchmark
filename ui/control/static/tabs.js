@@ -1,12 +1,12 @@
-const TAB_IDS = ["run", "prepare", "reports", "compare"];
+const TAB_IDS = ["reports", "run", "prepare", "compare"];
 
 function tabFromHash() {
   const hash = (window.location.hash || "").replace(/^#/, "");
-  return TAB_IDS.includes(hash) ? hash : "run";
+  return TAB_IDS.includes(hash) ? hash : "reports";
 }
 
 function activateTab(tabId, { updateHash = true } = {}) {
-  const id = TAB_IDS.includes(tabId) ? tabId : "run";
+  const id = TAB_IDS.includes(tabId) ? tabId : "reports";
   document.querySelectorAll(".tab-bar .tab").forEach((button) => {
     button.classList.toggle("active", button.dataset.tab === id);
   });

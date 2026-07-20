@@ -39,10 +39,11 @@ from control.config_schema import (  # noqa: E402
     prepare_estimate_payload,
     estimate_runtime_sec,
 )
-from control.features import FEATURES, active_feature, features_payload  # noqa: E402
+from control.features import FEATURES, features_payload, resolve_feature  # noqa: E402
 from control.kpi_compare import build_compare_payload, filter_runs_for_compare  # noqa: E402
 from control.report_proxy import (  # noqa: E402
     ReportProxy,
+    is_allowed_report_path,
     pick_primary_report,
     report_view_url,
     run_timestamp_meta,
@@ -74,7 +75,7 @@ def _droplet_overrides_from_values(values: dict) -> dict[str, str]:
 
 
 def _host_report_url(view_url: str, host: str) -> str:
-    """Rewrite ``/reports/results/...`` into ``/reports/@<host>/results/...``.
+    """Rewrite ``/reports/<path>`` into ``/reports/@<host>/<path>``.
 
     The host segment lives in the path (not a query string) so that relative
     asset links inside a report resolve back to the same droplet.
@@ -87,6 +88,12 @@ def _host_report_url(view_url: str, host: str) -> str:
     if view_url.startswith(prefix + "@"):
         return view_url
     return f"{prefix}@{quote(host, safe='')}/{view_url[len(prefix):]}"
+
+
+def _parse_feature(raw: str = "") -> str:
+    fid = (raw or "failover").strip().lower() or "failover"
+    resolve_feature(fid)  # raises if unknown/disabled
+    return fid
 
 
 def _annotate_runs_with_host(runs: list[dict], host: str) -> None:
@@ -111,8 +118,15 @@ class ControlServer:
         self._run_lock_guard = threading.Lock()
         self._prepare_lock = threading.Lock()
         self._prepare_backend: SshBackend | None = None
-        self.droplet_options = self._build_droplet_options()
-        self._host_names = {opt["host"]: opt["name"] for opt in self.droplet_options}
+        # Union of all feature maps (for prepare / legacy host name lookup).
+        self.droplet_options = self._build_droplet_options("failover")
+        all_hosts: dict[str, str] = {}
+        for feature in ("failover", "backup", "scaling"):
+            for name, host in droplet.droplets_for_feature(feature):
+                all_hosts.setdefault(host, name)
+        if droplet.host:
+            all_hosts.setdefault(droplet.host, droplet.name or droplet.host)
+        self._host_names = all_hosts
 
     def _run_lock_for(self, host: str) -> threading.Lock:
         with self._run_lock_guard:
@@ -120,43 +134,99 @@ class ControlServer:
                 self._run_locks[host] = threading.Lock()
             return self._run_locks[host]
 
-    def _build_droplet_options(self) -> list[dict]:
-        options = [
-            {
-                "name": self.droplet.name or self.droplet.host,
-                "host": self.droplet.host,
-                "default": True,
-            }
-        ]
-        seen = {self.droplet.host}
-        for name, host in self.droplet.droplets:
+    def _build_droplet_options(self, feature: str = "failover") -> list[dict]:
+        mapped = list(self.droplet.droplets_for_feature(feature))
+        # Prefer configured DROPLET_HOST as the locked default when it appears in this feature's map.
+        if feature == "failover" and self.droplet.host:
+            preferred = self.droplet.host
+            for idx, (name, host) in enumerate(mapped):
+                if host == preferred:
+                    if idx != 0:
+                        mapped.insert(0, mapped.pop(idx))
+                    break
+        options: list[dict] = []
+        seen: set[str] = set()
+        for name, host in mapped:
             if host in seen:
                 continue
             seen.add(host)
-            options.append({"name": name, "host": host, "default": False})
+            options.append({"name": name, "host": host, "default": len(options) == 0})
+        # Failover only: if map empty, keep the configured default host so UI still works.
+        if not options and feature == "failover":
+            options.append(
+                {
+                    "name": self.droplet.name or self.droplet.host,
+                    "host": self.droplet.host,
+                    "default": True,
+                }
+            )
         return options
 
-    def droplet_options_payload(self) -> dict:
+    def droplet_options_payload(self, feature: str = "failover") -> dict:
+        options = self._build_droplet_options(feature)
+        default_host = options[0]["host"] if options else ""
         return {
-            "droplets": self.droplet_options,
-            "default_host": self.droplet.host,
+            "droplets": options,
+            "default_host": default_host,
             "compare_runs_limit": self.compare_runs_limit,
+            "feature": feature,
+            "map_empty": len(options) == 0,
+            "map_hint": (
+                ""
+                if options
+                else (
+                    f"No droplets configured for {feature}. "
+                    f"Set {feature.upper()}_DROPLET_MAP in control.local.conf "
+                    f"(or BENCHMARK_{feature.upper()}_DROPLET_MAP)."
+                )
+            ),
         }
 
-    def _resolve_report_target(self, host: str = "") -> tuple[SshBackend, ReportProxy, DropletConfig]:
+    def _hosts_for_feature(self, feature: str = "failover") -> set[str]:
+        return {host for _, host in self.droplet.droplets_for_feature(feature)} | (
+            {self.droplet.host} if feature == "failover" else set()
+        )
+
+    def _resolve_report_target(
+        self, host: str = "", feature: str = "failover"
+    ) -> tuple[SshBackend, ReportProxy, DropletConfig]:
         """Return (backend, reports, droplet) for a report browsing host.
 
-        Only hosts listed in the configured droplet map (plus the default) are
-        allowed, to avoid using this endpoint to SSH into arbitrary hosts.
+        Only hosts listed in the feature's droplet map (plus the failover default)
+        are allowed, to avoid using this endpoint to SSH into arbitrary hosts.
         """
+        profile = resolve_feature(feature)
+        allowed = self._hosts_for_feature(feature)
         host = (host or "").strip()
-        if not host or host == self.droplet.host:
-            return self.backend, self.reports, self.droplet
-        if host not in self._host_names:
-            raise ValueError(f"Unknown droplet host: {host}")
-        cfg = self.droplet.with_overrides({"DROPLET_HOST": host, "DROPLET_NAME": self._host_names[host]})
+        if not host:
+            options = self._build_droplet_options(feature)
+            if options:
+                host = options[0]["host"]
+            elif feature == "failover":
+                host = self.droplet.host
+            else:
+                raise ValueError(
+                    f"No droplets configured for {feature}. "
+                    f"Set {feature.upper()}_DROPLET_MAP in control.local.conf."
+                )
+        if host not in allowed:
+            # Name lookup from any known map entry for clearer errors.
+            names = {h: n for n, h in self.droplet.droplets_for_feature(feature)}
+            raise ValueError(
+                f"Droplet {host} is not in the {feature} map"
+                + (f" ({names.get(host)})" if host in names else "")
+                + f". Configure {feature.upper()}_DROPLET_MAP."
+            )
+        name_by_host = {h: n for n, h in self.droplet.droplets_for_feature(feature)}
+        if feature == "failover" and self.droplet.host not in name_by_host:
+            name_by_host[self.droplet.host] = self.droplet.name or self.droplet.host
+        if host == self.droplet.host and feature == "failover":
+            return self.backend, ReportProxy(self.backend, profile), self.droplet
+        cfg = self.droplet.with_overrides(
+            {"DROPLET_HOST": host, "DROPLET_NAME": name_by_host.get(host, host)}
+        )
         backend = SshBackend(cfg)
-        return backend, ReportProxy(backend), cfg
+        return backend, ReportProxy(backend, profile), cfg
 
     def _backend_for_droplet(self, overrides: dict[str, str] | None = None) -> SshBackend:
         if not overrides:
@@ -218,7 +288,7 @@ class ControlServer:
             report_list = reports.discover_reports(results_dir)
         except Exception:
             report_list = []
-        primary = pick_primary_report(report_list)
+        primary = pick_primary_report(report_list, reports.feature)
         return {"reports": report_list, "primary_report": primary}
 
     def run_status(
@@ -230,6 +300,25 @@ class ControlServer:
         backend = backend or self.backend
         reports = reports or self.reports
         droplet = droplet or self.droplet
+        # Run status / start / log are failover-only for Option A.
+        if getattr(reports, "feature", None) and reports.feature.id != "failover":
+            return {
+                "running": False,
+                "completed": False,
+                "pid": "",
+                "results_dir": "",
+                "started_utc": "",
+                "log_path": "",
+                "report_path": "",
+                "report_url": "",
+                "reports": [],
+                "primary_report": None,
+                "estimated_runtime_sec": None,
+                "host": droplet.host,
+                "droplet_name": droplet.name or droplet.host,
+                "feature": reports.feature.id,
+                "browse_only": True,
+            }
         result = backend.ctl("status")
         if result.returncode != 0:
             return {
@@ -278,25 +367,35 @@ class ControlServer:
             "estimated_runtime_sec": estimate_runtime_sec(values) if values else None,
             "host": droplet.host,
             "droplet_name": droplet.name or droplet.host,
+            "feature": "failover",
         }
 
-    def list_report_runs(self, limit: int = 25, host: str = "") -> dict:
-        backend, reports, droplet = self._resolve_report_target(host)
-        status = self.run_status(backend, reports, droplet)
-        results_dir = status.get("results_dir", "")
-        running = bool(status.get("running"))
-        runs = reports.list_runs(
-            limit,
-            latest_results_dir=results_dir,
-            running_results_dir=results_dir if running else "",
-            running=running,
-            runs_min_id=droplet.runs_min_id,
-        )
+    def list_report_runs(self, limit: int = 25, host: str = "", feature: str = "failover") -> dict:
+        profile = resolve_feature(feature)
+        backend, reports, droplet = self._resolve_report_target(host, feature=feature)
+        results_dir = ""
+        running = False
+        runs_min_id = droplet.runs_min_id if profile.id == "failover" else ""
+        if profile.list_mode == "ctl":
+            status = self.run_status(backend, reports, droplet)
+            results_dir = status.get("results_dir", "")
+            running = bool(status.get("running"))
+            runs = reports.list_runs(
+                limit,
+                latest_results_dir=results_dir,
+                running_results_dir=results_dir if running else "",
+                running=running,
+                runs_min_id=runs_min_id,
+            )
+        else:
+            runs = reports.list_runs(limit, runs_min_id=runs_min_id)
+            if runs:
+                results_dir = runs[0].get("results_dir", "")
+                runs[0]["is_latest"] = True
         for run in runs:
-            meta = run_timestamp_meta(run.get("run_id", ""))
+            meta = run_timestamp_meta(run.get("run_id", ""), profile)
             run["started_at"] = meta["started_at"]
             run["started_display"] = meta["started_display"]
-            # Prefer newest report mtime as a secondary clock when present.
             mtimes = [int(r.get("mtime") or 0) for r in run.get("reports") or []]
             newest = max(mtimes) if mtimes else 0
             run["mtime"] = newest
@@ -310,37 +409,52 @@ class ControlServer:
             "runs": runs,
             "latest_results_dir": results_dir,
             "running": running,
-            "runs_min_id": droplet.runs_min_id,
+            "runs_min_id": runs_min_id,
             "host": droplet.host,
             "droplet_name": droplet.name or droplet.host,
-            "feature": active_feature().id,
+            "feature": profile.id,
+            "feature_label": profile.label,
+            "browse_only": not profile.can_start,
+            "can_generate": profile.id == "failover",
         }
 
-    def compare_runs(self, limit: int | None = None, host: str = "") -> dict:
+    def compare_runs(self, limit: int | None = None, host: str = "", feature: str = "failover") -> dict:
+        profile = resolve_feature(feature)
+        if not profile.can_compare:
+            return {
+                "runs": [],
+                "slices": [],
+                "error": f"KPI compare is not available for {profile.label} yet.",
+                "feature": profile.id,
+                "host": host or self.droplet.host,
+            }
         if limit is None:
             limit = self.compare_runs_limit
-        backend, _, droplet = self._resolve_report_target(host)
-        list_data = self.list_report_runs(limit=100, host=host)
+        backend, _, droplet = self._resolve_report_target(host, feature=feature)
+        list_data = self.list_report_runs(limit=100, host=host, feature=feature)
         runs = filter_runs_for_compare(list_data["runs"], droplet.runs_min_id)
         payload = build_compare_payload(runs, backend, limit=limit)
         payload["runs_min_id"] = droplet.runs_min_id
         payload["host"] = droplet.host
         payload["droplet_name"] = droplet.name or droplet.host
+        payload["feature"] = profile.id
         if droplet.host != self.droplet.host:
             _annotate_runs_with_host(payload["runs"], droplet.host)
         return payload
 
-    def generate_run_reports(self, results_dir: str, host: str = "") -> dict:
-        _, reports, droplet = self._resolve_report_target(host)
+    def generate_run_reports(self, results_dir: str, host: str = "", feature: str = "failover") -> dict:
+        profile = resolve_feature(feature)
+        _, reports, droplet = self._resolve_report_target(host, feature=feature)
         reports.generate_html_reports(results_dir)
         report_list = reports.discover_reports(results_dir)
-        primary = pick_primary_report(report_list)
+        primary = pick_primary_report(report_list, profile)
         result = {
             "ok": True,
-            "results_dir": validate_results_path(results_dir),
+            "results_dir": validate_results_path(results_dir, profile),
             "reports": report_list,
             "primary_report": primary,
             "host": droplet.host,
+            "feature": profile.id,
         }
         if droplet.host != self.droplet.host:
             _annotate_runs_with_host(
@@ -541,8 +655,13 @@ def make_handler(server: ControlServer):
             self.wfile.write(data)
 
         def _serve_report_file(self, rel_path: str, host: str = "") -> None:
-            _, reports, _ = server._resolve_report_target(host)
-            rel = validate_results_path(rel_path)
+            feature = "failover"
+            if rel_path.startswith("backup-benchmarking/"):
+                feature = "backup"
+            elif rel_path.startswith("scaling-benchmarking/"):
+                feature = "scaling"
+            _, reports, _ = server._resolve_report_target(host, feature=feature)
+            rel = validate_results_path(rel_path, feature)
             cache_path = reports.fetch_to_cache(rel)
             data = cache_path.read_bytes()
             ctype = mimetypes.guess_type(str(cache_path))[0] or "application/octet-stream"
@@ -580,7 +699,7 @@ def make_handler(server: ControlServer):
                     segment, _, remainder = rel_path.partition("/")
                     host = unquote(segment[1:])
                     rel_path = remainder
-                if rel_path.startswith("results/"):
+                if is_allowed_report_path(rel_path):
                     try:
                         self._serve_report_file(rel_path, host)
                     except ValueError:
@@ -594,7 +713,7 @@ def make_handler(server: ControlServer):
                     self._send_json({"ok": True, "service": "mysql-benchmark-ui"})
                     return
                 if path == "/api/features":
-                    self._send_json({"features": features_payload(), "active": active_feature().id})
+                    self._send_json({"features": features_payload(), "active": "failover"})
                     return
                 if path == "/api/health":
                     qs = parse_qs(parsed.query)
@@ -623,7 +742,9 @@ def make_handler(server: ControlServer):
                     )
                     return
                 if path == "/api/droplets":
-                    self._send_json(server.droplet_options_payload())
+                    qs = parse_qs(parsed.query)
+                    feature = _parse_feature((qs.get("feature") or ["failover"])[0])
+                    self._send_json(server.droplet_options_payload(feature=feature))
                     return
                 if path == "/api/prepare/schema":
                     self._send_json({"fields": _field_specs_json(PREPARE_FIELDS)})
@@ -652,17 +773,28 @@ def make_handler(server: ControlServer):
                     qs = parse_qs(parsed.query)
                     limit = int((qs.get("limit") or ["25"])[0])
                     host = (qs.get("host") or [""])[0]
-                    self._send_json(server.list_report_runs(limit=max(1, min(limit, 100)), host=host))
+                    feature = _parse_feature((qs.get("feature") or ["failover"])[0])
+                    self._send_json(
+                        server.list_report_runs(
+                            limit=max(1, min(limit, 100)),
+                            host=host,
+                            feature=feature,
+                        )
+                    )
                     return
                 if path == "/api/runs/compare":
                     qs = parse_qs(parsed.query)
                     limit_raw = (qs.get("limit") or [""])[0]
                     limit = int(limit_raw) if limit_raw else None
                     host = (qs.get("host") or [""])[0]
+                    feature = _parse_feature((qs.get("feature") or ["failover"])[0])
                     if limit is not None:
                         limit = max(1, min(limit, 12))
-                    self._send_json(server.compare_runs(limit=limit, host=host))
+                    self._send_json(server.compare_runs(limit=limit, host=host, feature=feature))
                     return
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
             except subprocess.CalledProcessError as exc:
                 detail = (exc.stderr or exc.stdout or str(exc)).strip()
                 self._send_json({"error": detail}, HTTPStatus.BAD_GATEWAY)
@@ -692,10 +824,13 @@ def make_handler(server: ControlServer):
                     payload = self._read_json()
                     results_dir = payload.get("results_dir", "")
                     host = payload.get("host", "")
+                    feature = _parse_feature(payload.get("feature", "failover"))
                     if not results_dir:
                         self._send_json({"error": "results_dir required"}, HTTPStatus.BAD_REQUEST)
                         return
-                    self._send_json(server.generate_run_reports(results_dir, host=host))
+                    self._send_json(
+                        server.generate_run_reports(results_dir, host=host, feature=feature)
+                    )
                     return
                 if parsed.path == "/api/prepare/status":
                     payload = self._read_json()
@@ -738,10 +873,19 @@ def run_server(host: str, port: int, config_path: Path | None = None) -> None:
     handler = make_handler(server_impl)
     httpd = ThreadingHTTPServer((host, port), handler)
     print(f"Failover control UI: http://{host}:{port}")
-    print(f"Default droplet: {droplet.user}@{droplet.host}:{droplet.remote_repo}")
+    failover_opts = server_impl._build_droplet_options("failover")
+    default = failover_opts[0] if failover_opts else None
+    if default:
+        print(f"Default droplet (failover): {default['name']}={default['host']}")
+    else:
+        print(f"Default droplet: {droplet.user}@{droplet.host}:{droplet.remote_repo}")
     if droplet.droplets:
         mapped = ", ".join(f"{n}={h}" for n, h in droplet.droplets)
-        print(f"Droplet map: {mapped}")
+        print(f"Failover map: {mapped}")
+    if droplet.backup_droplets:
+        print(f"Backup map: {', '.join(f'{n}={h}' for n, h in droplet.backup_droplets)}")
+    if droplet.scaling_droplets:
+        print(f"Scaling map: {', '.join(f'{n}={h}' for n, h in droplet.scaling_droplets)}")
     if droplet.ssh_key:
         print(f"SSH key: {droplet.ssh_key}")
     print(f"Features: {', '.join(f.id for f in FEATURES.values() if f.enabled)}")

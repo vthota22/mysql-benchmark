@@ -20,12 +20,33 @@ const btnRefreshCompare = document.getElementById("btn-refresh-compare");
 
 const globalDropletPicker = document.getElementById("global-droplet-picker");
 const globalDropletWrap = document.getElementById("global-droplet-wrap");
+const globalFeaturePicker = document.getElementById("global-feature-picker");
+const reportsIntro = document.getElementById("reports-intro");
+const reportsBrowseNote = document.getElementById("reports-browse-note");
 
 let schemaFields = [];
 let runPollTimer = null;
 let reportsPollTimer = null;
 let reportsLoaded = false;
 let compareLoaded = false;
+
+function updateReportsCopy(data = {}) {
+  const label = data.feature_label || FeatureContext.label || "Failover";
+  if (reportsIntro) {
+    reportsIntro.textContent =
+      `${label} runs on the active droplet. Reports are fetched over SSH and cached locally when opened.`;
+  }
+  if (reportsBrowseNote) {
+    if (data.browse_only || !FeatureContext.capability("can_start")) {
+      reportsBrowseNote.textContent =
+        "Browse-only for now: start/config stay under Failover until backup/scaling ctl wrappers are wired.";
+      reportsBrowseNote.classList.remove("hidden");
+    } else {
+      reportsBrowseNote.textContent = "";
+      reportsBrowseNote.classList.add("hidden");
+    }
+  }
+}
 
 function showMessage(text, kind = "ok") {
   actionMessage.hidden = false;
@@ -154,7 +175,7 @@ function bindReportPanelActions(root) {
 function renderCurrentReports(status) {
   const reports = status.reports || [];
   const primary = status.primary_report || (status.report_url ? { view_url: status.report_url, label: "Combined report" } : null);
-  const reportsTab = `<button type="button" class="link-button" data-open-tab="reports">Previous reports</button>`;
+  const reportsTab = `<button type="button" class="link-button" data-open-tab="reports">Benchmark run reports</button>`;
   const pending = status.running && !primary?.view_url;
 
   if (!reports.length && !primary && !pending) {
@@ -257,6 +278,7 @@ async function refreshReports() {
   runsList.textContent = "Loading…";
   runsList.className = "runs-list muted";
   const data = await api(DropletContext.withHost("/api/reports?limit=50"));
+  updateReportsCopy(data);
   updateFilterNote(runsFilterNote, data.runs_min_id, "Showing runs from");
   renderRunsList(runsList, data, {
     onGenerate: async (resultsDir, button) => {
@@ -313,36 +335,90 @@ async function reloadActiveDropletData() {
   reportsLoaded = false;
   compareLoaded = false;
   actionMessage.hidden = true;
+  FeatureContext.applyTabVisibility();
+
+  await DropletContext.loadForFeature(FeatureContext.id, {
+    persistHost: true,
+    notify: false,
+  });
+  DropletContext.renderPicker(globalDropletPicker, globalDropletWrap);
+
+  if (DropletContext.mapEmpty) {
+    connectionStatus.textContent = DropletContext.mapHint || "No droplets for this feature.";
+    connectionStatus.style.color = "var(--warn)";
+    if (runsList) {
+      runsList.textContent = DropletContext.mapHint || "No droplets configured for this feature.";
+      runsList.className = "runs-list muted";
+    }
+    return;
+  }
 
   await loadConnectionStatus(connectionStatus);
-  await loadRunConfig();
-  await refreshStatus();
+
+  const canStart = FeatureContext.capability("can_start");
+  if (canStart) {
+    await loadRunConfig();
+    await refreshStatus();
+  }
 
   const activeTab = document.querySelector(".tab-panel.active")?.id?.replace("panel-", "") || "run";
+  if (!canStart && (activeTab === "run" || activeTab === "prepare" || activeTab === "compare")) {
+    openTab("reports");
+    await refreshReports();
+    return;
+  }
   if (activeTab === "reports") {
     await refreshReports();
-  } else if (activeTab === "compare") {
+  } else if (activeTab === "compare" && FeatureContext.capability("can_compare")) {
     await refreshCompare();
   }
 }
 
 async function loadInitial() {
+  await FeatureContext.init();
+  FeatureContext.renderPicker(globalFeaturePicker);
+  FeatureContext.applyTabVisibility();
+
   await DropletContext.init();
   DropletContext.renderPicker(globalDropletPicker, globalDropletWrap);
   updateCompareLimitNote();
+  updateReportsCopy();
+
+  if (DropletContext.mapEmpty) {
+    connectionStatus.textContent = DropletContext.mapHint || "No droplets for this feature.";
+    connectionStatus.style.color = "var(--warn)";
+    openTab("reports");
+    if (runsList) {
+      runsList.textContent = DropletContext.mapHint || "No droplets configured for this feature.";
+      runsList.className = "runs-list muted";
+    }
+    return;
+  }
 
   const schema = await api(DropletContext.withHost("/api/schema"));
   schemaFields = schema.fields;
 
-  await loadRunConfig();
   await loadConnectionStatus(connectionStatus);
-  await refreshStatus();
 
-  const initialTab = (window.location.hash || "").replace(/^#/, "") || "run";
+  const canStart = FeatureContext.capability("can_start");
+  let initialTab = (window.location.hash || "").replace(/^#/, "") || "reports";
+  if (!canStart && (initialTab === "run" || initialTab === "prepare" || initialTab === "compare")) {
+    initialTab = "reports";
+  }
+  openTab(initialTab);
+
+  if (canStart && (initialTab === "run" || initialTab === "prepare")) {
+    await loadRunConfig();
+    await refreshStatus();
+  }
   if (initialTab === "reports") {
     await refreshReports();
   } else if (initialTab === "compare") {
     await refreshCompare();
+  }
+  if (canStart && initialTab === "reports") {
+    // Warm failover config/status in background for when user opens Run.
+    loadRunConfig().catch(() => {});
   }
 }
 
@@ -417,7 +493,18 @@ globalDropletPicker?.addEventListener("change", () => {
   DropletContext.setHost(globalDropletPicker.value || "");
 });
 
+globalFeaturePicker?.addEventListener("change", () => {
+  FeatureContext.setFeature(globalFeaturePicker.value || "failover");
+});
+
 window.addEventListener("failover-droplet", () => {
+  reloadActiveDropletData().catch((err) => {
+    connectionStatus.textContent = err.message;
+    connectionStatus.style.color = "var(--err)";
+  });
+});
+
+window.addEventListener("benchmark-feature", () => {
   reloadActiveDropletData().catch((err) => {
     connectionStatus.textContent = err.message;
     connectionStatus.style.color = "var(--err)";
@@ -432,7 +519,7 @@ window.addEventListener("failover-tab", (event) => {
       runsList.className = "runs-list muted";
     });
   }
-  if (tab === "compare" && !compareLoaded) {
+  if (tab === "compare" && !compareLoaded && FeatureContext.capability("can_compare")) {
     refreshCompare().catch((err) => {
       compareContent.textContent = err.message;
       compareContent.className = "compare-content muted";

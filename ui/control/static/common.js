@@ -14,6 +14,86 @@ async function api(path, options = {}) {
 }
 
 const ACTIVE_DROPLET_KEY = "failover_active_droplet_v1";
+const ACTIVE_FEATURE_KEY = "benchmark_active_feature_v1";
+
+const FeatureContext = {
+  id: "failover",
+  label: "Failover",
+  features: [],
+  current: null,
+  initialized: false,
+
+  find(id) {
+    return (this.features || []).find((f) => f.id === id) || null;
+  },
+
+  async init() {
+    if (this.initialized) return this;
+    const data = await api("/api/features");
+    this.features = (data.features || []).filter((f) => f.enabled);
+    const saved = localStorage.getItem(ACTIVE_FEATURE_KEY) || "";
+    const initial = this.find(saved) ? saved : (data.active || "failover");
+    this.setFeature(initial, { persist: false, notify: false });
+    this.initialized = true;
+    return this;
+  },
+
+  setFeature(id, { persist = true, notify = true } = {}) {
+    const next = this.find(id) || this.find("failover") || this.features[0];
+    if (!next) return;
+    this.current = next;
+    this.id = next.id;
+    this.label = next.label;
+    if (persist) {
+      localStorage.setItem(ACTIVE_FEATURE_KEY, this.id);
+    }
+    if (notify) {
+      window.dispatchEvent(
+        new CustomEvent("benchmark-feature", {
+          detail: { id: this.id, label: this.label, feature: next },
+        })
+      );
+    }
+  },
+
+  capability(name) {
+    return !!(this.current && this.current[name]);
+  },
+
+  withFeature(path) {
+    if (!this.id || this.id === "failover") {
+      return path;
+    }
+    const sep = path.includes("?") ? "&" : "?";
+    return `${path}${sep}feature=${encodeURIComponent(this.id)}`;
+  },
+
+  renderPicker(selectEl) {
+    if (!selectEl) return;
+    selectEl.innerHTML = (this.features || [])
+      .map((f) => `<option value="${f.id}">${f.label}</option>`)
+      .join("");
+    selectEl.value = this.id;
+  },
+
+  applyTabVisibility() {
+    document.querySelectorAll(".tab-bar .tab[data-requires]").forEach((tab) => {
+      const req = tab.dataset.requires;
+      const allowed = this.capability(req);
+      tab.hidden = !allowed;
+      if (!allowed && tab.classList.contains("active")) {
+        if (typeof window.activateFailoverTab === "function") {
+          window.activateFailoverTab("reports");
+        }
+      }
+    });
+    const title = document.getElementById("app-title");
+    if (title) {
+      title.textContent = `${this.label} benchmark control`;
+    }
+    document.title = `${this.label} benchmark control`;
+  },
+};
 
 const DropletContext = {
   host: "",
@@ -21,6 +101,9 @@ const DropletContext = {
   droplets: [],
   defaultHost: "",
   compareRunsLimit: 6,
+  mapEmpty: false,
+  mapHint: "",
+  featureId: "failover",
   initialized: false,
 
   dropletLabel(d) {
@@ -31,26 +114,41 @@ const DropletContext = {
     return (this.droplets || []).find((d) => d.host === host) || null;
   },
 
-  async init() {
-    if (this.initialized) return this;
-    const data = await api("/api/droplets");
+  async loadForFeature(featureId, { persistHost = true, notify = false } = {}) {
+    const fid = featureId || FeatureContext.id || "failover";
+    const path =
+      fid === "failover"
+        ? "/api/droplets"
+        : `/api/droplets?feature=${encodeURIComponent(fid)}`;
+    const data = await api(path);
+    this.featureId = data.feature || fid;
     this.droplets = data.droplets || [];
     this.defaultHost = data.default_host || (this.droplets[0] && this.droplets[0].host) || "";
-    this.compareRunsLimit = data.compare_runs_limit || 6;
+    this.compareRunsLimit = data.compare_runs_limit || this.compareRunsLimit || 6;
+    this.mapEmpty = !!data.map_empty;
+    this.mapHint = data.map_hint || "";
 
-    const saved = localStorage.getItem(ACTIVE_DROPLET_KEY) || "";
-    const initial = this.findDroplet(saved) ? saved : this.defaultHost;
-    this.setHost(initial, { persist: false, notify: false });
+    // Locked Active droplet = first entry in the feature map (ignore saved host).
+    this.setHost(this.defaultHost, { persist: persistHost, notify });
+    return this;
+  },
+
+  async init() {
+    if (this.initialized) return this;
+    await this.loadForFeature(FeatureContext.id || "failover", {
+      persistHost: true,
+      notify: false,
+    });
     this.initialized = true;
     return this;
   },
 
   setHost(host, { persist = true, notify = true } = {}) {
     const next = host || this.defaultHost;
-    const droplet = this.findDroplet(next);
+    const droplet = this.findDroplet(next) || this.droplets[0] || null;
     this.host = droplet ? droplet.host : this.defaultHost;
     this.name = droplet ? droplet.name : this.host;
-    if (persist) {
+    if (persist && this.host) {
       localStorage.setItem(ACTIVE_DROPLET_KEY, this.host);
     }
     if (notify) {
@@ -71,32 +169,38 @@ const DropletContext = {
   },
 
   withHost(path) {
-    const sep = path.includes("?") ? "&" : "?";
+    const withFeature = FeatureContext.withFeature(path);
+    const sep = withFeature.includes("?") ? "&" : "?";
     const query = this.hostQuery(sep);
-    return query ? `${path}${query}` : path;
+    return query ? `${withFeature}${query}` : withFeature;
   },
 
   withHostBody(body = {}) {
-    if (!this.host || this.host === this.defaultHost) {
-      return body;
+    const next = { ...body };
+    if (FeatureContext.id && FeatureContext.id !== "failover") {
+      next.feature = FeatureContext.id;
     }
-    return { ...body, host: this.host };
+    if (!this.host || this.host === this.defaultHost) {
+      return next;
+    }
+    return { ...next, host: this.host };
   },
 
   renderPicker(selectEl, wrapEl) {
     if (!selectEl) return;
-    selectEl.innerHTML = (this.droplets || [])
-      .map((d) => `<option value="${d.host}">${this.dropletLabel(d)}</option>`)
-      .join("");
-    if (this.findDroplet(this.host)) {
-      selectEl.value = this.host;
-    } else {
-      this.setHost(this.defaultHost, { notify: false });
-      selectEl.value = this.host;
+    selectEl.disabled = true;
+    if (!(this.droplets || []).length) {
+      selectEl.innerHTML = `<option value="">No droplets for this feature</option>`;
+      if (wrapEl) wrapEl.hidden = false;
+      return;
     }
-    if (wrapEl) {
-      wrapEl.hidden = (this.droplets || []).length <= 1;
-    }
+    // Show only the locked default (first map entry) as a read-only field.
+    const active = this.findDroplet(this.defaultHost) || this.droplets[0];
+    this.host = active.host;
+    this.name = active.name;
+    selectEl.innerHTML = `<option value="${active.host}">${this.dropletLabel(active)}</option>`;
+    selectEl.value = active.host;
+    if (wrapEl) wrapEl.hidden = false;
   },
 };
 
@@ -118,11 +222,14 @@ function runBadgesHtml(run) {
   return badges.join("");
 }
 
-function noReportHtml(run) {
+function noReportHtml(run, { canGenerate = true } = {}) {
   if (run.running) {
     return '<p class="run-meta">Run in progress — HTML report will appear when the run finishes (if graph generation is enabled).</p>';
   }
   if (run.completed) {
+    if (!canGenerate) {
+      return '<p class="run-meta">No HTML report on the droplet yet for this run.</p>';
+    }
     return (
       '<p class="run-meta">No HTML report on the droplet yet. ' +
       'This usually means <code>FAILOVER_GENERATE_GRAPHS=0</code> during the run.</p>' +
@@ -134,11 +241,13 @@ function noReportHtml(run) {
 
 function renderRunsList(container, data, { onGenerate } = {}) {
   const runs = data.runs || [];
+  const featureLabel = data.feature_label || FeatureContext.label || "benchmark";
+  const canGenerate = data.can_generate !== false;
   if (!runs.length) {
     const minId = (data.runs_min_id || "").trim();
     container.innerHTML = minId
-      ? `No failover runs found from ${minId} onward.`
-      : "No failover runs found on the droplet.";
+      ? `No ${featureLabel.toLowerCase()} runs found from ${minId} onward.`
+      : `No ${featureLabel.toLowerCase()} runs found on the droplet.`;
     container.className = "runs-list muted";
     return;
   }
@@ -152,7 +261,7 @@ function renderRunsList(container, data, { onGenerate } = {}) {
 
       const reportsBlock = reportItems
         ? `<ul>${reportItems}</ul>`
-        : noReportHtml(run);
+        : noReportHtml(run, { canGenerate });
 
       const primary = run.primary_report;
       const primaryLink = primary
@@ -172,7 +281,7 @@ function renderRunsList(container, data, { onGenerate } = {}) {
     })
     .join("");
 
-  if (onGenerate) {
+  if (onGenerate && canGenerate) {
     container.querySelectorAll(".btn-generate").forEach((button) => {
       button.addEventListener("click", () => onGenerate(button.dataset.resultsDir, button));
     });
@@ -187,7 +296,7 @@ async function generateRunReport(resultsDir, button, host = "") {
   try {
     return await api("/api/runs/generate-report", {
       method: "POST",
-      body: JSON.stringify({ results_dir: resultsDir, host }),
+      body: JSON.stringify(DropletContext.withHostBody({ results_dir: resultsDir, host })),
     });
   } finally {
     if (button) {
@@ -223,6 +332,12 @@ function updateFilterNote(el, minId, prefix) {
 function renderCompareTable(container, data) {
   const runs = data.runs || [];
   const slices = data.slices || [];
+
+  if (data.error) {
+    container.innerHTML = `<p>${data.error}</p>`;
+    container.className = "compare-content muted";
+    return;
+  }
 
   if (!runs.length) {
     const minId = (data.runs_min_id || "").trim();

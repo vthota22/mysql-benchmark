@@ -87,17 +87,37 @@ header h1 { margin: 0 0 0.25rem; font-size: 1.5rem; }
   gap: 1rem;
 }
 
-.global-droplet-picker {
+.header-pickers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1rem;
+  align-items: flex-end;
+}
+
+.global-droplet-picker,
+.global-feature-picker {
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
+  min-width: 180px;
+}
+
+.global-droplet-picker {
   min-width: 220px;
 }
 
-.global-droplet-picker span {
+.global-droplet-picker span,
+.global-feature-picker span {
   font-size: 0.8rem;
   color: var(--muted);
   font-weight: 600;
+}
+
+.global-droplet-picker select:disabled,
+.global-feature-picker select:disabled {
+  opacity: 0.85;
+  cursor: not-allowed;
+  color: var(--text);
 }
 
 .global-droplet-picker select {

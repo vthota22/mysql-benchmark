@@ -3,32 +3,57 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Failover benchmark control</title>
+  <title>Benchmark control</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <header>
     <div class="header-top">
       <div class="header-title">
-        <h1>Failover benchmark control</h1>
+        <h1 id="app-title">Benchmark control</h1>
         <p id="connection-status" class="muted">Checking droplet connection…</p>
       </div>
-      <label class="global-droplet-picker" id="global-droplet-wrap" hidden>
-        <span>Active droplet</span>
-        <select id="global-droplet-picker" aria-label="Active droplet"></select>
-      </label>
+      <div class="header-pickers">
+        <label class="global-feature-picker" id="global-feature-wrap">
+          <span>Feature</span>
+          <select id="global-feature-picker" aria-label="Benchmark feature"></select>
+        </label>
+        <label class="global-droplet-picker" id="global-droplet-wrap">
+          <span>Active droplet</span>
+          <select id="global-droplet-picker" aria-label="Active droplet" disabled></select>
+        </label>
+      </div>
     </div>
   </header>
 
   <nav class="tab-bar" aria-label="Main sections">
-    <button type="button" class="tab active" data-tab="run">Run benchmark</button>
-    <button type="button" class="tab" data-tab="prepare">Load data</button>
-    <button type="button" class="tab" data-tab="reports">Previous reports</button>
-    <button type="button" class="tab" data-tab="compare">Compare results</button>
+    <button type="button" class="tab active" data-tab="reports">Benchmark run reports</button>
+    <button type="button" class="tab" data-tab="run" data-requires="can_start">Run benchmark</button>
+    <button type="button" class="tab" data-tab="prepare" data-requires="can_prepare">Load data</button>
+    <button type="button" class="tab" data-tab="compare" data-requires="can_compare">Compare results</button>
   </nav>
 
   <main>
-    <div id="panel-run" class="tab-panel active">
+    <div id="panel-reports" class="tab-panel active">
+      <section class="card">
+        <div class="section-head">
+          <div>
+            <h2>Benchmark run reports</h2>
+            <p class="muted" id="reports-intro">
+              Runs on the active droplet. Reports are fetched over SSH and cached locally when opened.
+            </p>
+            <p id="reports-browse-note" class="muted hidden"></p>
+            <p id="runs-filter-note" class="muted hidden"></p>
+          </div>
+          <div class="reports-head-actions">
+            <button type="button" id="btn-refresh-runs">Refresh</button>
+          </div>
+        </div>
+        <div id="runs-list" class="runs-list muted">Open this tab to load runs…</div>
+      </section>
+    </div>
+
+    <div id="panel-run" class="tab-panel">
       <section class="card" id="run-panel">
         <h2>Run</h2>
         <div id="run-summary" class="run-summary muted">Loading status…</div>
@@ -106,22 +131,6 @@
       <section class="card">
         <h2>Prepare log</h2>
         <pre id="prepare-log" class="log">No prepare job yet.</pre>
-      </section>
-    </div>
-
-    <div id="panel-reports" class="tab-panel">
-      <section class="card">
-        <div class="section-head">
-          <div>
-            <h2>Previous reports</h2>
-            <p class="muted">Failover runs on the active droplet. Reports are fetched over SSH and cached locally when opened.</p>
-            <p id="runs-filter-note" class="muted hidden"></p>
-          </div>
-          <div class="reports-head-actions">
-            <button type="button" id="btn-refresh-runs">Refresh</button>
-          </div>
-        </div>
-        <div id="runs-list" class="runs-list muted">Open this tab to load runs…</div>
       </section>
     </div>
 
