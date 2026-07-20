@@ -8,8 +8,10 @@ set -euo pipefail
 : "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD}"
 : "${MYSQL_DB:?Set MYSQL_DB}"
 
-SCRIPT_DIR="$(dirname "$0")"
-source "${SCRIPT_DIR}/sysbench_mysql_opts.sh"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=bootstrap/sysbench_mysql_opts.sh
+source "${REPO_ROOT}/bootstrap/sysbench_mysql_opts.sh"
 
 TABLES="${TABLES:-10}"
 TABLE_SIZE="${TABLE_SIZE:-100000}"

@@ -6,5 +6,26 @@ ci-artifacts
 ci/benchmark-target.conf
 control.local.conf
 benchmark.conf
-control/.report_cache
+benchmark.conf.sanitized
 sysbench-1.1/bin/sysbench
+
+# Legacy root UI copy (canonical package is ui/)
+/control/
+
+# App Platform UI — track sources; ignore local secrets/cache
+ui/control.local.conf
+ui/control/.report_cache/
+
+# Python / OS junk
+**/__pycache__/
+*.py[cod]
+.DS_Store
+.matplotlib_cache/
+.write-test
+foo
+
+# Local secrets / one-off artifacts (never commit)
+kubeconfig-*
+*.pem
+Failover report*.html
+install_sysbench_11.log

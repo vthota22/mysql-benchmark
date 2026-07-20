@@ -11,15 +11,17 @@ set -euo pipefail
 : "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD}"
 : "${MYSQL_DB:?Set MYSQL_DB}"
 
-SCRIPT_DIR="$(dirname "$0")"
-source "${SCRIPT_DIR}/sysbench_mysql_opts.sh"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# shellcheck source=bootstrap/sysbench_mysql_opts.sh
+source "${REPO_ROOT}/bootstrap/sysbench_mysql_opts.sh"
 
 TABLES="${TABLES:-10}"
 TABLE_SIZE="${TABLE_SIZE:-100000}"
 WARMUP_SEC="${WARMUP_SEC:-30}"
 RUN_SEC="${RUN_SEC:-120}"
 THREADS="${THREADS:-1 4 8 16 32}"
-RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results}"
+RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/results}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 RUN_DIR="${RESULTS_DIR}/run_${TIMESTAMP}"
 

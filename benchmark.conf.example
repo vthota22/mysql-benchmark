@@ -46,7 +46,9 @@ MYSQL_SETTINGS_CHECK=1
 MYSQL_FAIL_ON_SETTINGS_MISMATCH=0
 # Variables to capture from both clusters (space-separated)
 # Align these in DigitalOcean cluster settings before benchmarking.
-MYSQL_VARS="version version_comment innodb_buffer_pool_size innodb_buffer_pool_instances innodb_log_file_size innodb_flush_log_at_trx_commit innodb_io_capacity innodb_io_capacity_max innodb_read_io_threads innodb_write_io_threads max_connections sql_require_primary_key transaction_isolation binlog_format sync_binlog character_set_server collation_server"
+MYSQL_VARS="version version_comment innodb_buffer_pool_size innodb_buffer_pool_instances innodb_log_file_size innodb_redo_log_capacity innodb_flush_log_at_trx_commit innodb_io_capacity innodb_io_capacity_max innodb_read_io_threads innodb_write_io_threads replica_parallel_workers group_replication_flow_control_certifier_threshold group_replication_flow_control_applier_threshold max_connections sql_require_primary_key transaction_isolation binlog_format sync_binlog character_set_server collation_server"
+# Runtime metadata (buffer pool hit %, BP/data ratio) captured automatically before
+# failover/prepare runs into mysql_runtime.env and merged into benchmark_config.env.
 # Optional: document your intended cluster config (informational — set in DO control panel)
 # MYSQL_CLUSTER_PLAN="db-s-4vcpu-8gb"
 
@@ -72,7 +74,9 @@ FAILOVER_EDITIONS="standard advanced"
 # FAILOVER_TRIGGER_SECOND=         # optional override; default warmup + baseline (= 300 with defaults above)
 # Per scenario wall clock: warmup + baseline + observe (600s with defaults above)
 # FAILOVER_REPORT_INTERVAL=1       # 1-second granularity (required for RTO + graphs)
-# FAILOVER_MONITOR_INTERVAL=1      # primary/topology poll interval (seconds, fixed wall-clock grid)
+# FAILOVER_PRIMARY_MONITOR_INTERVAL=0.25  # VIP/client-path poll (primary_monitor.tsv); sub-second for promote KPI
+# FAILOVER_CLUSTER_MONITOR_INTERVAL=1     # GR pod + K8s pod monitors (kubectl); keep >= 1s
+# FAILOVER_MONITOR_INTERVAL=1      # legacy fallback when the split intervals above are unset
 # FAILOVER_MONITOR_CONNECT_TIMEOUT=1  # mysql --connect-timeout per monitor poll
 # FAILOVER_MONITOR_OP_TIMEOUT=1    # max seconds per mysql session (timeout(1); one session = write + topology)
 # FAILOVER_MONITOR_WRITE_PROBE=1   # INSERT write probe in same mysql session as topology SELECT
@@ -80,6 +84,17 @@ FAILOVER_EDITIONS="standard advanced"
 # FAILOVER_MONITOR_PRIMARY=1       # poll @@hostname, read_only, GR state/role, write probe
 # FAILOVER_GR_POD_MONITOR=1        # Advanced: poll GR role/state/queues on each mysql pod via kubectl exec
 # FAILOVER_K8S_POD_MONITOR=1       # Advanced: poll mysql-* pod phase/readiness via kubectl
+# FAILOVER_HAPROXY_STATS_MONITOR=1 # Advanced: poll HAProxy stats socket (mysql-primary UP) on each haproxy pod
+# FAILOVER_HAPROXY_STATS_MONITOR_INTERVAL=0.5  # seconds between stats polls (0.5 recommended)
+# FAILOVER_GR_READINESS_GATE=1     # Block trigger until all GR members ONLINE, none RECOVERING
+# FAILOVER_GR_READINESS_POLL_SEC=2
+# FAILOVER_GR_READINESS_TIMEOUT_SEC=600
+# FAILOVER_GR_READINESS_ABORT_ON_TIMEOUT=1   # 0 = warn and trigger anyway on timeout
+# FAILOVER_REPLICA_WORKERS_GATE=1            # Before each iteration: SET PERSIST replica_parallel_workers on all pods
+# FAILOVER_REPLICA_PARALLEL_WORKERS=16       # Target value (operator default after pod recreate is 4)
+# FAILOVER_REPLICA_WORKERS_POLL_SEC=2
+# FAILOVER_REPLICA_WORKERS_TIMEOUT_SEC=600
+# FAILOVER_REPLICA_WORKERS_ABORT_ON_TIMEOUT=1
 # FAILOVER_COLLECT_K8S_EVENTS=1    # kubectl event snapshots (Advanced only)
 # FAILOVER_RUN_TPCC_CHECK=0        # 1 = TPC-C check after failover (sets data_loss in failover_kpi.csv)
 #

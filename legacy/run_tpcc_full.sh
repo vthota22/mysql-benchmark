@@ -8,10 +8,10 @@ set -euo pipefail
 : "${MYSQL_PASSWORD:?Set MYSQL_PASSWORD}"
 : "${MYSQL_DB:?Set MYSQL_DB}"
 
-export PATH="${HOME}/mysql-benchmark/sysbench-1.1/bin:${PATH}"
-
-SCRIPT_DIR="$(dirname "$0")"
-RESULTS_DIR="${SCRIPT_DIR}/results/tpcc_run_$(date +%Y%m%d_%H%M%S)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+export PATH="${REPO_ROOT}/sysbench-1.1/bin:${PATH}"
+RESULTS_DIR="${REPO_ROOT}/results/tpcc_run_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "${RESULTS_DIR}"
 
 TPCC_TABLES="${TPCC_TABLES:-1}"
@@ -42,7 +42,7 @@ mysql -h "${MYSQL_HOST}" -P "${MYSQL_PORT}" -u "${MYSQL_USER}" -p"${MYSQL_PASSWO
   | tee "${RESULTS_DIR}/mysql_info.txt"
 echo ""
 
-cd "${SCRIPT_DIR}"
+cd "${REPO_ROOT}"
 
 echo "--- Cleanup ---"
 ./run_tpcc.sh cleanup || true
@@ -79,7 +79,7 @@ echo "--- Parsing results ---"
     "${RESULTS_DIR}/run_output.txt" 2>/dev/null | tail -10 || echo "(parse run_output.txt manually)"
 } | tee "${SUMMARY}"
 
-echo "${RESULTS_DIR}" > "${SCRIPT_DIR}/results/LATEST_TPCC_RUN.txt"
+echo "${RESULTS_DIR}" > "${REPO_ROOT}/results/LATEST_TPCC_RUN.txt"
 echo ""
 echo "=== Done ==="
 echo "Summary: ${SUMMARY}"

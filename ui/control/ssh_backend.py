@@ -305,7 +305,7 @@ class SshBackend:
                 f"SSH to {target} works, but repo path is missing: {repo}\n"
                 f"Clone and set up the benchmark repo on this droplet, e.g.:\n"
                 f"  ssh {self.config.user}@{self.config.host} "
-                f"'git clone <your-repo-url> {repo} && cd {repo} && ./setup_benchmark.sh'"
+                f"'git clone <your-repo-url> {repo} && cd {repo} && ./bootstrap/setup_benchmark.sh'"
             )
 
         ctl = f"{repo_q}/scripts/prepare_run_ctl.sh"

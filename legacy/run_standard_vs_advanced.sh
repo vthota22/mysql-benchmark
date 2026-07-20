@@ -1,28 +1,26 @@
 #!/usr/bin/env bash
 # Compare MySQL Standard vs Advanced Edition using sysbench-tpcc
+# (legacy — moved out of the failover / backup / scaling hot path)
 #
 # Usage:
-#   ./setup_benchmark.sh                    # one-time setup
+#   ./bootstrap/setup_benchmark.sh
 #   cp benchmark.conf.example benchmark.conf
-#   # edit benchmark.conf
-#   ./run_standard_vs_advanced.sh
-#
-# Optional:
-#   BENCHMARK_CONF=/path/to/benchmark.conf ./run_standard_vs_advanced.sh
+#   ./legacy/run_standard_vs_advanced.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG="${BENCHMARK_CONF:-${SCRIPT_DIR}/benchmark.conf}"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CONFIG="${BENCHMARK_CONF:-${REPO_ROOT}/benchmark.conf}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RESULTS_DIR="${SCRIPT_DIR}/results/comparison_${TIMESTAMP}"
+RESULTS_DIR="${REPO_ROOT}/results/comparison_${TIMESTAMP}"
 CSV="${RESULTS_DIR}/comparison.csv"
 SUMMARY="${RESULTS_DIR}/comparison_summary.txt"
 FULL_LOG="${RESULTS_DIR}/full_run.log"
 
-export PATH="${SCRIPT_DIR}/sysbench-1.1/bin:${PATH}"
+export PATH="${REPO_ROOT}/sysbench-1.1/bin:${PATH}"
 
 # shellcheck source=lib/benchmark_common.sh
-source "${SCRIPT_DIR}/lib/benchmark_common.sh"
+source "${REPO_ROOT}/lib/benchmark_common.sh"
 load_benchmark_config "${CONFIG}"
 
 mkdir -p "${RESULTS_DIR}"
@@ -33,7 +31,7 @@ echo "=== MySQL Standard vs Advanced — TPC-C Benchmark ==="
 echo "Started:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "Results:  ${RESULTS_DIR}"
 echo "Config:   ${CONFIG}"
-echo "Sysbench: $("${SCRIPT_DIR}/which_sysbench.sh")"
+echo "Sysbench: $("${REPO_ROOT}/bootstrap/which_sysbench.sh")"
 echo ""
 echo "Dataset:  tables=${TPCC_TABLES:-10} scale=${TPCC_SCALE:-100} force_pk=${TPCC_FORCE_PK:-1}"
 echo "Matrix:   threads=[${THREADS}] durations=[${DURATIONS}] warmup=${WARMUP_SEC:-60}s"
@@ -129,7 +127,7 @@ echo ""
 echo "--- Generating comparison report ---"
 write_comparison_summary "${CSV}" "${SUMMARY}"
 
-echo "${RESULTS_DIR}" > "${SCRIPT_DIR}/results/LATEST_COMPARISON.txt"
+echo "${RESULTS_DIR}" > "${REPO_ROOT}/results/LATEST_COMPARISON.txt"
 
 echo ""
 echo "=== Benchmark complete ==="

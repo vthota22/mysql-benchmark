@@ -11,11 +11,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG="${BENCHMARK_CONF:-${SCRIPT_DIR}/benchmark.conf}"
-RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results/settings_check_$(date +%Y%m%d_%H%M%S)}"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CONFIG="${BENCHMARK_CONF:-${REPO_ROOT}/benchmark.conf}"
+RESULTS_DIR="${RESULTS_DIR:-${REPO_ROOT}/results/settings_check_$(date +%Y%m%d_%H%M%S)}"
 
 # shellcheck source=lib/benchmark_common.sh
-source "${SCRIPT_DIR}/lib/benchmark_common.sh"
+source "${REPO_ROOT}/lib/benchmark_common.sh"
 load_benchmark_config "${CONFIG}"
 
 mkdir -p "${RESULTS_DIR}"

@@ -44,7 +44,7 @@ echo "=== MySQL Failover Benchmark (TPC-C under load) ==="
 echo "Started:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "Results:  ${RESULTS_ROOT}"
 echo "Config:   ${CONFIG}"
-echo "Sysbench: $("${SCRIPT_DIR}/which_sysbench.sh")"
+echo "Sysbench: $("${SCRIPT_DIR}/bootstrap/which_sysbench.sh")"
 echo ""
 echo "Load:     threads=${FAILOVER_THREADS} report-interval=${FAILOVER_REPORT_INTERVAL}s"
 if [[ -n "${FAILOVER_THREAD_MATRIX:-}" ]]; then

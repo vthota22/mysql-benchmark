@@ -3,9 +3,10 @@
 # sysbench 1.0 hard-codes: client-key.pem, client-cert.pem, cacert.pem in cwd
 set -euo pipefail
 
-SCRIPT_DIR="$(dirname "$0")"
-SSL_DIR="${SCRIPT_DIR}/ssl-certs"
-TPCC_DIR="${1:-${SCRIPT_DIR}/TPCC/sysbench-tpcc}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SSL_DIR="${REPO_ROOT}/ssl-certs"
+TPCC_DIR="${1:-${REPO_ROOT}/TPCC/sysbench-tpcc}"
 
 if [[ ! -d "${TPCC_DIR}" ]]; then
   echo "ERROR: TPC-C dir not found: ${TPCC_DIR}"
@@ -41,7 +42,7 @@ else
   echo ""
   echo "RECOMMENDED: install sysbench 1.1+ (no cacert.pem needed):"
   echo "  ${SCRIPT_DIR}/install_sysbench_11.sh"
-  echo "  export PATH=\"${SCRIPT_DIR}/sysbench-1.1/bin:\$PATH\""
+  echo "  export PATH=\"${REPO_ROOT}/sysbench-1.1/bin:\$PATH\""
   exit 1
 fi
 

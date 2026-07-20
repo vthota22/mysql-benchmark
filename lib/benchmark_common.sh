@@ -5,7 +5,7 @@ set -euo pipefail
 BENCH_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # shellcheck source=/dev/null
-source "${BENCH_ROOT}/sysbench_mysql_opts.sh"
+source "${BENCH_ROOT}/bootstrap/sysbench_mysql_opts.sh"
 
 load_benchmark_config() {
   local config_file="${1:?config file required}"
@@ -77,7 +77,7 @@ run_tpcc_command() {
   local tpcc
   tpcc="$(tpcc_dir)"
   if [[ ! -f "${tpcc}/tpcc.lua" ]]; then
-    echo "ERROR: Missing ${tpcc}/tpcc.lua — run setup_benchmark.sh first" >&2
+    echo "ERROR: Missing ${tpcc}/tpcc.lua — run bootstrap/setup_benchmark.sh first" >&2
     exit 1
   fi
 

@@ -3,8 +3,9 @@
 # Usage: set MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DB
 #        then call build_mysql_base_opts (or source after vars are set)
 
-_SYSBENCH_OPTS_DIR="$(dirname "${BASH_SOURCE[0]}")"
-SYSBENCH_BIN="$("${_SYSBENCH_OPTS_DIR}/which_sysbench.sh")"
+_BOOTSTRAP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_REPO_ROOT="$(cd "${_BOOTSTRAP_DIR}/.." && pwd)"
+SYSBENCH_BIN="$("${_BOOTSTRAP_DIR}/which_sysbench.sh")"
 SYSBENCH_VERSION=$("${SYSBENCH_BIN}" --version 2>&1 | awk '{print $2}')
 
 build_mysql_base_opts() {
@@ -37,8 +38,8 @@ if [[ "${SB_MAJOR}" -ge 1 && "${SB_MINOR}" -ge 1 ]] 2>/dev/null \
 else
   SYSBENCH_SSL_MODE="1.0"
   MYSQL_SSL_OPTS=(--mysql-ssl=on)
-  SSL_DIR="${_SYSBENCH_OPTS_DIR}/ssl-certs"
-  "${_SYSBENCH_OPTS_DIR}/setup_sysbench_ssl.sh" >/dev/null
+  SSL_DIR="${_REPO_ROOT}/ssl-certs"
+  "${_BOOTSTRAP_DIR}/setup_sysbench_ssl.sh" >/dev/null
 fi
 
 _sysbench_bin_invocation() {
@@ -64,7 +65,7 @@ run_sysbench_tpcc() {
   shift
   build_mysql_base_opts
   if [[ "${SYSBENCH_SSL_MODE}" == "1.0" ]]; then
-    "${_SYSBENCH_OPTS_DIR}/setup_tpcc_ssl.sh" "${tpcc_dir}"
+    "${_BOOTSTRAP_DIR}/setup_tpcc_ssl.sh" "${tpcc_dir}"
   fi
   (cd "${tpcc_dir}" && _sysbench_bin_invocation tpcc.lua "$@")
 }

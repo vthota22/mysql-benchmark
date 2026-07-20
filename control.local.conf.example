@@ -1,0 +1,34 @@
+# Local control UI — copy to control.local.conf (gitignored) and fill in your droplet.
+#
+#   cp control.local.conf.example control.local.conf
+#
+# Then from your laptop:
+#   python3 control_ui.py
+#   open http://127.0.0.1:8765
+
+DROPLET_HOST=your-droplet-ip-or-hostname
+DROPLET_USER=root
+DROPLET_SSH_PORT=22
+# Optional friendly name for the default droplet (shown in the reports picker)
+# DROPLET_NAME=primary
+# Optional if not using default ssh agent / ~/.ssh/config
+# DROPLET_SSH_KEY=~/.ssh/id_rsa
+
+# Extra droplets for the global "Active droplet" picker (name:ip pairs, comma-separated).
+# They reuse the same SSH user/port/key and REMOTE_REPO as the default droplet.
+# DROPLET_MAP=staging:10.0.0.2, prod-eu:10.0.0.3
+
+# Path to this repo on the droplet (where run_failover_benchmark.sh lives)
+REMOTE_REPO=/root/mysql-benchmark
+
+# benchmark.conf path relative to REMOTE_REPO
+REMOTE_BENCHMARK_CONF=benchmark.conf
+
+# Local UI bind (override on CLI: python3 control_ui.py --port 8765)
+# CONTROL_PORT=8765
+
+# Previous runs page: only show this run and newer (omit to list all runs)
+# RUNS_MIN_ID=failover_20260702_020852
+
+# Compare results tab: number of recent runs to compare (default 6, max 12)
+# COMPARE_RUNS_LIMIT=6

@@ -32,7 +32,7 @@ echo "Started:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "Results:  ${RESULTS_ROOT}"
 echo "Config:   ${CONFIG}"
 echo "Edition:  ${EDITION}"
-echo "Sysbench: $("${REPO_ROOT}/which_sysbench.sh" 2>/dev/null || echo sysbench)"
+echo "Sysbench: $("${REPO_ROOT}/bootstrap/which_sysbench.sh" 2>/dev/null || echo sysbench)"
 echo ""
 
 load_benchmark_config "${CONFIG}"

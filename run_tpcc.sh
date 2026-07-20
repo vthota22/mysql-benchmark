@@ -20,9 +20,10 @@ set -euo pipefail
 
 COMMAND="${1:?Usage: $0 prepare|run|check|cleanup}"
 
-SCRIPT_DIR="$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TPCC_DIR="${TPCC_DIR:-${SCRIPT_DIR}/TPCC/sysbench-tpcc}"
-source "${SCRIPT_DIR}/sysbench_mysql_opts.sh"
+# shellcheck source=bootstrap/sysbench_mysql_opts.sh
+source "${SCRIPT_DIR}/bootstrap/sysbench_mysql_opts.sh"
 
 TPCC_TABLES="${TPCC_TABLES:-1}"
 TPCC_SCALE="${TPCC_SCALE:-10}"

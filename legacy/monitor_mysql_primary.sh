@@ -8,11 +8,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CONFIG="${BENCHMARK_CONF:-${SCRIPT_DIR}/benchmark.conf}"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+CONFIG="${BENCHMARK_CONF:-${REPO_ROOT}/benchmark.conf}"
 RESULTS_DIR="${1:?Usage: $0 <results_dir>}"
 
 # shellcheck source=lib/failover_common.sh
-source "${SCRIPT_DIR}/lib/failover_common.sh"
+source "${REPO_ROOT}/lib/failover_common.sh"
 load_benchmark_config "${CONFIG}"
 
 EDITION="${FAILOVER_EDITION:-${MONITOR_EDITION:-standard}}"

@@ -10,7 +10,9 @@
 # For dev/internal clusters: do NOT use cacert.pem — only dummy client certs.
 set -euo pipefail
 
-SSL_DIR="$(dirname "$0")/ssl-certs"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SSL_DIR="${REPO_ROOT}/ssl-certs"
 mkdir -p "${SSL_DIR}"
 
 # Dummy client cert/key — required by sysbench 1.0.x file checks; server won't verify these
