@@ -4,11 +4,11 @@
 # Usage:
 #   trigger_failover.sh <edition> <results_dir> [action]
 #
-# Actions (Advanced pod delete; harness uses prepare → refresh → fire):
-#   prepare  — fetch kubeconfig, validate kubectl, resolve primary pod (during baseline)
-#   refresh  — re-resolve primary pod shortly before trigger second
-#   fire     — kubectl delete/kill using kubeconfig + target pod from refresh (no re-resolve)
-#   (omit)   — one-shot: prepare + delete immediately (manual / legacy)
+# Actions (Advanced; harness uses prepare → refresh → fire):
+#   prepare  — fetch kubeconfig, validate kubectl, resolve primary (+ promote target) pod
+#   refresh  — re-resolve primary / promote target shortly before trigger second
+#   fire     — pod_delete | mysqld_kill | set_as_primary using prepared env (no re-resolve)
+#   (omit)   — one-shot: prepare + fire immediately (manual / legacy)
 #
 # Requires benchmark.conf (via BENCHMARK_CONF) and edition-specific settings.
 set -euo pipefail
@@ -59,6 +59,7 @@ write_failover_prepared_env() {
   local ns="${3:?namespace required}"
   local delete_force="${4:-1}"
   local delete_grace="${5:-0}"
+  local promote_pod="${6:-}"
 
   cat > "${PREPARED_ENV}" <<EOF
 FAILOVER_PREPARED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -66,6 +67,7 @@ FAILOVER_KUBECONFIG=${kubeconfig}
 FAILOVER_K8S_NAMESPACE=${ns}
 FAILOVER_K8S_CONTEXT=${ADVANCED_K8S_CONTEXT:-}
 FAILOVER_TARGET_POD=${pod}
+FAILOVER_PROMOTE_POD=${promote_pod}
 FAILOVER_POD_DELETE_FORCE=${delete_force}
 FAILOVER_POD_DELETE_GRACE_SEC=${delete_grace}
 EOF
@@ -371,6 +373,85 @@ _advanced_failover_kill_mysqld() {
   log_failover_do_events "${RESULTS_DIR}" "advanced" "post_mysqld_kill"
 }
 
+# Pick a SECONDARY mysql pod to promote (graceful planned primary replacement).
+find_advanced_promote_pod() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local primary_pod="${2:?primary pod required}"
+  local ns="${ADVANCED_K8S_NAMESPACE:-}"
+  local log="${TRIGGER_LOG}"
+  local pod role workers
+  : "${ns:?Set ADVANCED_K8S_NAMESPACE in benchmark.conf}"
+
+  if [[ -n "${ADVANCED_K8S_PROMOTE_POD_NAME:-}" ]]; then
+    echo "Using configured promote pod: ${ADVANCED_K8S_PROMOTE_POD_NAME}" >> "${log}"
+    echo "${ADVANCED_K8S_PROMOTE_POD_NAME}"
+    return 0
+  fi
+
+  while IFS= read -r pod; do
+    [[ -n "${pod}" ]] || continue
+    [[ "${pod}" == "${primary_pod}" ]] && continue
+    if ! IFS=$'\t' read -r role workers < <(_failover_poll_pod_replica_workers_role "${kubeconfig}" "${ns}" "${pod}"); then
+      echo "WARNING: could not read GR role on ${pod}" >> "${log}"
+      continue
+    fi
+    if [[ "${role}" == "SECONDARY" ]]; then
+      echo "Promote candidate (SECONDARY): ${pod}" >> "${log}"
+      echo "${pod}"
+      return 0
+    fi
+  done < <(_failover_list_mysql_pods "${kubeconfig}" "${ns}")
+
+  echo "ERROR: Could not find a SECONDARY mysql pod to promote (primary=${primary_pod})." >> "${log}"
+  return 1
+}
+
+_advanced_failover_set_as_primary() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local primary_pod="${2:?primary pod required}"
+  local promote_pod="${3:?promote pod required}"
+  local ns="${4:?namespace required}"
+  local member_id
+
+  echo "FAILOVER_METHOD=group_replication_set_as_primary" >> "${EVENT_FILE}"
+  echo "FAILOVER_TARGET_POD=${primary_pod}" >> "${EVENT_FILE}"
+  echo "FAILOVER_PROMOTE_POD=${promote_pod}" >> "${EVENT_FILE}"
+
+  member_id="$(_failover_get_pod_server_uuid "${kubeconfig}" "${ns}" "${promote_pod}")"
+  [[ -n "${member_id}" ]] || {
+    echo "ERROR: could not read server_uuid on promote pod ${promote_pod}" | tee -a "${TRIGGER_LOG}"
+    return 1
+  }
+  if [[ ! "${member_id}" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+    echo "ERROR: invalid server_uuid from ${promote_pod}: '${member_id}' (expected UUID)" | tee -a "${TRIGGER_LOG}"
+    return 1
+  fi
+  echo "FAILOVER_PROMOTE_MEMBER_ID=${member_id}" >> "${EVENT_FILE}"
+
+  echo "Graceful primary replacement: promoting ${promote_pod} (${member_id}) via ${primary_pod}..." \
+    | tee -a "${TRIGGER_LOG}"
+  echo "SQL: SELECT group_replication_set_as_primary('${member_id}');" >> "${TRIGGER_LOG}"
+
+  echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
+  echo "FAILOVER_TRIGGER_EPOCH=$(python3 -c 'import time; print("%.3f" % time.time())')" >> "${EVENT_FILE}"
+  echo "FAILOVER_SET_AS_PRIMARY_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
+
+  if ! _failover_mysql_root_exec "${kubeconfig}" "${ns}" "${primary_pod}" \
+    "SELECT group_replication_set_as_primary('${member_id}');" 60 | tee -a "${TRIGGER_LOG}"; then
+    echo "ERROR: group_replication_set_as_primary failed for ${promote_pod}" | tee -a "${TRIGGER_LOG}"
+    return 1
+  fi
+
+  echo "group_replication_set_as_primary issued at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${TRIGGER_LOG}"
+  {
+    echo "PRIMARY_BEFORE=${primary_pod}"
+    echo "PRIMARY_AFTER=${promote_pod}"
+    echo "PROMOTE_MEMBER_ID=${member_id}"
+  } > "${RESULTS_DIR}/primary_change.env"
+  _failover_snapshot_k8s_events "${RESULTS_DIR}" "post_set_as_primary"
+  log_failover_do_events "${RESULTS_DIR}" "advanced" "post_set_as_primary"
+}
+
 prepare_advanced_failover_trigger() {
   if ! failover_advanced_trigger_active; then
     if ! failover_trigger_enabled; then
@@ -390,15 +471,21 @@ prepare_advanced_failover_trigger() {
 
   local delete_force="${FAILOVER_POD_DELETE_FORCE:-1}"
   local delete_grace="${FAILOVER_POD_DELETE_GRACE_SEC:-0}"
-  local kubeconfig pod ns
+  local kubeconfig pod ns promote_pod=""
+  local method
+  method="$(failover_advanced_trigger_method)"
 
   ns="${ADVANCED_K8S_NAMESPACE:?Set ADVANCED_K8S_NAMESPACE}"
   echo "Preparing Advanced failover trigger at $(date -u +%Y-%m-%dT%H:%M:%SZ)..." | tee -a "${TRIGGER_LOG}"
   kubeconfig=$(fetch_advanced_kubeconfig)
   pod=$(find_advanced_primary_pod "${kubeconfig}")
+  if [[ "${method}" == "set_as_primary" ]]; then
+    promote_pod=$(find_advanced_promote_pod "${kubeconfig}" "${pod}")
+  fi
 
-  write_failover_prepared_env "${kubeconfig}" "${pod}" "${ns}" "${delete_force}" "${delete_grace}"
-  echo "Prepared: kubeconfig=${kubeconfig} target_pod=${pod} namespace=${ns}" | tee -a "${TRIGGER_LOG}"
+  write_failover_prepared_env "${kubeconfig}" "${pod}" "${ns}" "${delete_force}" "${delete_grace}" "${promote_pod}"
+  echo "Prepared: kubeconfig=${kubeconfig} target_pod=${pod} promote_pod=${promote_pod:-none} namespace=${ns}" \
+    | tee -a "${TRIGGER_LOG}"
 }
 
 refresh_advanced_failover_trigger() {
@@ -409,11 +496,17 @@ refresh_advanced_failover_trigger() {
     return 1
   fi
 
-  local pod
+  local pod promote_pod=""
+  local method
+  method="$(failover_advanced_trigger_method)"
   pod=$(find_advanced_primary_pod "${FAILOVER_KUBECONFIG}")
+  if [[ "${method}" == "set_as_primary" ]]; then
+    promote_pod=$(find_advanced_promote_pod "${FAILOVER_KUBECONFIG}" "${pod}")
+  fi
   write_failover_prepared_env "${FAILOVER_KUBECONFIG}" "${pod}" "${FAILOVER_K8S_NAMESPACE}" \
-    "${FAILOVER_POD_DELETE_FORCE:-1}" "${FAILOVER_POD_DELETE_GRACE_SEC:-0}"
-  echo "Refreshed primary pod for trigger: ${pod} at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${TRIGGER_LOG}"
+    "${FAILOVER_POD_DELETE_FORCE:-1}" "${FAILOVER_POD_DELETE_GRACE_SEC:-0}" "${promote_pod}"
+  echo "Refreshed primary=${pod} promote=${promote_pod:-none} at $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    | tee -a "${TRIGGER_LOG}"
 }
 
 fire_advanced_failover_trigger() {
@@ -428,7 +521,7 @@ fire_advanced_failover_trigger() {
 
   load_failover_prepared_env
 
-  local pod="${FAILOVER_TARGET_POD}" method
+  local pod="${FAILOVER_TARGET_POD}" promote_pod="${FAILOVER_PROMOTE_POD:-}" method
   echo "Using primary pod from refresh: ${pod} at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${TRIGGER_LOG}"
 
   method="$(failover_advanced_trigger_method)"
@@ -439,6 +532,12 @@ fire_advanced_failover_trigger() {
       ;;
     mysqld_kill)
       _advanced_failover_kill_mysqld "${FAILOVER_KUBECONFIG}" "${pod}" "${FAILOVER_K8S_NAMESPACE}"
+      ;;
+    set_as_primary)
+      : "${promote_pod:?FAILOVER_PROMOTE_POD missing in prepared env — run refresh first}"
+      echo "Using promote pod from refresh: ${promote_pod}" | tee -a "${TRIGGER_LOG}"
+      _advanced_failover_set_as_primary "${FAILOVER_KUBECONFIG}" "${pod}" "${promote_pod}" \
+        "${FAILOVER_K8S_NAMESPACE}"
       ;;
     *)
       echo "ERROR: Unknown FAILOVER_ADVANCED_TRIGGER_METHOD=${method}" >&2

@@ -86,7 +86,9 @@ FAILOVER_EDITIONS="standard advanced"
 # FAILOVER_K8S_POD_MONITOR=1       # Advanced: poll mysql-* pod phase/readiness via kubectl
 # FAILOVER_HAPROXY_STATS_MONITOR=1 # Advanced: poll HAProxy stats socket (mysql-primary UP) on each haproxy pod
 # FAILOVER_HAPROXY_STATS_MONITOR_INTERVAL=0.5  # seconds between stats polls (0.5 recommended)
-# FAILOVER_GR_READINESS_GATE=1     # Block trigger until all GR members ONLINE, none RECOVERING
+# FAILOVER_GR_READINESS_GATE=1     # Block trigger until GR + mysql pods are fully healthy
+# FAILOVER_GR_EXPECTED_MEMBERS=3   # Require this many ONLINE GR members (0 = do not enforce count)
+# FAILOVER_GR_REQUIRE_K8S_PODS_READY=1  # Also require that many mysql-* pods Ready (not deleting)
 # FAILOVER_GR_READINESS_POLL_SEC=2
 # FAILOVER_GR_READINESS_TIMEOUT_SEC=600
 # FAILOVER_GR_READINESS_ABORT_ON_TIMEOUT=1   # 0 = warn and trigger anyway on timeout
@@ -103,18 +105,32 @@ FAILOVER_EDITIONS="standard advanced"
 # FAILOVER_SCENARIO_DELAY_SEC=120         # pause between scenarios (cooldown / cluster settle)
 # FAILOVER_THREAD_MATRIX="4 8 16 32"      # run failover at each thread count (results under edition/t<N>/)
 # FAILOVER_THREAD_DELAY_SEC=120             # pause between thread counts in a matrix run
+# Unplanned + planned in one harness run (advanced only):
+# FAILOVER_TRIGGER_MATRIX="pod_delete set_as_primary"
+# FAILOVER_TRIGGER_MATRIX_DELAY_SEC=180     # settle between trigger methods (GR readiness also re-checked)
 # FAILOVER_ITERATIONS=1                     # repeat full scenario loop N times (results under edition/iter<N>/)
-# FAILOVER_ITERATION_DELAY_SEC=120          # pause between back-to-back failover iterations
+# FAILOVER_ITERATION_DELAY_SEC=120          # soft cooldown between iters; readiness gate waits for full health
 # TPC-C trx_profile is passed to tpcc.lua: mixed = standard TPC-C mix; write_only = 50/50 new_order/payment
 #
-# Output: results/failover_*/advanced/t<N>/<scenario>/...  (when FAILOVER_THREAD_MATRIX is set)
+# Output layouts (any combination of the optional nest levels):
+#   results/failover_*/advanced/<scenario>/
+#   results/failover_*/advanced/t<N>/<scenario>/
+#   results/failover_*/advanced/pod_delete/<scenario>/   # when FAILOVER_TRIGGER_MATRIX is set
+#   results/failover_*/advanced/iter<N>/set_as_primary/t<N>/<scenario>/
 # Combined HTML (thread toggle): results/failover_*/advanced/graphs/failover_report.html
 #   mixed/      — standard TPC-C transaction mix (reads + writes)
 #   write_only/ — 100% new_order/payment; writes_failed_during_failover KPI populated
 # Combined rollup: results/failover_*/failover_kpi.csv and failover_comparison.txt
-#   failure_detection_sec   — trigger → first monitor connect failure (connect_ok=0)
-#   primary_election_sec    — first connect failure → promotion (GR PRIMARY + write_ok=1)
-#   total_failover_sec      — trigger → promotion (total downtime until writes OK)
+# Unplanned (pod_delete / mysqld_kill):
+#   failure_detection_sec   — trigger → first connect_ok=0 (within FAILOVER_DETECT_WINDOW_SEC)
+#   primary_election_sec    — first connect_ok=0 → new PRIMARY hostname + write_ok=1
+#   total_failover_sec      — trigger → new PRIMARY hostname + write_ok=1 (includes detect)
+# Planned (set_as_primary):
+#   failure_detection_sec   — N/A
+#   primary_election_sec    — write-path downtime (first write_ok=0 → new PRIMARY + write_ok=1)
+#   total_failover_sec      — same write-path downtime (0 if never unhealthy but primary moved)
+# FAILOVER_DETECT_WINDOW_SEC=60           # unplanned connect-fail accept window
+# FAILOVER_PLANNED_DETECT_WINDOW_SEC=10   # planned write/connect outage accept window
 #   app_recovery_sec        — trigger → RTO (TPS ≥ 90% baseline for 30s stable)
 #   transactions_failed_during_failover — excess err/s + reconn/s over pre-trigger baseline (TTD → RTO)
 #   writes_failed_during_failover — monitor polls with connect_ok=1 and write_ok=0 (trigger → max(RTO, promote))
@@ -166,13 +182,20 @@ STANDARD_CLUSTER_UUID=
 # STANDARD_CLUSTER_NUM_NODES=3   # see NUM_NODES / STANDARD_CLUSTER_NUM_NODES at top of file
 
 # --- Advanced Edition failover trigger ---
-# Method: pod_delete | mysqld_kill
-#   pod_delete   — kubectl delete primary pod (default)
-#   mysqld_kill  — kubectl exec kill mysqld inside primary pod (process crash)
+# Method: pod_delete | mysqld_kill | set_as_primary
+#   pod_delete      — kubectl delete primary pod (default; unplanned)
+#   mysqld_kill     — kubectl exec kill mysqld inside primary pod (process crash)
+#   set_as_primary  — graceful planned primary replacement via group_replication_set_as_primary
 FAILOVER_ADVANCED_TRIGGER_METHOD=pod_delete
+# Run unplanned then planned in one harness invocation (results under advanced/<method>/...).
+# Leave unset to use only FAILOVER_ADVANCED_TRIGGER_METHOD above (no extra method subdir).
+FAILOVER_TRIGGER_MATRIX="pod_delete set_as_primary"
+FAILOVER_TRIGGER_MATRIX_DELAY_SEC=180
 # Harness prepares kubeconfig + primary pod during baseline, re-resolves pod
 # FAILOVER_TRIGGER_PREPARE_SEC seconds before trigger, then fires at trigger second.
 # FAILOVER_TRIGGER_PREPARE_SEC=5
+# Optional: pin which SECONDARY to promote for set_as_primary (else first SECONDARY found)
+# ADVANCED_K8S_PROMOTE_POD_NAME=
 # pod_delete: ungraceful kill (default): grace-period=0 --force
 FAILOVER_POD_DELETE_FORCE=1
 FAILOVER_POD_DELETE_GRACE_SEC=0

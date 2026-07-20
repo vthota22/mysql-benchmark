@@ -455,6 +455,20 @@ button:disabled {
   margin-left: 0.35rem;
 }
 
+.badge.failover-planned {
+  background: rgba(56, 189, 248, 0.18);
+  color: #7dd3fc;
+  margin-left: 0.45rem;
+  vertical-align: middle;
+}
+
+.badge.failover-unplanned {
+  background: rgba(251, 146, 60, 0.18);
+  color: #fdba74;
+  margin-left: 0.45rem;
+  vertical-align: middle;
+}
+
 .btn-generate {
   border: 1px solid var(--accent);
   background: transparent;

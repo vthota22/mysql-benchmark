@@ -113,6 +113,33 @@ def report_view_url(rel_path: str) -> str:
     return f"/reports/{validate_results_path(rel_path)}"
 
 
+_TRIGGER_METHOD_LABELS = {
+    "pod_delete": ("unplanned", "Unplanned (pod_delete)"),
+    "mysqld_kill": ("unplanned", "Unplanned (mysqld_kill)"),
+    "set_as_primary": ("planned", "Planned (set_as_primary)"),
+}
+
+
+def failover_mode_from_path(rel_path: str) -> str:
+    """Return 'planned', 'unplanned', or '' from a results path."""
+    try:
+        rel = validate_results_path(rel_path)
+    except ValueError:
+        rel = rel_path.strip().lstrip("/").replace("\\", "/")
+    for part in Path(rel).parts:
+        mode = _TRIGGER_METHOD_LABELS.get(part, ("", ""))[0]
+        if mode:
+            return mode
+    return ""
+
+
+def _humanize_path_part(part: str) -> str:
+    labeled = _TRIGGER_METHOD_LABELS.get(part)
+    if labeled:
+        return labeled[1]
+    return part
+
+
 def report_label(rel_path: str) -> str:
     rel = validate_results_path(rel_path)
     feature = _feature_for_path(rel)
@@ -120,6 +147,7 @@ def report_label(rel_path: str) -> str:
     # Failover: label by path under the run dir, e.g.
     #   .../advanced/graphs/failover_report.html              → Combined report
     #   .../advanced/iter1/t16/mixed/graphs/failover_report.html → advanced · iter1 · t16 · mixed
+    #   .../advanced/pod_delete/mixed/graphs/... → advanced · Unplanned (pod_delete) · mixed
     if feature.id == "failover" and rel.endswith("/graphs/failover_report.html"):
         prefix = rel[: -len("/graphs/failover_report.html")]
         parts = Path(prefix).parts  # results / failover_TS / advanced [/ iter…]
@@ -128,7 +156,7 @@ def report_label(rel_path: str) -> str:
         scenario = parts[2:]
         if scenario == ("advanced",):
             return "Combined report"
-        return " · ".join(scenario)
+        return " · ".join(_humanize_path_part(p) for p in scenario)
 
     if rel.endswith(feature.primary_report_suffix) or Path(rel).name == feature.report_html_name:
         return "Primary report"
@@ -156,12 +184,17 @@ def pick_primary_report(reports: list[dict], feature: FeatureProfile | None = No
 
 def _report_entry(rel_path: str, mtime: int = 0) -> dict:
     path = validate_results_path(rel_path)
-    return {
+    mode = failover_mode_from_path(path)
+    entry = {
         "path": path,
         "label": report_label(path),
         "view_url": report_view_url(path),
         "mtime": mtime,
     }
+    if mode:
+        entry["failover_mode"] = mode
+        entry["failover_mode_label"] = "Planned" if mode == "planned" else "Unplanned"
+    return entry
 
 
 class ReportProxy:

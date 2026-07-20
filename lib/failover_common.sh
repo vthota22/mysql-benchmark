@@ -37,11 +37,15 @@ failover_defaults() {
   : "${FAILOVER_K8S_POD_MONITOR:=1}"
   : "${FAILOVER_HAPROXY_STATS_MONITOR:=1}"
   : "${FAILOVER_HAPROXY_STATS_MONITOR_INTERVAL:=0.5}"
-  # Block failover trigger until all GR members are ONLINE and none RECOVERING
+  # Block failover trigger until GR is fully healthy (expected members ONLINE, 1 PRIMARY)
   : "${FAILOVER_GR_READINESS_GATE:=1}"
   : "${FAILOVER_GR_READINESS_POLL_SEC:=2}"
   : "${FAILOVER_GR_READINESS_TIMEOUT_SEC:=600}"
   : "${FAILOVER_GR_READINESS_ABORT_ON_TIMEOUT:=1}"
+  # Require this many ONLINE GR members (and Ready mysql-* pods). 0 = do not enforce count.
+  : "${FAILOVER_GR_EXPECTED_MEMBERS:=3}"
+  # Also require all mysql-* pods Ready (phase=Running, ready_num==ready_den, not deleting)
+  : "${FAILOVER_GR_REQUIRE_K8S_PODS_READY:=1}"
   # Advanced: ensure replica_parallel_workers on every pod before each iteration / trigger
   : "${FAILOVER_REPLICA_WORKERS_GATE:=1}"
   : "${FAILOVER_REPLICA_PARALLEL_WORKERS:=16}"
@@ -57,6 +61,10 @@ failover_defaults() {
   : "${FAILOVER_POD_DELETE_FORCE:=1}"
   : "${FAILOVER_POD_DELETE_GRACE_SEC:=0}"
   : "${FAILOVER_MYSQLD_KILL_SIGNAL:=9}"
+  # Unplanned: max seconds after trigger to accept connect_ok=0 as detection.
+  : "${FAILOVER_DETECT_WINDOW_SEC:=60}"
+  # Planned (set_as_primary): max seconds after trigger to accept write/connect outage start.
+  : "${FAILOVER_PLANNED_DETECT_WINDOW_SEC:=10}"
   : "${ADVANCED_K8S_MYSQL_CONTAINER:=mysql}"
   # Advanced: fetch kubeconfig early; re-resolve primary pod this many seconds before delete
   : "${FAILOVER_TRIGGER_PREPARE_SEC:=5}"
@@ -65,6 +73,10 @@ failover_defaults() {
   # Space-separated load thread counts; when set, runs each under edition/t<N>/<scenario>/
   : "${FAILOVER_THREAD_MATRIX:=}"
   : "${FAILOVER_THREAD_DELAY_SEC:=120}"
+  # Space-separated advanced trigger methods; when set, runs each under edition/<method>/...
+  # Example: "pod_delete set_as_primary" (unplanned then planned). Empty = use FAILOVER_ADVANCED_TRIGGER_METHOD only.
+  : "${FAILOVER_TRIGGER_MATRIX:=}"
+  : "${FAILOVER_TRIGGER_MATRIX_DELAY_SEC:=180}"
   # Repeat full failover scenario loop N times (results under edition/iter<N>/); single combined report at end
   : "${FAILOVER_ITERATIONS:=1}"
   : "${FAILOVER_ITERATION_DELAY_SEC:=120}"
@@ -192,6 +204,8 @@ write_failover_benchmark_config() {
     echo "TPCC_THREADS=${load_threads}"
     echo "PREP_THREADS=${prep_threads}"
     echo "FAILOVER_THREAD_MATRIX=${FAILOVER_THREAD_MATRIX:-}"
+    echo "FAILOVER_TRIGGER_MATRIX=${FAILOVER_TRIGGER_MATRIX:-}"
+    echo "FAILOVER_ADVANCED_TRIGGER_METHOD=${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}"
     echo "FAILOVER_SCENARIOS=${FAILOVER_SCENARIOS:-mixed write_only}"
   } > "${edition_dir}/benchmark_config.env"
 }
@@ -239,15 +253,48 @@ failover_advanced_trigger_method() {
   echo "${FAILOVER_ADVANCED_TRIGGER_METHOD}"
 }
 
-# Advanced kubectl-based trigger (pod delete or mysqld kill inside primary pod).
+# Valid advanced trigger methods for FAILOVER_TRIGGER_MATRIX / FAILOVER_ADVANCED_TRIGGER_METHOD.
+failover_is_advanced_trigger_method() {
+  case "${1:-}" in
+    pod_delete|mysqld_kill|set_as_primary) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Resolve the list of advanced trigger methods for one edition run.
+# When FAILOVER_TRIGGER_MATRIX is set, that list is used; otherwise a single
+# FAILOVER_ADVANCED_TRIGGER_METHOD entry (no extra results subdir).
+failover_trigger_matrix_methods() {
+  failover_defaults
+  local method
+  if [[ -n "${FAILOVER_TRIGGER_MATRIX:-}" ]]; then
+    for method in ${FAILOVER_TRIGGER_MATRIX}; do
+      if ! failover_is_advanced_trigger_method "${method}"; then
+        echo "ERROR: Unknown FAILOVER_TRIGGER_MATRIX entry '${method}' (use pod_delete, mysqld_kill, set_as_primary)" >&2
+        return 1
+      fi
+      echo "${method}"
+    done
+    return 0
+  fi
+  method="${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}"
+  if ! failover_is_advanced_trigger_method "${method}"; then
+    echo "ERROR: Unknown FAILOVER_ADVANCED_TRIGGER_METHOD=${method} (use pod_delete, mysqld_kill, set_as_primary)" >&2
+    return 1
+  fi
+  echo "${method}"
+}
+
+# Advanced kubectl-based trigger (pod delete, mysqld kill, or graceful GR switchover).
 failover_advanced_trigger_active() {
   failover_defaults
   failover_trigger_enabled || return 1
   case "$(failover_advanced_trigger_method)" in
     pod_delete) failover_pod_delete_enabled ;;
     mysqld_kill) return 0 ;;
+    set_as_primary) return 0 ;;
     *)
-      echo "ERROR: Unknown FAILOVER_ADVANCED_TRIGGER_METHOD=$(failover_advanced_trigger_method) (use pod_delete or mysqld_kill)" >&2
+      echo "ERROR: Unknown FAILOVER_ADVANCED_TRIGGER_METHOD=$(failover_advanced_trigger_method) (use pod_delete, mysqld_kill, or set_as_primary)" >&2
       return 1
       ;;
   esac
@@ -2248,6 +2295,7 @@ _failover_eval_gr_cluster_readiness() {
   local tsv="${1:?tsv required}"
   local host state role
   local total=0 online=0 recovering=0 primary=0
+  local expected="${FAILOVER_GR_EXPECTED_MEMBERS:-3}"
   local -a bad=()
 
   GR_READY_SUMMARY=""
@@ -2286,25 +2334,88 @@ _failover_eval_gr_cluster_readiness() {
     GR_READY_SUMMARY="expected 1 PRIMARY, found ${primary}"
     return 1
   fi
-  GR_READY_SUMMARY="all ${total} members ONLINE, 1 PRIMARY"
+  if [[ "${expected}" =~ ^[0-9]+$ ]] && (( expected > 0 )) && (( online != expected )); then
+    GR_READY_SUMMARY="expected ${expected} ONLINE members, found ${online}"
+    return 1
+  fi
+  if [[ "${expected}" =~ ^[0-9]+$ ]] && (( expected > 0 )); then
+    GR_READY_SUMMARY="all ${online}/${expected} members ONLINE, 1 PRIMARY"
+  else
+    GR_READY_SUMMARY="all ${total} members ONLINE, 1 PRIMARY"
+  fi
   return 0
 }
 
-# Wait until GR is stable before firing failover (back-to-back iteration safety).
+# Evaluate mysql-* pod readiness for pre-failover gate.
+# Sets K8S_READY_SUMMARY. Returns 0=ready, 1=not ready, 2=no pods / query failed.
+_failover_eval_k8s_mysql_pods_readiness() {
+  local tsv="${1:?tsv required}"
+  local expected="${FAILOVER_GR_EXPECTED_MEMBERS:-3}"
+  local name phase ready_num ready_den restarts deleting is_target
+  local total=0 ready=0
+  local -a bad=()
+
+  K8S_READY_SUMMARY=""
+  while IFS=$'\t' read -r name phase ready_num ready_den restarts deleting is_target || [[ -n "${name}" ]]; do
+    [[ -z "${name}" ]] && continue
+    total=$((total + 1))
+    phase="${phase:-Unknown}"
+    ready_num="${ready_num:-0}"
+    ready_den="${ready_den:-0}"
+    deleting="${deleting:-0}"
+    if [[ "${phase}" == "Running" && "${deleting}" == "0" \
+      && "${ready_num}" =~ ^[0-9]+$ && "${ready_den}" =~ ^[0-9]+$ ]] \
+      && (( ready_den > 0 )) && (( ready_num == ready_den )); then
+      ready=$((ready + 1))
+    else
+      bad+=("${name}:${phase} ${ready_num}/${ready_den} deleting=${deleting}")
+    fi
+  done <<< "${tsv}"
+
+  if (( total == 0 )); then
+    K8S_READY_SUMMARY="no mysql-* pods returned"
+    return 2
+  fi
+  if (( ready != total )); then
+    K8S_READY_SUMMARY="only ${ready}/${total} mysql pods Ready (${bad[*]})"
+    return 1
+  fi
+  if [[ "${expected}" =~ ^[0-9]+$ ]] && (( expected > 0 )) && (( ready != expected )); then
+    K8S_READY_SUMMARY="expected ${expected} Ready mysql pods, found ${ready}"
+    return 1
+  fi
+  if [[ "${expected}" =~ ^[0-9]+$ ]] && (( expected > 0 )); then
+    K8S_READY_SUMMARY="all ${ready}/${expected} mysql pods Ready"
+  else
+    K8S_READY_SUMMARY="all ${ready} mysql pods Ready"
+  fi
+  return 0
+}
+
+# Wait until GR (+ optional k8s pods) is stable before firing failover.
 wait_for_gr_readiness_before_failover() {
   local results_dir="${1:?results dir required}"
   local log_file="${results_dir}/failover_gr_readiness.log"
   local poll_sec="${FAILOVER_GR_READINESS_POLL_SEC:-2}"
   local timeout_sec="${FAILOVER_GR_READINESS_TIMEOUT_SEC:-600}"
   local abort="${FAILOVER_GR_READINESS_ABORT_ON_TIMEOUT:-1}"
-  local waited=0 poll_num=0 tsv rc
+  local expected="${FAILOVER_GR_EXPECTED_MEMBERS:-3}"
+  local require_k8s="${FAILOVER_GR_REQUIRE_K8S_PODS_READY:-1}"
+  local waited=0 poll_num=0 tsv rc k8s_tsv k8s_rc kubeconfig ns
+  local summary=""
 
   if ! failover_gr_readiness_gate_enabled; then
     return 0
   fi
 
-  echo "=== GR readiness gate (all ONLINE, none RECOVERING) ===" | tee "${log_file}"
+  echo "=== GR readiness gate (expected ONLINE=${expected}, k8s_pods_ready=${require_k8s}) ===" | tee "${log_file}"
   echo "Poll interval=${poll_sec}s timeout=${timeout_sec}s" | tee -a "${log_file}"
+
+  ns="${ADVANCED_K8S_NAMESPACE:-}"
+  kubeconfig=""
+  if [[ "${require_k8s}" == "1" ]]; then
+    kubeconfig="$(_failover_resolve_kubeconfig "${results_dir}" 2>/dev/null || true)"
+  fi
 
   while (( waited <= timeout_sec )); do
     poll_num=$((poll_num + 1))
@@ -2317,25 +2428,65 @@ wait_for_gr_readiness_before_failover() {
       GR_READY_SUMMARY="mysql GR query failed"
     fi
 
+    k8s_rc=0
+    K8S_READY_SUMMARY="skipped"
+    k8s_tsv=""
+    if [[ "${require_k8s}" == "1" ]]; then
+      k8s_rc=2
+      if [[ -z "${ns}" ]]; then
+        K8S_READY_SUMMARY="ADVANCED_K8S_NAMESPACE unset"
+      elif [[ -z "${kubeconfig}" ]]; then
+        K8S_READY_SUMMARY="no kubeconfig (set ADVANCED_KUBECONFIG_PATH)"
+      elif ! command -v kubectl >/dev/null 2>&1; then
+        K8S_READY_SUMMARY="kubectl not found"
+      else
+        k8s_tsv="$(_failover_poll_k8s_mysql_pods_once "${kubeconfig}" "${ns}" "" 2>/dev/null || true)"
+        if [[ -n "${k8s_tsv}" ]]; then
+          _failover_eval_k8s_mysql_pods_readiness "${k8s_tsv}"
+          k8s_rc=$?
+        else
+          K8S_READY_SUMMARY="kubectl mysql pod query failed"
+        fi
+      fi
+    fi
+
+    if (( rc == 0 && k8s_rc == 0 )); then
+      summary="${GR_READY_SUMMARY}; ${K8S_READY_SUMMARY}"
+    elif (( rc == 0 )); then
+      summary="GR ok (${GR_READY_SUMMARY}); k8s not ready (${K8S_READY_SUMMARY})"
+    elif (( k8s_rc == 0 )); then
+      summary="GR not ready (${GR_READY_SUMMARY}); k8s ok (${K8S_READY_SUMMARY})"
+    else
+      summary="GR not ready (${GR_READY_SUMMARY}); k8s not ready (${K8S_READY_SUMMARY})"
+    fi
+    GR_READY_SUMMARY="${summary}"
+
     {
       local ready_flag=0
-      (( rc == 0 )) && ready_flag=1
+      (( rc == 0 && k8s_rc == 0 )) && ready_flag=1
       echo "poll=${poll_num} waited=${waited}s utc=$(date -u +%Y-%m-%dT%H:%M:%SZ) ready=${ready_flag} summary=${GR_READY_SUMMARY}"
       if [[ -n "${tsv}" ]]; then
         while IFS=$'\t' read -r host state role; do
           [[ -z "${host}" ]] && continue
-          echo "  ${host}  ${state}  ${role}"
+          echo "  GR  ${host}  ${state}  ${role}"
         done <<< "${tsv}"
+      fi
+      if [[ -n "${k8s_tsv}" ]]; then
+        while IFS=$'\t' read -r name phase ready_num ready_den restarts deleting is_target; do
+          [[ -z "${name}" ]] && continue
+          echo "  K8S ${name}  ${phase}  ${ready_num}/${ready_den}  restarts=${restarts}  deleting=${deleting}"
+        done <<< "${k8s_tsv}"
       fi
     } | tee -a "${log_file}"
 
-    if (( rc == 0 )); then
+    if (( rc == 0 && k8s_rc == 0 )); then
       echo "GR readiness gate PASSED after ${waited}s: ${GR_READY_SUMMARY}" | tee -a "${log_file}"
       {
         echo "FAILOVER_GR_READINESS_GATE=passed"
         echo "FAILOVER_GR_READINESS_WAIT_SEC=${waited}"
         echo "FAILOVER_GR_READINESS_SUMMARY=${GR_READY_SUMMARY}"
         echo "FAILOVER_GR_READINESS_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "FAILOVER_GR_EXPECTED_MEMBERS=${expected}"
       } >> "${results_dir}/failover_event.txt"
       return 0
     fi
@@ -2354,6 +2505,7 @@ wait_for_gr_readiness_before_failover() {
     echo "FAILOVER_GR_READINESS_WAIT_SEC=${timeout_sec}"
     echo "FAILOVER_GR_READINESS_SUMMARY=${GR_READY_SUMMARY}"
     echo "FAILOVER_GR_READINESS_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "FAILOVER_GR_EXPECTED_MEMBERS=${expected}"
   } >> "${results_dir}/failover_event.txt"
 
   if [[ "${abort}" == "1" ]]; then
@@ -2424,8 +2576,9 @@ _failover_get_pod_server_uuid() {
   local ns="${2:?namespace required}"
   local pod="${3:?pod required}"
 
+  # mysql -e prints a header row (e.g. "@@server_uuid"); keep only a UUID-shaped value.
   _failover_mysql_root_exec "${kubeconfig}" "${ns}" "${pod}" "SELECT @@server_uuid;" 30 \
-    | awk 'NF { print; exit }'
+    | awk 'NF && $0 ~ /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/ { print; exit }'
 }
 
 _failover_wait_gr_cluster_online() {
@@ -3234,10 +3387,16 @@ write_failover_kpi() {
     scenario="${FAILOVER_SCENARIO:-mixed}"
     trx_profile="${TPCC_TRX_PROFILE:-mixed}"
   fi
+  local trigger_method=""
   if [[ -f "${event_file}" ]]; then
     edition=$(grep -E '^FAILOVER_EDITION=' "${event_file}" | tail -1 | cut -d= -f2- || echo "unknown")
     trigger_utc=$(grep -E '^FAILOVER_TRIGGER_UTC=' "${event_file}" | tail -1 | cut -d= -f2- || true)
+    trigger_method=$(grep -E '^FAILOVER_ADVANCED_TRIGGER_METHOD=' "${event_file}" | tail -1 | cut -d= -f2- || true)
+    if [[ -z "${trigger_method}" ]]; then
+      trigger_method=$(grep -E '^FAILOVER_METHOD=' "${event_file}" | tail -1 | cut -d= -f2- || true)
+    fi
   fi
+  : "${trigger_method:=${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}}"
 
   local monitor_offset=0
   if [[ -f "${results_dir}/primary_monitor_meta.txt" && -f "${timing_file}" ]]; then
@@ -3288,6 +3447,8 @@ write_failover_kpi() {
       -v monitor_offset="${monitor_offset}" \
       -v detect_guard="${detect_guard_sec}" \
       -v detect_window="${FAILOVER_DETECT_WINDOW_SEC:-60}" \
+      -v planned_window="${FAILOVER_PLANNED_DETECT_WINDOW_SEC:-10}" \
+      -v trigger_method="${trigger_method}" \
       -v primary_before="${primary_before}" \
       -v tpcc_check="${tpcc_check}" \
       -v sysbench_max_lat="${sysbench_max_lat}" \
@@ -3383,6 +3544,15 @@ function monitor_is_new_format(f) {
   role = monitor_gr_role(f)
   return (role == "PRIMARY" || role == "SECONDARY" || role == "ONLINE" || role == "OFFLINE")
 }
+function is_planned_mode() {
+  return (trigger_method == "set_as_primary" || trigger_method == "group_replication_set_as_primary")
+}
+function host_changed(f,    host) {
+  host = f[4]
+  if (primary_before == "" || primary_before == "N/A") return 1
+  if (host == "" || host == "ERROR") return 0
+  return (host != primary_before)
+}
 function is_primary_elected(f,    wo, role, gr) {
   if (f[3] != "1") return 0
   wo = monitor_write_ok(f)
@@ -3390,8 +3560,10 @@ function is_primary_elected(f,    wo, role, gr) {
   role = monitor_gr_role(f)
   gr = monitor_gr_state(f)
   if (edition == "advanced") {
-    return (role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY"))
+    if (!(role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY"))) return 0
   }
+  # Require VIP hostname to move to a different primary pod.
+  if (!host_changed(f)) return 0
   return 1
 }
 function detect_primary_election_from_monitor(    sysbench_sec, saw_connect_fail) {
@@ -3409,6 +3581,60 @@ function detect_primary_election_from_monitor(    sysbench_sec, saw_connect_fail
     }
     if (is_primary_elected(f))
       return sysbench_sec - wall_trigger
+  }
+  close(monitor)
+  return -1
+}
+# Planned: first write_ok=0 or connect_ok=0 after trigger (short window).
+function detect_planned_outage_start(    sysbench_sec, rel, guard, window, wo) {
+  if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
+  close(monitor)
+  guard = (detect_guard == "" ? 0 : detect_guard + 0)
+  window = (planned_window == "" ? 10 : planned_window + 0)
+  while ((getline line < monitor) > 0) {
+    split(line, f, "\t")
+    if (f[1] == "timestamp_utc") continue
+    sysbench_sec = (f[2] + 0) - monitor_offset
+    rel = sysbench_sec - wall_trigger
+    if (rel < -guard) continue
+    if (window > 0 && rel > window) break
+    wo = monitor_write_ok(f)
+    if (f[3] != "1" || wo == 0)
+      return (rel < 0 ? 0 : rel)
+  }
+  close(monitor)
+  return -1
+}
+# Planned: first new-PRIMARY+write_ok after outage_start_rel (trigger-relative).
+function detect_planned_recover_from(outage_start_rel,    sysbench_sec, rel) {
+  if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
+  close(monitor)
+  while ((getline line < monitor) > 0) {
+    split(line, f, "\t")
+    if (f[1] == "timestamp_utc") continue
+    sysbench_sec = (f[2] + 0) - monitor_offset
+    rel = sysbench_sec - wall_trigger
+    if (rel < outage_start_rel) continue
+    if (is_primary_elected(f))
+      return rel
+  }
+  close(monitor)
+  return -1
+}
+# Planned zero-downtime: new PRIMARY+write_ok after trigger with no prior outage sample.
+function detect_planned_zero_downtime_promote(    sysbench_sec, rel, window) {
+  if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
+  close(monitor)
+  window = (planned_window == "" ? 10 : planned_window + 0)
+  while ((getline line < monitor) > 0) {
+    split(line, f, "\t")
+    if (f[1] == "timestamp_utc") continue
+    sysbench_sec = (f[2] + 0) - monitor_offset
+    rel = sysbench_sec - wall_trigger
+    if (rel < 0) continue
+    if (window > 0 && rel > window) break
+    if (is_primary_elected(f))
+      return rel
   }
   close(monitor)
   return -1
@@ -3493,6 +3719,10 @@ function fmt_sec(v) {
   if (v == int(v)) return sprintf("%d", v)
   return sprintf("%.2f", v)
 }
+function fmt_detect(v) {
+  if (is_planned_mode()) return "N/A"
+  return fmt_sec(v)
+}
 function fmt_phase_duration(v) {
   if (v < 0) return "NOT_REACHED"
   if (v < 1) return sprintf("%.3f", v)
@@ -3510,20 +3740,52 @@ function fmt_lat(v) {
 }
 END {
   load_timeseries()
-  failure_sec = detect_connect_failure_ttd()
-  promote_total_sec = detect_primary_election_from_monitor()
-  election_sec = phase_duration(promote_total_sec, failure_sec)
+  outage_start_rel = -1
+  if (is_planned_mode()) {
+    # Planned: detect N/A; total = write-path downtime (first bad → new PRIMARY).
+    failure_sec = -1
+    outage_start_rel = detect_planned_outage_start()
+    if (outage_start_rel < 0) {
+      if (detect_planned_zero_downtime_promote() >= 0) {
+        promote_total_sec = 0
+        election_sec = 0
+      } else {
+        promote_total_sec = -1
+        election_sec = -1
+      }
+    } else {
+      recover_rel = detect_planned_recover_from(outage_start_rel)
+      if (recover_rel >= 0) {
+        promote_total_sec = recover_rel - outage_start_rel
+        election_sec = promote_total_sec
+      } else {
+        promote_total_sec = -1
+        election_sec = -1
+      }
+    }
+    window_start = (outage_start_rel >= 0 ? outage_start_rel : 0)
+  } else {
+    # Unplanned: connect_ok=0 detect; total = trigger → new PRIMARY (hostname change).
+    failure_sec = detect_connect_failure_ttd()
+    promote_total_sec = detect_primary_election_from_monitor()
+    election_sec = phase_duration(promote_total_sec, failure_sec)
+    window_start = failure_sec
+  }
   recovery_sec = detect_app_recovery_rto()
-  dip_sec = dip_duration(failure_sec, recovery_sec)
-  peak_lat = peak_latency(failure_sec, recovery_sec)
+  dip_sec = dip_duration(window_start, recovery_sec)
+  peak_lat = peak_latency(window_start, recovery_sec)
   peak_err_window = 0
-  tx_failed = failover_errors_in_window(failure_sec, recovery_sec)
-  writes_failed = count_write_probe_failures(recovery_sec, promote_total_sec)
+  tx_failed = failover_errors_in_window(window_start, recovery_sec)
+  # For planned, count write failures over trigger → recover (duration mapped via abs end).
+  if (is_planned_mode() && outage_start_rel >= 0 && promote_total_sec >= 0)
+    writes_failed = count_write_probe_failures(recovery_sec, outage_start_rel + promote_total_sec)
+  else
+    writes_failed = count_write_probe_failures(recovery_sec, promote_total_sec)
 
   print "edition,scenario,trx_profile,failure_detection_sec,primary_election_sec,total_failover_sec,app_recovery_sec,tps_dip_duration_sec,peak_latency_failover_ms,transactions_failed_during_failover,writes_failed_during_failover,peak_write_err_per_sec,data_loss"
   printf "%s,%s,%s,%s,%s,%s,%s,%d,%s,%d,%d,%.2f,%s\n", \
     edition, scenario, trx_profile, \
-    fmt_sec(failure_sec), fmt_sec(election_sec), fmt_sec(promote_total_sec), fmt_sec(recovery_sec), \
+    fmt_detect(failure_sec), fmt_sec(election_sec), fmt_sec(promote_total_sec), fmt_sec(recovery_sec), \
     dip_sec, fmt_lat(peak_lat), tx_failed, writes_failed, peak_err_window, tpcc_check
 }
 AWK
@@ -3546,9 +3808,10 @@ write_failover_promotion_breakdown() {
 
   [[ -f "${monitor}" ]] || return 0
 
-  local trigger_wall edition
+  local trigger_wall edition trigger_method
   trigger_wall=$(failover_trigger_wall_second_from_timing "${timing_file}")
   edition="unknown"
+  trigger_method=""
   if [[ -f "${timing_file}" ]]; then
     # shellcheck disable=SC1090
     source "${timing_file}" 2>/dev/null || true
@@ -3556,7 +3819,12 @@ write_failover_promotion_breakdown() {
   fi
   if [[ -f "${event_file}" ]]; then
     edition=$(grep -E '^FAILOVER_EDITION=' "${event_file}" | tail -1 | cut -d= -f2- || echo "unknown")
+    trigger_method=$(grep -E '^FAILOVER_ADVANCED_TRIGGER_METHOD=' "${event_file}" | tail -1 | cut -d= -f2- || true)
+    if [[ -z "${trigger_method}" ]]; then
+      trigger_method=$(grep -E '^FAILOVER_METHOD=' "${event_file}" | tail -1 | cut -d= -f2- || true)
+    fi
   fi
+  : "${trigger_method:=${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}}"
 
   local monitor_offset=0
   if [[ -f "${results_dir}/primary_monitor_meta.txt" && -f "${timing_file}" ]]; then
@@ -3626,6 +3894,7 @@ write_failover_promotion_breakdown() {
 
   awk -v wall_trigger="${trigger_wall}" \
       -v edition="${edition}" \
+      -v trigger_method="${trigger_method}" \
       -v monitor="${monitor}" \
       -v gr_monitor="${gr_monitor}" \
       -v monitor_offset="${monitor_offset}" \
@@ -3665,6 +3934,12 @@ function phase_start_after(gr_rel, ttd_rel) {
   if (gr_rel < 0) return ttd_rel
   return (gr_rel > ttd_rel) ? gr_rel : ttd_rel
 }
+function host_changed(f,    host) {
+  host = f[4]
+  if (primary_before == "" || primary_before == "N/A") return 1
+  if (host == "" || host == "ERROR") return 0
+  return (host != primary_before)
+}
 function is_primary_elected(f,    wo, role, gr) {
   if (f[3] != "1") return 0
   wo = monitor_write_ok(f)
@@ -3672,8 +3947,9 @@ function is_primary_elected(f,    wo, role, gr) {
   role = monitor_gr_role(f)
   gr = monitor_gr_state(f)
   if (edition == "advanced") {
-    return (role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY"))
+    if (!(role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY"))) return 0
   }
+  if (!host_changed(f)) return 0
   return 1
 }
 function fmt_sec(v) {
@@ -3691,7 +3967,7 @@ function phase_duration(end_rel, start_rel) {
   if (end_rel < start_rel) return -1
   return end_rel - start_rel
 }
-function scan_ha_monitor(    line, f, sysbench_sec, host, wo) {
+function scan_ha_monitor(    line, f, sysbench_sec, host, wo, rel) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return
   close(monitor)
   while ((getline line < monitor) > 0) {
@@ -3700,28 +3976,34 @@ function scan_ha_monitor(    line, f, sysbench_sec, host, wo) {
     sysbench_sec = (f[2] + 0) - monitor_offset
     host = f[4]
     wo = monitor_write_ok(f)
+    rel = sysbench_sec - wall_trigger
     if (primary_before == "N/A" && sysbench_sec < wall_trigger && f[3] == "1" && host != "ERROR")
       primary_before = host
     if (sysbench_sec < wall_trigger) continue
     if (stale_ha_end < 0 && f[3] == "1" && host == primary_before && wo == 1)
-      stale_ha_end = sysbench_sec - wall_trigger
-    if (ttd < 0 && f[3] != "1") {
-      ttd = sysbench_sec - wall_trigger
-      continue
+      stale_ha_end = rel
+    # Unplanned: TTD = first connect_ok=0. Planned: first write_ok=0 or connect_ok=0.
+    if (ttd < 0) {
+      if (trigger_method == "set_as_primary" || trigger_method == "group_replication_set_as_primary") {
+        if (f[3] != "1" || wo == 0) ttd = (rel < 0 ? 0 : rel)
+      } else if (f[3] != "1") {
+        ttd = (rel < 0 ? 0 : rel)
+      }
+      if (ttd >= 0 && f[3] != "1") continue
     }
     if (ttd < 0) continue
     if (vip_connect < 0 && f[3] == "1") {
-      vip_connect = sysbench_sec - wall_trigger
+      vip_connect = rel
       if (wo != 1) vip_connect_only = vip_connect
     }
     if (vip_connect_only < 0 && f[3] == "1" && wo != 1)
-      vip_connect_only = sysbench_sec - wall_trigger
+      vip_connect_only = rel
     if (new_host < 0 && f[3] == "1" && host != "ERROR" && primary_before != "N/A" && host != primary_before)
-      new_host = sysbench_sec - wall_trigger
+      new_host = rel
     if (gr_on_vip < 0 && is_gr_primary_visible(f))
-      gr_on_vip = sysbench_sec - wall_trigger
+      gr_on_vip = rel
     if (write_ok < 0 && is_primary_elected(f))
-      write_ok = sysbench_sec - wall_trigger
+      write_ok = rel
   }
   close(monitor)
 }
@@ -3996,12 +4278,18 @@ write_failover_extended_metrics() {
     scenario="${FAILOVER_SCENARIO:-mixed}"
     trx_profile="${TPCC_TRX_PROFILE:-mixed}"
   fi
+  local trigger_method=""
   if [[ -f "${event_file}" ]]; then
     trigger_utc=$(grep -E '^FAILOVER_TRIGGER_UTC=' "${event_file}" | tail -1 | cut -d= -f2- || true)
     edition=$(grep -E '^FAILOVER_EDITION=' "${event_file}" | tail -1 | cut -d= -f2- || echo "unknown")
     method=$(grep -E '^FAILOVER_METHOD=' "${event_file}" | tail -1 | cut -d= -f2- || echo "unknown")
     target_pod=$(grep -E '^FAILOVER_TARGET_POD=' "${event_file}" | tail -1 | cut -d= -f2- || true)
+    trigger_method=$(grep -E '^FAILOVER_ADVANCED_TRIGGER_METHOD=' "${event_file}" | tail -1 | cut -d= -f2- || true)
+    if [[ -z "${trigger_method}" ]]; then
+      trigger_method="${method}"
+    fi
   fi
+  : "${trigger_method:=${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}}"
 
   local primary_env="${results_dir}/primary_change.env"
   if [[ -f "${monitor}" ]]; then
@@ -4049,6 +4337,7 @@ write_failover_extended_metrics() {
       -v scenario="${scenario}" \
       -v trx_profile="${trx_profile}" \
       -v method="${method}" \
+      -v trigger_method="${trigger_method}" \
       -v target_pod="${target_pod}" \
       -v tpcc_check="${tpcc_check}" \
       -v recovery_pct="${FAILOVER_RECOVERY_THRESHOLD}" \
@@ -4059,6 +4348,7 @@ write_failover_extended_metrics() {
       -v monitor_offset="${monitor_offset}" \
       -v detect_guard="${detect_guard_sec}" \
       -v detect_window="${FAILOVER_DETECT_WINDOW_SEC:-60}" \
+      -v planned_window="${FAILOVER_PLANNED_DETECT_WINDOW_SEC:-10}" \
       -v primary_before="${primary_before}" \
       -v primary_after="${primary_after}" \
       -v primary_changed="${primary_changed}" \
@@ -4073,6 +4363,8 @@ BEGIN {
   failure_detect = -1
   failure_detect_abs = -1
   promote_sec = -1
+  planned_outage_start = -1
+  planned_downtime = -1
   rto = -1
   load_end_sec = 0
   baseline = 0
@@ -4095,6 +4387,7 @@ BEGIN {
   pre_reconn_sum = 0
   pre_err_cnt = 0
   monitor_offset = monitor_offset + 0
+  connect_fail = -1
   if (parsed_env != "") {
     while ((getline line < parsed_env) > 0) {
       split(line, kv, "=")
@@ -4159,6 +4452,15 @@ function monitor_write_ok(f) {
   if (length(f) >= 10 && f[9] != "" && f[9] != "ERROR") return f[9] + 0
   return -1
 }
+function is_planned_mode() {
+  return (trigger_method == "set_as_primary" || trigger_method == "group_replication_set_as_primary")
+}
+function host_changed(f,    host) {
+  host = f[4]
+  if (primary_before == "" || primary_before == "N/A") return 1
+  if (host == "" || host == "ERROR") return 0
+  return (host != primary_before)
+}
 function is_primary_elected(f,    wo, role, gr) {
   if (f[3] != "1") return 0
   wo = monitor_write_ok(f)
@@ -4166,8 +4468,9 @@ function is_primary_elected(f,    wo, role, gr) {
   role = monitor_gr_role(f)
   gr = monitor_gr_state(f)
   if (edition == "advanced") {
-    return (role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY"))
+    if (!(role == "PRIMARY" && (gr == "ONLINE" || gr == "PRIMARY"))) return 0
   }
+  if (!host_changed(f)) return 0
   return 1
 }
 function compute_rto(    sec, stable_count, computed) {
@@ -4205,6 +4508,25 @@ function detect_connect_failure_ttd(    sysbench_sec, rel, guard, window) {
     # connection blip cannot masquerade as the failover detection.
     if (window > 0 && rel > window) break
     if (f[3] != "1") return (rel < 0 ? 0 : rel)
+  }
+  close(monitor)
+  return -1
+}
+function detect_planned_outage_start(    sysbench_sec, rel, guard, window, wo) {
+  if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
+  close(monitor)
+  guard = (detect_guard == "" ? 0 : detect_guard + 0)
+  window = (planned_window == "" ? 10 : planned_window + 0)
+  while ((getline line < monitor) > 0) {
+    split(line, f, "\t")
+    if (f[1] == "timestamp_utc") continue
+    sysbench_sec = (f[2] + 0) - monitor_offset
+    rel = sysbench_sec - wall_trigger
+    if (rel < -guard) continue
+    if (window > 0 && rel > window) break
+    wo = monitor_write_ok(f)
+    if (f[3] != "1" || wo == 0)
+      return (rel < 0 ? 0 : rel)
   }
   close(monitor)
   return -1
@@ -4257,33 +4579,48 @@ function failover_tx_failures(fail_rel, rto_rel,    sec, start, end, sum, baseli
   }
   return int(sum + 0.5)
 }
-function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec, saw_connect_fail) {
+function load_monitor(    f, host, ro, gr, elapsed, sysbench_sec, saw_outage, wo, rel, pwindow) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return
   close(monitor)
-  saw_connect_fail = 0
+  saw_outage = 0
+  planned_outage_start = -1
+  pwindow = (planned_window == "" ? 10 : planned_window + 0)
   while ((getline line < monitor) > 0) {
     split(line, f, "\t")
     if (f[1] == "timestamp_utc") continue
     elapsed = f[2] + 0
     sysbench_sec = elapsed - monitor_offset
-    if (f[3] != "1") {
-      if (sysbench_sec >= wall_trigger && connect_fail < 0)
-        connect_fail = sysbench_sec - wall_trigger
-      if (sysbench_sec >= wall_trigger) saw_connect_fail = 1
-      continue
+    rel = sysbench_sec - wall_trigger
+    wo = monitor_write_ok(f)
+    if (primary_before == "N/A" && sysbench_sec < wall_trigger && f[3] == "1" && f[4] != "ERROR")
+      primary_before = f[4]
+    if (sysbench_sec < wall_trigger) continue
+    if (is_planned_mode()) {
+      if (!saw_outage) {
+        if ((f[3] != "1" || wo == 0) && (pwindow <= 0 || rel <= pwindow)) {
+          saw_outage = 1
+          planned_outage_start = (rel < 0 ? 0 : rel)
+          if (f[3] != "1" && connect_fail < 0) connect_fail = planned_outage_start
+        } else if (is_primary_elected(f) && promote_sec < 0) {
+          # Zero-downtime planned switch: mark promote at first new PRIMARY.
+          promote_sec = rel
+          planned_outage_start = -2
+        }
+      } else if (promote_sec < 0 && is_primary_elected(f)) {
+        promote_sec = rel
+      }
+    } else {
+      if (f[3] != "1") {
+        if (connect_fail < 0) connect_fail = rel
+        saw_outage = 1
+        continue
+      }
+      if (saw_outage && promote_sec < 0 && is_primary_elected(f))
+        promote_sec = rel
     }
     host = f[4]
-    ro = f[5] + 0
-    gr = monitor_gr_state(f)
-    if (primary_before == "N/A" && sysbench_sec < wall_trigger) primary_before = host
-    if (sysbench_sec >= wall_trigger) {
-      if (!saw_connect_fail) {
-        continue
-      } else if (promote_sec < 0 && is_primary_elected(f)) {
-        promote_sec = sysbench_sec - wall_trigger
-      }
-      if (primary_after == "N/A" && host != "ERROR") primary_after = host
-    }
+    if (primary_after == "N/A" && host != "ERROR" && is_primary_elected(f))
+      primary_after = host
   }
   close(monitor)
 }
@@ -4321,15 +4658,33 @@ END {
   }
   if (pre_qps_cnt > 0) baseline_qps = pre_qps_sum / pre_qps_cnt
 
-  failure_detect = detect_connect_failure_ttd()
-  if (failure_detect >= 0) failure_detect_abs = wall_trigger + failure_detect
-  promote_after_detect = phase_duration(promote_sec, failure_detect)
+  planned_downtime = -1
+  if (is_planned_mode()) {
+    failure_detect = -1
+    if (planned_outage_start == -2 && promote_sec >= 0) {
+      # Zero-downtime planned switchover.
+      planned_downtime = 0
+      promote_after_detect = 0
+    } else if (planned_outage_start >= 0 && promote_sec >= 0) {
+      planned_downtime = promote_sec - planned_outage_start
+      if (planned_downtime < 0) planned_downtime = -1
+      promote_after_detect = planned_downtime
+    } else {
+      promote_after_detect = -1
+    }
+  } else {
+    failure_detect = detect_connect_failure_ttd()
+    if (failure_detect >= 0) failure_detect_abs = wall_trigger + failure_detect
+    promote_after_detect = phase_duration(promote_sec, failure_detect)
+  }
 
   computed_rto = compute_rto()
   if (computed_rto >= 0) rto = computed_rto
 
   writes_failed = count_write_probe_failures(rto, promote_sec)
-  tx_failed = failover_tx_failures(failure_detect, rto)
+  tx_window_start = failure_detect
+  if (is_planned_mode() && planned_outage_start >= 0) tx_window_start = planned_outage_start
+  tx_failed = failover_tx_failures(tx_window_start, rto)
 
   print "=== Failover Extended Metrics ==="
   print "Generated:              " generated_utc
@@ -4347,18 +4702,30 @@ END {
   print "Target pod:               " (target_pod != "" ? target_pod : "N/A")
   print ""
   print "--- Timing ---"
-  if (failure_detect >= 0)
+  if (is_planned_mode()) {
+    print "Time to detect failure:   N/A (planned switchover; connect detect not used)"
+    if (promote_after_detect >= 0)
+      printf "Time to promote primary:  %.3f s (%.0f ms · first write/connect failure → new PRIMARY + write_ok)\n", promote_after_detect, promote_after_detect * 1000
+    else
+      print "Time to promote primary:  NOT_DETECTED (monitor off or no promotion signal seen)"
+    if (planned_downtime >= 0)
+      printf "Total failover time:      %.3f s (%.0f ms · planned write-path downtime)\n", planned_downtime, planned_downtime * 1000
+    else
+      print "Total failover time:      NOT_DETECTED"
+  } else if (failure_detect >= 0)
     printf "Time to detect failure:   %.3f s (%.0f ms · from trigger, first connect failure connect_ok=0)\n", failure_detect, failure_detect * 1000
   else
     print "Time to detect failure:   NOT_DETECTED"
-  if (promote_after_detect >= 0)
-    printf "Time to promote primary:  %.3f s (%.0f ms · from first connect failure, GR PRIMARY + write probe OK)\n", promote_after_detect, promote_after_detect * 1000
-  else
-    print "Time to promote primary:  NOT_DETECTED (monitor off or no promotion signal seen)"
-  if (promote_sec >= 0)
-    printf "Total failover time:      %.3f s (%.0f ms · downtime from trigger to promotion)\n", promote_sec, promote_sec * 1000
-  else
-    print "Total failover time:      NOT_DETECTED"
+  if (!is_planned_mode()) {
+    if (promote_after_detect >= 0)
+      printf "Time to promote primary:  %.3f s (%.0f ms · from first connect failure, new PRIMARY hostname + write_ok)\n", promote_after_detect, promote_after_detect * 1000
+    else
+      print "Time to promote primary:  NOT_DETECTED (monitor off or no promotion signal seen)"
+    if (promote_sec >= 0)
+      printf "Total failover time:      %.3f s (%.0f ms · downtime from trigger to promotion)\n", promote_sec, promote_sec * 1000
+    else
+      print "Total failover time:      NOT_DETECTED"
+  }
   if (rto >= 0)
     printf "Application recovery RTO: %.3f s (%.0f ms · %.0f%% baseline for %ds)\n", rto, rto * 1000, recovery_pct * 100, stable
   else
@@ -4460,6 +4827,42 @@ write_failover_comparison() {
     fi
   }
 
+  # Walk edition/<iterN>/<trigger_method>/<tN>/<scenario>/ (any subset of nesting).
+  _walk_failover_result_dirs() {
+    local edition="$1"
+    local parent_dir="$2"
+    local label_prefix="$3"
+    local child_dir child_name label scenario_dir
+
+    for child_dir in "${parent_dir}"/*/; do
+      [[ -d "${child_dir}" ]] || continue
+      child_name=$(basename "${child_dir}")
+      [[ "${child_name}" == "graphs" ]] && continue
+
+      if [[ "${child_name}" =~ ^t[0-9]+$ ]] \
+        || [[ "${child_name}" =~ ^iter[0-9]+$ ]] \
+        || failover_is_advanced_trigger_method "${child_name}"; then
+        if [[ -n "${label_prefix}" ]]; then
+          label="${label_prefix}/${child_name}"
+        else
+          label="${child_name}"
+        fi
+        _walk_failover_result_dirs "${edition}" "${child_dir}" "${label}"
+        continue
+      fi
+
+      scenario_dir="${child_dir}"
+      [[ -f "${scenario_dir}/failover_kpi.csv" ]] || continue
+      found_scenario=1
+      if [[ -n "${label_prefix}" ]]; then
+        label="${label_prefix}/${child_name}"
+      else
+        label="${child_name}"
+      fi
+      _append_failover_scenario_results "${edition}" "${label}" "${scenario_dir}"
+    done
+  }
+
   for edition_dir in "${results_root}"/*/; do
     [[ -d "${edition_dir}" ]] || continue
     local edition
@@ -4467,54 +4870,7 @@ write_failover_comparison() {
     [[ "${edition}" == "graphs" ]] && continue
 
     local found_scenario=0
-    for sub_dir in "${edition_dir}"/*/; do
-      [[ -d "${sub_dir}" ]] || continue
-      local sub_name scenario_dir scenario threads_label
-      sub_name=$(basename "${sub_dir}")
-
-      if [[ "${sub_name}" =~ ^t[0-9]+$ ]]; then
-        threads_label="${sub_name}"
-        for scenario_dir in "${sub_dir}"/*/; do
-          [[ -d "${scenario_dir}" ]] || continue
-          scenario=$(basename "${scenario_dir}")
-          [[ -f "${scenario_dir}/failover_kpi.csv" ]] || continue
-          found_scenario=1
-          _append_failover_scenario_results "${edition}" "${threads_label}/${scenario}" "${scenario_dir}"
-        done
-        continue
-      fi
-
-      if [[ "${sub_name}" =~ ^iter[0-9]+$ ]]; then
-        local iter_label="${sub_name}"
-        for inner_dir in "${sub_dir}"/*/; do
-          [[ -d "${inner_dir}" ]] || continue
-          local inner_name
-          inner_name=$(basename "${inner_dir}")
-          if [[ "${inner_name}" =~ ^t[0-9]+$ ]]; then
-            for scenario_dir in "${inner_dir}"/*/; do
-              [[ -d "${scenario_dir}" ]] || continue
-              scenario=$(basename "${scenario_dir}")
-              [[ -f "${scenario_dir}/failover_kpi.csv" ]] || continue
-              found_scenario=1
-              _append_failover_scenario_results "${edition}" "${iter_label}/${inner_name}/${scenario}" "${scenario_dir}"
-            done
-            continue
-          fi
-          scenario_dir="${inner_dir}"
-          scenario="${inner_name}"
-          [[ -f "${scenario_dir}/failover_kpi.csv" ]] || continue
-          found_scenario=1
-          _append_failover_scenario_results "${edition}" "${iter_label}/${scenario}" "${scenario_dir}"
-        done
-        continue
-      fi
-
-      scenario_dir="${sub_dir}"
-      scenario="${sub_name}"
-      [[ -f "${scenario_dir}/failover_kpi.csv" ]] || continue
-      found_scenario=1
-      _append_failover_scenario_results "${edition}" "${scenario}" "${scenario_dir}"
-    done
+    _walk_failover_result_dirs "${edition}" "${edition_dir}" ""
 
     if [[ "${found_scenario}" -eq 0 && -f "${edition_dir}/failover_kpi.csv" ]]; then
       _append_failover_scenario_results "${edition}" "default" "${edition_dir%/}"

@@ -206,7 +206,14 @@ const DropletContext = {
 
 function reportLinkHtml(report, label) {
   const text = label || report.label || "Report";
-  return `<a href="${report.view_url}" target="_blank" rel="noopener">${text}</a>`;
+  const mode = report.failover_mode;
+  let badge = "";
+  if (mode === "planned") {
+    badge = '<span class="badge failover-planned" title="Planned failover (set_as_primary)">Planned</span>';
+  } else if (mode === "unplanned") {
+    badge = '<span class="badge failover-unplanned" title="Unplanned failover">Unplanned</span>';
+  }
+  return `<a href="${report.view_url}" target="_blank" rel="noopener">${text}</a>${badge}`;
 }
 
 function runBadgesHtml(run) {

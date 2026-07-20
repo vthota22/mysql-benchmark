@@ -34,19 +34,21 @@ def _ensure_mpl() -> bool:
 
 
 # Upper bound (seconds after the trigger) for treating a monitor connect failure
-# as the failover detection. Keeps a stray late connection blip from being picked
-# up as the "first connect failure". Mirrors FAILOVER_DETECT_WINDOW_SEC on the
-# analysis side.
+# as the failover detection (unplanned). Keeps a stray late connection blip from
+# being picked up as the "first connect failure". Mirrors FAILOVER_DETECT_WINDOW_SEC.
 _DETECT_WINDOW_SEC = 60.0
+# Planned (set_as_primary): short window for first write/connect outage sample.
+_PLANNED_DETECT_WINDOW_SEC = 10.0
 
 METRIC_HELP = {
     "detect": (
-        "Seconds from failover trigger until the primary monitor reports the first "
-        "connect failure (connect_ok=0), including timeouts when the monitor cannot connect."
+        "Unplanned: seconds from trigger until first connect_ok=0. "
+        "Planned (set_as_primary): N/A — use write-path downtime instead."
     ),
     "promote": (
-        "Seconds from the first connect failure until the new primary is fully promoted "
-        "and accepting writes: GR PRIMARY role (Advanced) and write probe INSERT succeeds (write_ok=1)."
+        "Unplanned: first connect_ok=0 → new PRIMARY hostname + write_ok=1. "
+        "Planned: first write_ok=0 (or connect_ok=0) → new PRIMARY hostname + write_ok=1 "
+        "(total_failover_sec is that write-path downtime)."
     ),
 }
 
@@ -390,6 +392,7 @@ def enrich_cluster_metadata(cfg: dict[str, str], edition: str) -> None:
 THREAD_DIR_RE = re.compile(r"^t(\d+)$")
 ITER_DIR_RE = re.compile(r"^iter(\d+)$")
 EDITION_NAMES = {"advanced", "standard"}
+TRIGGER_METHODS = {"pod_delete", "mysqld_kill", "set_as_primary"}
 DEFAULT_THREAD_MATRIX = (4, 8, 16, 32)
 DEFAULT_SCENARIOS = ("mixed", "write_only")
 VALID_SCENARIO_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -568,13 +571,25 @@ def resolve_scenario_list(
     return sorted(planned)
 
 
-def discover_thread_runs(edition_dir: Path) -> dict[int, dict[str, Path]]:
-    """Map thread count -> scenario name -> results dir."""
-    runs: dict[int, dict[str, Path]] = {}
-    if not edition_dir.is_dir():
-        return runs
+def _add_thread_scenario_run(
+    runs: dict[int, dict[str, Path]],
+    threads: int,
+    label: str,
+    scenario_dir: Path,
+) -> None:
+    runs.setdefault(threads, {})[label] = scenario_dir
 
-    for child in sorted(edition_dir.iterdir()):
+
+def _collect_thread_runs_from_dir(
+    parent: Path,
+    runs: dict[int, dict[str, Path]],
+    label_prefix: str = "",
+) -> None:
+    """Collect thread/scenario runs under parent, including trigger-method nesting."""
+    if not parent.is_dir():
+        return
+
+    for child in sorted(parent.iterdir()):
         if not child.is_dir() or child.name == "graphs":
             continue
         match = THREAD_DIR_RE.match(child.name)
@@ -582,14 +597,55 @@ def discover_thread_runs(edition_dir: Path) -> dict[int, dict[str, Path]]:
             threads = int(match.group(1))
             for scenario_dir in sorted(child.iterdir()):
                 if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
-                    runs.setdefault(threads, {})[scenario_dir.name] = scenario_dir
+                    if label_prefix:
+                        label = f"{label_prefix}/{scenario_dir.name}"
+                    else:
+                        label = scenario_dir.name
+                    _add_thread_scenario_run(runs, threads, label, scenario_dir)
+            continue
+        if child.name in TRIGGER_METHODS:
+            prefix = f"{label_prefix}/{child.name}" if label_prefix else child.name
+            _collect_thread_runs_from_dir(child, runs, prefix)
             continue
         if child.name in {"mixed", "write_only"} and (child / "failover_timeseries.csv").exists():
             bundle = load_scenario_bundle(child)
             threads = bundle["threads"] or 0
-            runs.setdefault(threads, {})[child.name] = child
+            label = f"{label_prefix}/{child.name}" if label_prefix else child.name
+            _add_thread_scenario_run(runs, threads, label, child)
 
+
+def discover_thread_runs(edition_dir: Path) -> dict[int, dict[str, Path]]:
+    """Map thread count -> scenario label -> results dir."""
+    runs: dict[int, dict[str, Path]] = {}
+    _collect_thread_runs_from_dir(edition_dir, runs)
     return runs
+
+
+def _collect_iteration_inner_runs(
+    parent: Path,
+    runs: dict[int, dict[str, Path]],
+    iteration: int,
+    label_prefix: str = "",
+) -> None:
+    for inner in sorted(parent.iterdir()):
+        if not inner.is_dir() or inner.name == "graphs":
+            continue
+        thread_match = THREAD_DIR_RE.match(inner.name)
+        if thread_match:
+            for scenario_dir in sorted(inner.iterdir()):
+                if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
+                    parts = [p for p in (label_prefix, inner.name, scenario_dir.name) if p]
+                    label = "/".join(parts)
+                    runs.setdefault(iteration, {})[label] = scenario_dir
+            continue
+        if inner.name in TRIGGER_METHODS:
+            prefix = f"{label_prefix}/{inner.name}" if label_prefix else inner.name
+            _collect_iteration_inner_runs(inner, runs, iteration, prefix)
+            continue
+        if (inner / "failover_timeseries.csv").exists():
+            parts = [p for p in (label_prefix, inner.name) if p]
+            label = "/".join(parts)
+            runs.setdefault(iteration, {})[label] = inner
 
 
 def discover_iteration_runs(edition_dir: Path) -> dict[int, dict[str, Path]]:
@@ -605,18 +661,7 @@ def discover_iteration_runs(edition_dir: Path) -> dict[int, dict[str, Path]]:
         if not match:
             continue
         iteration = int(match.group(1))
-        for inner in sorted(child.iterdir()):
-            if not inner.is_dir() or inner.name == "graphs":
-                continue
-            thread_match = THREAD_DIR_RE.match(inner.name)
-            if thread_match:
-                for scenario_dir in sorted(inner.iterdir()):
-                    if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
-                        label = f"{inner.name}/{scenario_dir.name}"
-                        runs.setdefault(iteration, {})[label] = scenario_dir
-                continue
-            if (inner / "failover_timeseries.csv").exists():
-                runs.setdefault(iteration, {})[inner.name] = inner
+        _collect_iteration_inner_runs(child, runs, iteration)
 
     return runs
 
@@ -650,7 +695,7 @@ def _iteration_kpi_comparison_html(iter_runs: dict[int, dict[str, Path]]) -> str
             detect_cells.append(f"<td>{html.escape(str(detect))}</td>")
             promote_cells.append(f"<td>{html.escape(str(promote))}</td>")
         blocks.append(
-            f'<div class="card"><h2>KPI comparison — {html.escape(scenario)}</h2>'
+            f'<div class="card"><h2>KPI comparison — {html.escape(_humanize_scenario_path_label(scenario))}</h2>'
             f'<div class="table-scroll"><table class="throughput-compare">'
             f"<thead><tr><th>Metric</th>{header}</tr></thead>"
             f"<tbody>"
@@ -818,6 +863,7 @@ def _meta_rows_for_bundle(bundle: dict) -> list[tuple[str, str]]:
         trigger_rows = [("Trigger second", str(int(trigger)) if trigger else "N/A")]
     return [
         ("Edition", bundle["edition"]),
+        ("Failover type", _failover_mode_info(event, Path(bundle["dir"]))["label"]),
         ("Scenario", bundle["scenario"]),
         ("TPC-C profile", bundle["trx_profile"]),
         ("Load threads", str(threads) if threads else _cfg_value(bench, "THREADS", "FAILOVER_THREADS")),
@@ -830,7 +876,7 @@ def _meta_rows_for_bundle(bundle: dict) -> list[tuple[str, str]]:
         ("Sysbench start (UTC)", meta.get("SYSBENCH_START_UTC", "N/A")),
         ("Failover trigger (UTC)", event.get("FAILOVER_TRIGGER_UTC", "N/A")),
         *trigger_rows,
-        ("Trigger method", event.get("FAILOVER_METHOD", "N/A")),
+        ("Trigger method", event.get("FAILOVER_METHOD") or event.get("FAILOVER_ADVANCED_TRIGGER_METHOD") or "N/A"),
         ("Target pod", event.get("FAILOVER_TARGET_POD", "N/A")),
         ("Baseline TPS", f"{baseline_tps:.2f}" if baseline_tps else "N/A"),
         ("Baseline QPS", f"{baseline_qps:.2f}" if baseline_qps else "N/A"),
@@ -1878,6 +1924,24 @@ FAILOVER_SUMMARY_CSS = """
     .badge-ok { background: rgba(34, 197, 94, 0.18); color: #4ade80; border: 1px solid rgba(74, 222, 128, 0.35); }
     .badge-warn { background: rgba(251, 191, 36, 0.15); color: #fbbf24; border: 1px solid rgba(251, 191, 36, 0.35); }
     .badge-fail { background: rgba(248, 113, 113, 0.15); color: #f87171; border: 1px solid rgba(248, 113, 113, 0.35); }
+    .badge-mode-planned {
+      background: rgba(56, 189, 248, 0.18); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.4);
+    }
+    .badge-mode-unplanned {
+      background: rgba(251, 146, 60, 0.18); color: #fdba74; border: 1px solid rgba(251, 146, 60, 0.4);
+    }
+    .header-mode-banner {
+      display: inline-flex; align-items: center; gap: 0.45rem; margin: 0.55rem 0 0;
+      padding: 0.4rem 0.75rem; border-radius: 8px; font-size: 0.86rem; font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .header-mode-banner.mode-planned {
+      background: rgba(56, 189, 248, 0.14); color: #7dd3fc; border: 1px solid rgba(56, 189, 248, 0.35);
+    }
+    .header-mode-banner.mode-unplanned {
+      background: rgba(251, 146, 60, 0.14); color: #fdba74; border: 1px solid rgba(251, 146, 60, 0.35);
+    }
+    .header-badges { display: flex; flex-wrap: wrap; gap: 0.4rem; justify-content: flex-end; }
     .impact-section {
       background: var(--card); border: 1px solid var(--border); border-radius: 12px;
       padding: 1.25rem 1.35rem 1.1rem; margin-bottom: 1.25rem;
@@ -2202,12 +2266,110 @@ def _wall_hms(wall: str) -> str:
     return wall
 
 
-def _is_promoted_monitor_row(row: dict[str, str | float], edition: str) -> bool:
+def _is_planned_trigger(event: dict[str, str]) -> bool:
+    method = _trigger_method_from_event(event)
+    return method in ("set_as_primary", "group_replication_set_as_primary")
+
+
+def _trigger_method_from_event(event: dict[str, str]) -> str:
+    return (
+        event.get("FAILOVER_ADVANCED_TRIGGER_METHOD")
+        or event.get("FAILOVER_METHOD")
+        or ""
+    ).strip()
+
+
+def _trigger_method_from_path(scenario_dir: Path | None) -> str:
+    if scenario_dir is None:
+        return ""
+    for part in scenario_dir.parts:
+        if part in TRIGGER_METHODS:
+            return part
+    return ""
+
+
+def _normalize_trigger_method(method: str) -> str:
+    method = (method or "").strip()
+    if method == "group_replication_set_as_primary":
+        return "set_as_primary"
+    return method
+
+
+def _failover_mode_info(
+    event: dict[str, str] | None = None,
+    scenario_dir: Path | None = None,
+) -> dict[str, str]:
+    """Classify a run as planned / unplanned for report headers and labels."""
+    event = event or {}
+    method = _normalize_trigger_method(_trigger_method_from_event(event))
+    if not method:
+        method = _normalize_trigger_method(_trigger_method_from_path(scenario_dir))
+
+    if method == "set_as_primary":
+        return {
+            "mode": "planned",
+            "label": "Planned failover",
+            "short": "Planned",
+            "method": method,
+            "badge_class": "badge-mode-planned",
+            "eyebrow": "Planned failover benchmark",
+            "title": "Planned Failover Impact Summary",
+        }
+    if method in {"pod_delete", "mysqld_kill"}:
+        method_note = "pod delete" if method == "pod_delete" else "mysqld kill"
+        return {
+            "mode": "unplanned",
+            "label": f"Unplanned failover ({method_note})",
+            "short": "Unplanned",
+            "method": method,
+            "badge_class": "badge-mode-unplanned",
+            "eyebrow": "Unplanned failover benchmark",
+            "title": "Unplanned Failover Impact Summary",
+        }
+    return {
+        "mode": "unknown",
+        "label": "Failover",
+        "short": "",
+        "method": method,
+        "badge_class": "",
+        "eyebrow": "Failover benchmark",
+        "title": "Failover Impact Summary",
+    }
+
+
+def _humanize_scenario_path_label(label: str) -> str:
+    """Turn pod_delete/mixed into 'Unplanned (pod_delete) · mixed' for UI toggles."""
+    parts = [p for p in str(label).split("/") if p]
+    if not parts:
+        return label
+    out: list[str] = []
+    for part in parts:
+        info = _failover_mode_info({"FAILOVER_ADVANCED_TRIGGER_METHOD": part})
+        if info["mode"] == "planned":
+            out.append("Planned (set_as_primary)")
+        elif info["mode"] == "unplanned":
+            out.append(f"Unplanned ({part})")
+        else:
+            out.append(part)
+    return " · ".join(out)
+
+
+def _is_promoted_monitor_row(
+    row: dict[str, str | float],
+    edition: str,
+    primary_before: str = "",
+) -> bool:
     if row["connect_ok"] != "1" or row["write_ok"] != "1":
         return False
     if edition == "advanced":
-        return row["gr_role"] == "PRIMARY" and row["gr_state"] in ("ONLINE", "PRIMARY")
-    return True
+        if not (row["gr_role"] == "PRIMARY" and row["gr_state"] in ("ONLINE", "PRIMARY")):
+            return False
+    host = str(row.get("hostname") or "")
+    if primary_before and host and host != "ERROR" and host != primary_before:
+        return True
+    if not primary_before:
+        return edition != "advanced" or row["gr_role"] == "PRIMARY"
+    return False
 
 
 def _select_monitor_transition_rows(
@@ -2216,10 +2378,12 @@ def _select_monitor_transition_rows(
     primary_before: str,
     event: dict[str, str],
 ) -> list[tuple[dict[str, str | float], str]]:
-    """Curated polls: last pre-trigger, first post-trigger (delete), first connect fail, promotion."""
+    """Curated polls around trigger: failure marker + promotion (planned vs unplanned)."""
     ordered: list[tuple[dict[str, str | float], str]] = []
     seen: set[tuple[str, str]] = set()
     edition = event.get("FAILOVER_EDITION", "advanced")
+    planned = _is_planned_trigger(event)
+    detect_window = _PLANNED_DETECT_WINDOW_SEC if planned else _DETECT_WINDOW_SEC
 
     def add(row: dict[str, str | float], note: str = "") -> None:
         key = (str(row["wall"]), str(row["hostname"]))
@@ -2234,48 +2398,64 @@ def _select_monitor_transition_rows(
     if pre:
         add(pre[-1])
 
-    delete_row = post[0] if post else None
-    if delete_row:
-        add(delete_row, "← pod deleted")
+    trigger_row = post[0] if post else None
+    if trigger_row:
+        add(trigger_row, "← switchover triggered" if planned else "← pod deleted")
 
-    connect_fail_row: dict[str, str | float] | None = None
+    failure_row: dict[str, str | float] | None = None
     for row in post:
-        # Don't let an unrelated late connection blip masquerade as the failover
-        # detection: only consider failures within the plausible detection window.
-        if float(row["sysbench_sec"]) - trigger > _DETECT_WINDOW_SEC:
+        if float(row["sysbench_sec"]) - trigger > detect_window:
             break
-        if row["connect_ok"] == "0":
-            connect_fail_row = row
+        if planned:
+            if row["connect_ok"] == "0" or row["write_ok"] == "0":
+                failure_row = row
+                break
+        elif row["connect_ok"] == "0":
+            failure_row = row
             break
 
     promote_row: dict[str, str | float] | None = None
     saw_failure = False
     for row in post:
+        if planned and float(row["sysbench_sec"]) - trigger > detect_window and not saw_failure:
+            # Allow zero-downtime planned promote within the short window only.
+            break
         if row["connect_ok"] == "0" or row["write_ok"] == "0":
-            saw_failure = True
-        elif saw_failure and _is_promoted_monitor_row(row, edition):
+            if (not planned) or float(row["sysbench_sec"]) - trigger <= detect_window:
+                saw_failure = True
+        elif saw_failure and _is_promoted_monitor_row(row, edition, primary_before):
+            promote_row = row
+            break
+        elif (
+            planned
+            and not saw_failure
+            and _is_promoted_monitor_row(row, edition, primary_before)
+            and float(row["sysbench_sec"]) - trigger <= detect_window
+        ):
+            # Zero-downtime: hostname moved with continuous write_ok.
             promote_row = row
             break
 
-    failure_row = connect_fail_row
-    if delete_row and failure_row and promote_row:
-        delete_sb = float(delete_row["sysbench_sec"])
+    # Add annotated failure/promote before intermediates so notes are not dropped by seen[].
+    if failure_row:
+        note = "← first write failure" if planned else "← first connect failure"
+        add(failure_row, note)
+
+    if promote_row:
+        add(promote_row, "← promotion")
+
+    if trigger_row and failure_row and promote_row:
+        delete_sb = float(trigger_row["sysbench_sec"])
         failure_sb = float(failure_row["sysbench_sec"])
         promote_sb = float(promote_row["sysbench_sec"])
         for row in post:
             sb = float(row["sysbench_sec"])
             if sb <= delete_sb + 0.05 or sb >= promote_sb - 0.05:
                 continue
-            if failure_row and abs(sb - failure_sb) < 0.05:
+            if abs(sb - failure_sb) < 0.05:
                 continue
             if primary_before and str(row["hostname"]) == primary_before:
                 add(row)
-
-    if connect_fail_row:
-        add(connect_fail_row, "← first connect failure")
-
-    if promote_row:
-        add(promote_row, "← promotion")
 
     return ordered
 
@@ -2306,11 +2486,20 @@ def _monitor_trigger_table_html(scenario_dir: Path, bundle: dict) -> str:
         return '<p class="muted">No monitor polls around trigger.</p>'
 
     trigger_hms = _wall_hms(trigger_utc) if trigger_utc else "N/A"
-    headline = (
-        f'<p class="monitor-headline"><strong>{html.escape(scenario)}</strong> — pod '
-        f"<code>{html.escape(_short_pod_name(target_pod))}</code> deleted at "
-        f'<code>{html.escape(trigger_hms)}</code></p>'
-    )
+    planned = _is_planned_trigger(event)
+    if planned:
+        headline = (
+            f'<p class="monitor-headline"><strong>{html.escape(scenario)}</strong> — planned '
+            f"switchover (<code>set_as_primary</code>) at "
+            f"<code>{html.escape(trigger_hms)}</code> "
+            f"(from <code>{html.escape(_short_pod_name(target_pod))}</code>)</p>"
+        )
+    else:
+        headline = (
+            f'<p class="monitor-headline"><strong>{html.escape(scenario)}</strong> — pod '
+            f"<code>{html.escape(_short_pod_name(target_pod))}</code> deleted at "
+            f"<code>{html.escape(trigger_hms)}</code></p>"
+        )
     if primary_before:
         headline += (
             f'<p class="monitor-subhead">Primary before trigger: '
@@ -2329,7 +2518,7 @@ def _monitor_trigger_table_html(scenario_dir: Path, bundle: dict) -> str:
     for row, note in transition:
         sb = float(row["sysbench_sec"])
         row_classes: list[str] = []
-        if note == "← pod deleted":
+        if note in ("← pod deleted", "← switchover triggered"):
             row_classes.append("row-at-trigger")
         elif note in ("← promotion", "← hostname change"):
             row_classes.append("row-promotion")
@@ -2350,7 +2539,7 @@ def _monitor_trigger_table_html(scenario_dir: Path, bundle: dict) -> str:
 
         body_rows.append(
             f"<tr{cls}>"
-            f"<td>{sb:.1f}</td>"
+            f"<td>{sb:.3f}</td>"
             f"<td>{html.escape(_wall_hms(str(row['wall'])))}</td>"
             f"<td>{connect_cell}</td>"
             f"<td>{write_cell}</td>"
@@ -3137,6 +3326,7 @@ def _failover_impact_summary_html(bundle: dict) -> str:
     scenario = bundle.get("scenario", "default")
     trx_profile = bundle.get("trx_profile", "mixed")
     threads = bundle.get("threads", "")
+    mode_info = _failover_mode_info(event, scenario_dir)
 
     promote_raw = kpi.get("primary_election_sec") or extended.get("promote_sec", "N/A")
     detect_raw = kpi.get("failure_detection_sec") or extended.get("failure_detect_sec", "N/A")
@@ -3153,7 +3343,12 @@ def _failover_impact_summary_html(bundle: dict) -> str:
         hero_cls = "hero-bad"
 
     trigger_utc = event.get("FAILOVER_TRIGGER_UTC", "N/A")
-    trigger_method = event.get("FAILOVER_METHOD", "N/A")
+    trigger_method = (
+        mode_info.get("method")
+        or event.get("FAILOVER_METHOD")
+        or event.get("FAILOVER_ADVANCED_TRIGGER_METHOD")
+        or "N/A"
+    )
     target_pod = event.get("FAILOVER_TARGET_POD", "N/A")
     run_id = _failover_run_id(scenario_dir)
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -3187,18 +3382,34 @@ def _failover_impact_summary_html(bundle: dict) -> str:
         )
 
     threads_label = f"{threads} threads" if threads else "threads N/A"
+    mode_banner = ""
+    mode_badge = ""
+    if mode_info["mode"] in {"planned", "unplanned"}:
+        mode_banner = (
+            f'<p class="header-mode-banner mode-{html.escape(mode_info["mode"])}">'
+            f'{html.escape(mode_info["label"])}'
+            f'</p>'
+        )
+        mode_badge = (
+            f'<span class="badge {html.escape(mode_info["badge_class"])}">'
+            f'{html.escape(mode_info["short"].upper())}</span>'
+        )
 
     return f"""
 <header class="report-header">
   <div class="header-top">
     <div class="header-titles">
-      <p class="header-eyebrow">Failover benchmark</p>
-      <h1 class="header-title">Failover Impact Summary</h1>
+      <p class="header-eyebrow">{html.escape(mode_info["eyebrow"])}</p>
+      <h1 class="header-title">{html.escape(mode_info["title"])}</h1>
+      {mode_banner}
       <p class="header-subtitle">{html.escape(edition)} · {html.escape(scenario)} ({html.escape(trx_profile)}) · {html.escape(threads_label)}</p>
       {primary_row}
     </div>
     <div class="header-meta">
-      <span class="badge {badge_cls}">{badge_text}</span>
+      <div class="header-badges">
+        {mode_badge}
+        <span class="badge {badge_cls}">{badge_text}</span>
+      </div>
       <div class="header-run"><span class="meta-label">Run</span>{html.escape(run_id)}</div>
       <div class="header-run"><span class="meta-label">Trigger</span>{html.escape(trigger_line)}</div>
       <div class="header-generated"><span class="meta-label">Generated</span>{html.escape(generated)}</div>
@@ -3821,6 +4032,7 @@ def generate_html_report(
         trigger_meta_rows = [("Trigger second", str(int(trigger_log)) if trigger_log else "N/A")]
     meta_rows = [
         ("Edition", edition),
+        ("Failover type", _failover_mode_info(event, edition_dir)["label"]),
         ("Scenario", scenario),
         ("TPC-C profile", trx_profile),
         ("Load threads", str(infer_thread_count(edition_dir, meta, bench)) or _cfg_value(bench, "THREADS", "FAILOVER_THREADS")),
@@ -3833,7 +4045,7 @@ def generate_html_report(
         ("Sysbench start (UTC)", meta.get("SYSBENCH_START_UTC", "N/A")),
         ("Failover trigger (UTC)", event.get("FAILOVER_TRIGGER_UTC", "N/A")),
         *trigger_meta_rows,
-        ("Trigger method", event.get("FAILOVER_METHOD", "N/A")),
+        ("Trigger method", event.get("FAILOVER_METHOD") or event.get("FAILOVER_ADVANCED_TRIGGER_METHOD") or "N/A"),
         ("Target pod", event.get("FAILOVER_TARGET_POD", "N/A")),
         ("Baseline TPS", f"{baseline_tps:.2f}" if baseline_tps else "N/A"),
         ("Baseline QPS", f"{baseline_qps:.2f}" if baseline_qps else "N/A"),
@@ -3868,6 +4080,12 @@ def generate_html_report(
         "trigger_wall": trigger_wall,
     }
     impact_summary_html = _failover_impact_summary_html(summary_bundle)
+    mode_info = _failover_mode_info(event, edition_dir)
+    page_title = (
+        f"{mode_info['short']} failover report — {edition} / {scenario}"
+        if mode_info["short"]
+        else f"Failover report — {edition} / {scenario}"
+    )
 
     out_path = edition_dir / "graphs" / "failover_report.html"
     out_path.parent.mkdir(exist_ok=True)
@@ -3877,7 +4095,7 @@ def generate_html_report(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Failover report — {html.escape(edition)} / {html.escape(scenario)}</title>
+  <title>{html.escape(page_title)}</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
 {CHARTJS_ZOOM_CDN}
@@ -4196,7 +4414,7 @@ def generate_combined_sweep_html_report(
     )
     scenario_buttons = "".join(
         f'<button type="button" class="toggle-btn scenario-btn{" active" if s == default_scenario else ""}" '
-        f'data-scenario="{html.escape(s)}">{html.escape(s)}</button>'
+        f'data-scenario="{html.escape(s)}">{html.escape(_humanize_scenario_path_label(s))}</button>'
         for s in active_scenarios
     )
     sweep_toolbar = (
@@ -4571,28 +4789,17 @@ def generate_for_edition(edition_dir: Path, *, png: bool = True, html: bool = Tr
 
 
 def _collect_scenario_dirs(parent: Path) -> list[Path]:
-    """Scenario dirs under an edition or thread parent (flat or tN/scenario layout)."""
+    """Scenario dirs under an edition or nested iter/trigger/thread parent."""
     found: list[Path] = []
+    if not parent.is_dir():
+        return found
     for child in sorted(parent.iterdir()):
         if not child.is_dir() or child.name == "graphs":
             continue
         if (child / "failover_timeseries.csv").exists():
             found.append(child)
-        elif THREAD_DIR_RE.match(child.name):
-            for scenario_dir in sorted(child.iterdir()):
-                if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
-                    found.append(scenario_dir)
-        elif ITER_DIR_RE.match(child.name):
-            for inner in sorted(child.iterdir()):
-                if not inner.is_dir() or inner.name == "graphs":
-                    continue
-                if (inner / "failover_timeseries.csv").exists():
-                    found.append(inner)
-                    continue
-                if THREAD_DIR_RE.match(inner.name):
-                    for scenario_dir in sorted(inner.iterdir()):
-                        if scenario_dir.is_dir() and (scenario_dir / "failover_timeseries.csv").exists():
-                            found.append(scenario_dir)
+        elif THREAD_DIR_RE.match(child.name) or ITER_DIR_RE.match(child.name) or child.name in TRIGGER_METHODS:
+            found.extend(_collect_scenario_dirs(child))
     return found
 
 
@@ -4619,6 +4826,9 @@ def discover_edition_dirs(path: Path) -> tuple[list[Path], Path]:
                     dirs.extend(_collect_scenario_dirs(child))
                     continue
                 if ITER_DIR_RE.match(child.name):
+                    dirs.extend(_collect_scenario_dirs(child))
+                    continue
+                if child.name in TRIGGER_METHODS:
                     dirs.extend(_collect_scenario_dirs(child))
                     continue
                 for scenario_dir in sorted(child.iterdir()):

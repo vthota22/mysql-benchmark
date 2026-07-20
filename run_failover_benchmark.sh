@@ -12,6 +12,7 @@
 #   FAILOVER_EDITIONS="advanced" ./run_failover_benchmark.sh   # single edition
 #   FAILOVER_SCENARIOS="mixed" ./run_failover_benchmark.sh    # skip write_only scenario
 #   FAILOVER_THREAD_MATRIX="4 8 16 32" ./run_failover_benchmark.sh  # thread sweep
+#   FAILOVER_TRIGGER_MATRIX="pod_delete set_as_primary" ./run_failover_benchmark.sh  # unplanned + planned
 #
 # Run inside tmux/nohup on the benchmark droplet — runtime depends on FAILOVER_*_SEC and scenario count.
 set -euo pipefail
@@ -33,6 +34,9 @@ mkdir -p "${RESULTS_ROOT}"
 {
   echo "FAILOVER_ITERATIONS=${FAILOVER_ITERATIONS:-1}"
   echo "FAILOVER_ITERATION_DELAY_SEC=${FAILOVER_ITERATION_DELAY_SEC:-120}"
+  echo "FAILOVER_TRIGGER_MATRIX=${FAILOVER_TRIGGER_MATRIX:-}"
+  echo "FAILOVER_TRIGGER_MATRIX_DELAY_SEC=${FAILOVER_TRIGGER_MATRIX_DELAY_SEC:-180}"
+  echo "FAILOVER_ADVANCED_TRIGGER_METHOD=${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}"
 } > "${RESULTS_ROOT}/failover_run_matrix.env"
 exec > >(tee -a "${FULL_LOG}") 2>&1
 
@@ -50,6 +54,9 @@ echo "Load:     threads=${FAILOVER_THREADS} report-interval=${FAILOVER_REPORT_IN
 if [[ -n "${FAILOVER_THREAD_MATRIX:-}" ]]; then
   echo "Thread matrix:${FAILOVER_THREAD_MATRIX} (delay between=${FAILOVER_THREAD_DELAY_SEC}s)"
 fi
+if [[ -n "${FAILOVER_TRIGGER_MATRIX:-}" ]]; then
+  echo "Trigger matrix:${FAILOVER_TRIGGER_MATRIX} (delay between=${FAILOVER_TRIGGER_MATRIX_DELAY_SEC}s)"
+fi
 echo "Timeline: warmup=${FAILOVER_WARMUP_SEC}s + baseline=${FAILOVER_BASELINE_SEC}s + observe=${FAILOVER_OBSERVE_SEC}s"
 echo "          trigger at second $(failover_trigger_second) | total=$(_per_scenario_runtime_sec)s per scenario"
 echo "Scenarios:${FAILOVER_SCENARIOS} (delay between=${FAILOVER_SCENARIO_DELAY_SEC}s)"
@@ -60,11 +67,15 @@ verify_failover_tpcc_profiles || exit 1
 echo "Editions: ${FAILOVER_EDITIONS}"
 echo "Reconnect: mysql-ignore-errors=${FAILOVER_MYSQL_IGNORE_ERRORS}"
 echo "Monitor:   primary=${FAILOVER_MONITOR_PRIMARY:-1} k8s_events=${FAILOVER_COLLECT_K8S_EVENTS:-1}"
-echo "GR gate:   readiness=${FAILOVER_GR_READINESS_GATE:-1} poll=${FAILOVER_GR_READINESS_POLL_SEC:-2}s timeout=${FAILOVER_GR_READINESS_TIMEOUT_SEC:-600}s"
+echo "GR gate:   readiness=${FAILOVER_GR_READINESS_GATE:-1} expected_members=${FAILOVER_GR_EXPECTED_MEMBERS:-3} k8s_pods=${FAILOVER_GR_REQUIRE_K8S_PODS_READY:-1} poll=${FAILOVER_GR_READINESS_POLL_SEC:-2}s timeout=${FAILOVER_GR_READINESS_TIMEOUT_SEC:-600}s"
 echo "Workers:   gate=${FAILOVER_REPLICA_WORKERS_GATE:-1} target=${FAILOVER_REPLICA_PARALLEL_WORKERS:-16}"
 if failover_trigger_enabled; then
   if [[ "${FAILOVER_EDITIONS}" == *advanced* ]]; then
-    echo "Trigger:  enabled (method=${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}, pod delete=${FAILOVER_POD_DELETE})"
+    if [[ -n "${FAILOVER_TRIGGER_MATRIX:-}" ]]; then
+      echo "Trigger:  enabled (matrix=${FAILOVER_TRIGGER_MATRIX}, pod delete=${FAILOVER_POD_DELETE})"
+    else
+      echo "Trigger:  enabled (method=${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}, pod delete=${FAILOVER_POD_DELETE})"
+    fi
   else
     echo "Trigger:  enabled (FAILOVER_TRIGGER_ENABLED=1)"
   fi
@@ -137,7 +148,7 @@ run_failover_scenario() {
       fi
     fi
     if failover_gr_readiness_gate_enabled; then
-      echo "--- GR readiness gate (all members ONLINE, none RECOVERING) ---"
+      echo "--- GR readiness gate (expected ${FAILOVER_GR_EXPECTED_MEMBERS:-3} ONLINE + k8s Ready) ---"
       if ! wait_for_gr_readiness_before_failover "${scenario_dir}" \
         2>&1 | tee -a "${scenario_dir}/failover_trigger.log"; then
         stop_sysbench_load "${scenario_dir}"
@@ -213,10 +224,15 @@ run_failover_edition() {
   echo "Trigger: $(
     if [[ "${edition}" == "standard" ]]; then
       echo "${FAILOVER_STANDARD_TRIGGER_METHOD:-install_update}"
+    elif [[ -n "${FAILOVER_TRIGGER_MATRIX:-}" ]]; then
+      echo "matrix=${FAILOVER_TRIGGER_MATRIX}"
     else
       case "${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}" in
         mysqld_kill)
           echo "kubectl_kill_mysqld (signal=${FAILOVER_MYSQLD_KILL_SIGNAL:-9}, container=${ADVANCED_K8S_MYSQL_CONTAINER:-mysql})"
+          ;;
+        set_as_primary)
+          echo "group_replication_set_as_primary (graceful primary replacement)"
           ;;
         pod_delete)
           if [[ "${FAILOVER_POD_DELETE_FORCE:-1}" == "1" ]]; then
@@ -269,7 +285,10 @@ run_failover_edition() {
 
   local scenario_index=0
   local thread_index=0
+  local trigger_index=0
   local iterations="${FAILOVER_ITERATIONS:-1}"
+  # Preserve conf default so matrix loops can restore after export overrides.
+  local configured_advanced_trigger="${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}"
 
   if ! [[ "${iterations}" =~ ^[0-9]+$ ]] || (( iterations < 1 )); then
     echo "ERROR: FAILOVER_ITERATIONS must be an integer >= 1" >&2
@@ -292,7 +311,7 @@ run_failover_edition() {
     return 0
   }
 
-  _run_edition_scenarios_under_dir() {
+  _run_thread_matrix_under_dir() {
     local base_dir="${1:?base dir required}"
     if [[ -n "${FAILOVER_THREAD_MATRIX:-}" ]]; then
       thread_index=0
@@ -319,6 +338,76 @@ run_failover_edition() {
     return 0
   }
 
+  _describe_advanced_trigger() {
+    local method="${1:-pod_delete}"
+    case "${method}" in
+      mysqld_kill)
+        echo "kubectl_kill_mysqld (signal=${FAILOVER_MYSQLD_KILL_SIGNAL:-9}, container=${ADVANCED_K8S_MYSQL_CONTAINER:-mysql})"
+        ;;
+      set_as_primary)
+        echo "group_replication_set_as_primary (graceful primary replacement)"
+        ;;
+      pod_delete)
+        if [[ "${FAILOVER_POD_DELETE_FORCE:-1}" == "1" ]]; then
+          echo "kubectl_delete_pod_force (grace-period=${FAILOVER_POD_DELETE_GRACE_SEC:-0})"
+        else
+          echo "kubectl_delete_pod (grace-period=${FAILOVER_POD_DELETE_GRACE_SEC:-30})"
+        fi
+        ;;
+      *)
+        echo "${method}"
+        ;;
+    esac
+  }
+
+  _run_edition_scenarios_under_dir() {
+    local base_dir="${1:?base dir required}"
+
+    # Standard edition has its own trigger path; matrix applies to advanced only.
+    if [[ "${edition}" != "advanced" ]] || [[ -z "${FAILOVER_TRIGGER_MATRIX:-}" ]]; then
+      export FAILOVER_ADVANCED_TRIGGER_METHOD="${configured_advanced_trigger}"
+      if ! _run_thread_matrix_under_dir "${base_dir}"; then
+        return 1
+      fi
+      return 0
+    fi
+
+    local methods method method_dir
+    methods="$(failover_trigger_matrix_methods)" || return 1
+    trigger_index=0
+    while IFS= read -r method; do
+      [[ -n "${method}" ]] || continue
+      trigger_index=$((trigger_index + 1))
+      if [[ "${trigger_index}" -gt 1 && "${FAILOVER_TRIGGER_MATRIX_DELAY_SEC:-0}" -gt 0 ]]; then
+        echo ""
+        echo "--- Waiting ${FAILOVER_TRIGGER_MATRIX_DELAY_SEC}s for cluster stability before trigger method ${method} ---"
+        sleep "${FAILOVER_TRIGGER_MATRIX_DELAY_SEC}"
+      fi
+      export FAILOVER_ADVANCED_TRIGGER_METHOD="${method}"
+      method_dir="${base_dir}/${method}"
+      mkdir -p "${method_dir}"
+      {
+        echo "FAILOVER_ADVANCED_TRIGGER_METHOD=${method}"
+        echo "FAILOVER_TRIGGER_MATRIX=${FAILOVER_TRIGGER_MATRIX}"
+      } > "${method_dir}/failover_trigger_method.env"
+      echo ""
+      echo "======== Trigger method: ${method} ($(_describe_advanced_trigger "${method}")) ========"
+      echo "Results under ${method_dir}/"
+      # Re-check health after the previous failover before starting the next method.
+      if ! _run_iteration_gr_readiness_gate "${method_dir}"; then
+        return 1
+      fi
+      if ! _run_iteration_replica_workers_gate "${method_dir}"; then
+        return 1
+      fi
+      if ! _run_thread_matrix_under_dir "${method_dir}"; then
+        return 1
+      fi
+    done <<< "${methods}"
+    export FAILOVER_ADVANCED_TRIGGER_METHOD="${configured_advanced_trigger}"
+    return 0
+  }
+
   _run_iteration_replica_workers_gate() {
     local gate_dir="${1:?gate dir required}"
     if [[ "${edition}" != "advanced" ]] || ! failover_advanced_trigger_active; then
@@ -329,6 +418,22 @@ run_failover_edition() {
     fi
     echo "--- Replica parallel workers gate (target=${FAILOVER_REPLICA_PARALLEL_WORKERS:-16}) ---"
     if ! ensure_replica_parallel_workers_before_failover "${gate_dir}"; then
+      return 1
+    fi
+    return 0
+  }
+
+  # Fail fast before warmup if cluster is not fully healthy (same checks as pre-trigger).
+  _run_iteration_gr_readiness_gate() {
+    local gate_dir="${1:?gate dir required}"
+    if [[ "${edition}" != "advanced" ]] || ! failover_advanced_trigger_active; then
+      return 0
+    fi
+    if ! failover_gr_readiness_gate_enabled; then
+      return 0
+    fi
+    echo "--- GR readiness gate (pre-iteration; expected ${FAILOVER_GR_EXPECTED_MEMBERS:-3} ONLINE + k8s Ready) ---"
+    if ! wait_for_gr_readiness_before_failover "${gate_dir}"; then
       return 1
     fi
     return 0
@@ -350,6 +455,9 @@ run_failover_edition() {
         echo "FAILOVER_ITERATION=${iter}"
         echo "FAILOVER_ITERATIONS=${iterations}"
       } > "${iter_dir}/failover_iteration.env"
+      if ! _run_iteration_gr_readiness_gate "${iter_dir}"; then
+        return 1
+      fi
       if ! _run_iteration_replica_workers_gate "${iter_dir}"; then
         return 1
       fi
@@ -358,6 +466,9 @@ run_failover_edition() {
       fi
     done
   else
+    if ! _run_iteration_gr_readiness_gate "${edition_dir}"; then
+      return 1
+    fi
     if ! _run_iteration_replica_workers_gate "${edition_dir}"; then
       return 1
     fi
