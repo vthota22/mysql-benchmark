@@ -46,6 +46,7 @@ mkdir -p "${OUTPUT_DIR}"
 
 TSV_FILE="${OUTPUT_DIR}/k8s_monitor.tsv"
 HAPROXY_TSV="${OUTPUT_DIR}/haproxy_monitor.tsv"
+HAPROXY_CONNS_TSV="${OUTPUT_DIR}/haproxy_conns.tsv"
 ENDPOINTS_TSV="${OUTPUT_DIR}/endpoints_monitor.tsv"
 EVENTS_TSV="${OUTPUT_DIR}/k8s_events.tsv"
 MONITOR_LOG="${OUTPUT_DIR}/k8s_monitor.log"
@@ -515,6 +516,46 @@ for item in data.get('items', []):
   done <<< "${proxy_lines}"
 }
 
+# ── HAProxy connection count polling (via admin socket) ───────────────────
+# Polls CurrConns + per-frontend session counts from each HAProxy pod.
+# Writes to haproxy_conns.tsv: timestamp, pod, curr_conns, cum_conns,
+#   mysql_primary_scur, mysql_replicas_scur, mysql_admin_scur
+poll_haproxy_conns() {
+  local ts="${1:?timestamp required}"
+
+  local haproxy_pods
+  haproxy_pods="$(kubectl_ns get pods \
+    -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=haproxy" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)" || return
+
+  while IFS= read -r pod_name; do
+    [[ -z "${pod_name}" ]] && continue
+
+    local raw
+    raw="$(kubectl_ns exec "${pod_name}" -c haproxy -- sh -c '
+      info=$(echo "show info" | socat stdio /etc/haproxy/mysql/haproxy.sock 2>/dev/null)
+      curr=$(echo "$info" | grep "^CurrConns:" | awk "{print \$2}")
+      cum=$(echo "$info" | grep "^CumConns:" | awk "{print \$2}")
+      stat=$(echo "show stat" | socat stdio /etc/haproxy/mysql/haproxy.sock 2>/dev/null)
+      primary_scur=$(echo "$stat" | awk -F, "/^mysql-primary,BACKEND/{print \$5}")
+      replicas_scur=$(echo "$stat" | awk -F, "/^mysql-replicas,BACKEND/{print \$5}")
+      admin_scur=$(echo "$stat" | awk -F, "/^mysql-admin,BACKEND/{print \$5}")
+      echo "${curr:-0}\t${cum:-0}\t${primary_scur:-0}\t${replicas_scur:-0}\t${admin_scur:-0}"
+    ' 2>/dev/null)" || continue
+
+    [[ -z "${raw}" ]] && continue
+
+    local curr_conns cum_conns primary_scur replicas_scur admin_scur
+    IFS=$'\t' read -r curr_conns cum_conns primary_scur replicas_scur admin_scur <<< "${raw}"
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${ts}" "${pod_name}" \
+      "${curr_conns:-0}" "${cum_conns:-0}" \
+      "${primary_scur:-0}" "${replicas_scur:-0}" "${admin_scur:-0}" \
+      >> "${HAPROXY_CONNS_TSV}"
+  done <<< "${haproxy_pods}"
+}
+
 # ── Service endpoints tracking (reveals when HAProxy sees new primary) ────
 poll_endpoints() {
   local ts="${1:?timestamp required}"
@@ -793,8 +834,9 @@ for item in data.get('items', []):
   fi
   PREVIOUS_NODE_MAP="${current_node_map}"
 
-  # Poll HAProxy/router pods, endpoints, and K8s events
+  # Poll HAProxy/router pods, endpoints, connections, and K8s events
   poll_haproxy_pods "${ts}"
+  poll_haproxy_conns "${ts}"
   poll_endpoints "${ts}"
   poll_k8s_events "${ts}"
 }
@@ -850,6 +892,11 @@ main() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "timestamp" "pod" "component" "phase" "ready" "node" "restarts" "reason" \
     > "${HAPROXY_TSV}"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "timestamp" "pod" "curr_conns" "cum_conns" \
+    "mysql_primary_scur" "mysql_replicas_scur" "mysql_admin_scur" \
+    > "${HAPROXY_CONNS_TSV}"
 
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
     "timestamp" "service" "state" "pod" "ip" "ports" \
