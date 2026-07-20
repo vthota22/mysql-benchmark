@@ -16,6 +16,7 @@
 # Outputs:
 #   k8s_monitor.tsv        — per-pod time-series (MySQL pods)
 #   haproxy_monitor.tsv    — per-pod time-series (HAProxy/router pods)
+#   haproxy_conns.tsv      — CurrConns / backend scur per HAProxy pod
 #   endpoints_monitor.tsv  — service endpoint changes
 #   k8s_events.tsv         — namespace events log
 #   k8s_monitor.log        — key events (failovers, changes)
@@ -459,10 +460,12 @@ gr_stats_lookup() {
 }
 
 # ── HAProxy / MySQL Router pod monitoring ─────────────────────────────────
+# Percona PS operator labels HAProxy pods as:
+#   app.kubernetes.io/component=proxy
+#   app.kubernetes.io/name=haproxy
 poll_haproxy_pods() {
   local ts="${1:?timestamp required}"
 
-  # Percona operator labels HAProxy pods with component=haproxy
   local haproxy_json
   haproxy_json="$(kubectl_ns get pods \
     -l "app.kubernetes.io/instance=${CLUSTER_NAME}" \
@@ -472,13 +475,19 @@ poll_haproxy_pods() {
   proxy_lines="$(echo "${haproxy_json}" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
+# Percona PS operator labels HAProxy as component=proxy + name=haproxy
+# (not component=haproxy). Also accept router/proxysql variants.
+PROXY_COMPONENTS = {'haproxy', 'proxy', 'router', 'proxysql', 'mysql-router'}
+PROXY_NAMES = {'haproxy', 'router', 'proxysql', 'mysql-router'}
 for item in data.get('items', []):
     meta = item['metadata']
     labels = meta.get('labels', {})
     component = labels.get('app.kubernetes.io/component', '')
-    # Match haproxy, router, or proxysql components
-    if component not in ('haproxy', 'router', 'proxysql', 'mysql-router'):
+    app_name = labels.get('app.kubernetes.io/name', '')
+    if component not in PROXY_COMPONENTS and app_name not in PROXY_NAMES:
         continue
+    # Prefer a stable display label (haproxy/router) over generic 'proxy'
+    display = app_name if app_name in PROXY_NAMES else (component or 'proxy')
     spec = item['spec']
     status = item['status']
     cs = status.get('containerStatuses', [])
@@ -496,7 +505,7 @@ for item in data.get('items', []):
             break
     print('\t'.join([
         meta['name'],
-        component,
+        display,
         status.get('phase', 'Unknown'),
         'true' if ready else 'false',
         spec.get('nodeName', ''),
@@ -517,30 +526,44 @@ for item in data.get('items', []):
 }
 
 # ── HAProxy connection count polling (via admin socket) ───────────────────
-# Polls CurrConns + per-frontend session counts from each HAProxy pod.
+# Polls CurrConns + per-backend session counts from each HAProxy pod.
 # Writes to haproxy_conns.tsv: timestamp, pod, curr_conns, cum_conns,
 #   mysql_primary_scur, mysql_replicas_scur, mysql_admin_scur
+#
+# Label note: Percona PS operator sets component=proxy + name=haproxy
+# (not component=haproxy). Prefer name=haproxy scoped to this cluster.
 poll_haproxy_conns() {
   local ts="${1:?timestamp required}"
 
   local haproxy_pods
   haproxy_pods="$(kubectl_ns get pods \
-    -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=haproxy" \
+    -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/name=haproxy" \
     -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)" || return
+
+  # Fallback: older/alternate label layouts
+  if [[ -z "${haproxy_pods}" ]]; then
+    haproxy_pods="$(kubectl_ns get pods \
+      -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=proxy" \
+      -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)" || return
+  fi
 
   while IFS= read -r pod_name; do
     [[ -z "${pod_name}" ]] && continue
 
     local raw
+    # Use printf so fields are real tabs; sock path matches Percona PS image.
     raw="$(kubectl_ns exec "${pod_name}" -c haproxy -- sh -c '
-      info=$(echo "show info" | socat stdio /etc/haproxy/mysql/haproxy.sock 2>/dev/null)
-      curr=$(echo "$info" | grep "^CurrConns:" | awk "{print \$2}")
-      cum=$(echo "$info" | grep "^CumConns:" | awk "{print \$2}")
-      stat=$(echo "show stat" | socat stdio /etc/haproxy/mysql/haproxy.sock 2>/dev/null)
+      SOCK=/etc/haproxy/mysql/haproxy.sock
+      info=$(echo "show info" | socat stdio "$SOCK" 2>/dev/null)
+      curr=$(echo "$info" | awk -F": " "/^CurrConns:/{print \$2}")
+      cum=$(echo "$info" | awk -F": " "/^CumConns:/{print \$2}")
+      stat=$(echo "show stat" | socat stdio "$SOCK" 2>/dev/null)
       primary_scur=$(echo "$stat" | awk -F, "/^mysql-primary,BACKEND/{print \$5}")
       replicas_scur=$(echo "$stat" | awk -F, "/^mysql-replicas,BACKEND/{print \$5}")
       admin_scur=$(echo "$stat" | awk -F, "/^mysql-admin,BACKEND/{print \$5}")
-      echo "${curr:-0}\t${cum:-0}\t${primary_scur:-0}\t${replicas_scur:-0}\t${admin_scur:-0}"
+      printf "%s\t%s\t%s\t%s\t%s\n" \
+        "${curr:-0}" "${cum:-0}" \
+        "${primary_scur:-0}" "${replicas_scur:-0}" "${admin_scur:-0}"
     ' 2>/dev/null)" || continue
 
     [[ -z "${raw}" ]] && continue

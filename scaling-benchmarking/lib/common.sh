@@ -223,6 +223,7 @@ fetch_cluster_details() {
     return 1
   fi
   if ! command -v doctl >/dev/null 2>&1; then
+    log_phase "0_FETCH" "WARNING: doctl not found in PATH — skipping auto-fetch (using benchmark.conf values)"
     return 1
   fi
 
@@ -234,7 +235,7 @@ fetch_cluster_details() {
   local cluster_info
   cluster_info="$(run_doctl databases get "${CLUSTER_ID}" \
     --format Size,NumNodes,StorageMib --no-header 2>/dev/null)" || {
-    log_phase "0_FETCH" "WARNING: failed to fetch cluster info from doctl"
+    log_phase "0_FETCH" "WARNING: failed to fetch cluster info from doctl — continuing with benchmark.conf values"
     return 1
   }
   local fetched_size fetched_nodes fetched_storage_mib
@@ -260,7 +261,7 @@ fetch_cluster_details() {
   local conn_info
   conn_info="$(run_doctl databases connection "${CLUSTER_ID}" \
     --format Host,Port,User,Password --no-header 2>/dev/null)" || {
-    log_phase "0_FETCH" "WARNING: failed to fetch connection info from doctl"
+    log_phase "0_FETCH" "WARNING: failed to fetch connection info from doctl — continuing with benchmark.conf values"
     return 1
   }
   local fetched_host fetched_port fetched_user fetched_pass
@@ -316,8 +317,10 @@ require_config() {
 
   # Auto-fetch connection + initial state from doctl when not manually set.
   # Pass config file path so fetched values are written back to benchmark.conf.
+  # Fetch failures are non-fatal: fall back to values already in benchmark.conf
+  # (set -e would otherwise abort with little/no output before the startup banner).
   if [[ -n "${DO_API_TOKEN:-}" ]]; then
-    fetch_cluster_details "${BENCHMARK_CONF_FILE:-}"
+    fetch_cluster_details "${BENCHMARK_CONF_FILE:-}" || true
   fi
 
   apply_mysql_host_override "${BENCHMARK_CONF_FILE:-}"

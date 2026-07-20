@@ -57,9 +57,10 @@ export DO_API_TOKEN="${DO_API_TOKEN:-}"
 export DO_API_URL="${DO_API_URL:-}"
 export CLUSTER_ID="${CLUSTER_ID:-}"
 
-# Always fetch live cluster details + connection info from doctl; save back to config
+# Always fetch live cluster details + connection info from doctl; save back to config.
+# Failures are non-fatal — fall back to values already in benchmark.conf.
 if [[ -n "${CLUSTER_ID:-}" && -n "${DO_API_TOKEN:-}" ]]; then
-  fetch_cluster_details "${CONFIG}"
+  fetch_cluster_details "${CONFIG}" || true
 fi
 
 apply_mysql_host_override "${CONFIG}"
