@@ -613,9 +613,11 @@ def build_main_figure(
     if run_dir is not None:
         failovers = _resolve_failovers(k8s_rows or [], run_dir)
         drains = _detect_secondary_drains(k8s_rows or [], run_dir, failovers=failovers)
+        drains = _with_separate_proxy_drain_markers(drains, k8s_rows or [], run_dir)
     elif k8s_rows:
         failovers = _resolve_failovers(k8s_rows, None)
         drains = _detect_secondary_drains(k8s_rows, None, failovers=failovers)
+        drains = _with_separate_proxy_drain_markers(drains, k8s_rows, None)
     else:
         failovers = []
         drains = []
@@ -1094,6 +1096,18 @@ def _load_killing_events(run_dir: Path | None) -> list[dict[str, str]]:
     return events
 
 
+def _ts_hhmmss(ts: str) -> str:
+    """Return HH:MM:SS from an ISO UTC timestamp, or '' if unavailable."""
+    return ts[11:19] if len(ts) >= 19 else ""
+
+
+def _companion_sort_key(name: str) -> tuple[int, str]:
+    return (
+        0 if name.startswith("haproxy") else 1 if name.startswith("binlog") else 2,
+        name,
+    )
+
+
 def _detect_secondary_drains(
     k8s_rows: list[K8sPodRow],
     run_dir: Path | None = None,
@@ -1104,7 +1118,10 @@ def _detect_secondary_drains(
     """Detect SECONDARY mysql pods entering deleting=yes (rolling drain).
 
     Companion HAProxy / binlog pods killed within companion_window_sec are
-    appended to the label, e.g. 'Secondary Drain mysql-0 (+ haproxy-0, binlog-server)'.
+    recorded on each drain. Only companions that share the exact same HH:MM:SS
+    timestamp are folded into the drain label
+    (e.g. 'Secondary Drain mysql-0 (+ haproxy-0)'). Companions at a different
+    second are kept in companion_events for separate labels/rows.
 
     Drains of the old PRIMARY that already have a Failover label (same pod /
     near the same timestamp) are omitted to avoid duplicate markers.
@@ -1140,8 +1157,8 @@ def _detect_secondary_drains(
     killings = _load_killing_events(run_dir)
     for drain in drains:
         center = _parse_utc(drain["timestamp"])
-        companions: list[str] = []
-        companion_times: list[str] = []
+        drain_hhmmss = _ts_hhmmss(drain["timestamp"])
+        companion_events: list[dict[str, str]] = []
         seen: set[str] = set()
         for ev in killings:
             obj = ev["object"]
@@ -1156,21 +1173,28 @@ def _detect_secondary_drains(
             if delta > companion_window_sec:
                 continue
             name = _component_short_name(obj)
-            if name not in seen:
-                seen.add(name)
-                companions.append(name)
-                companion_times.append(ev["timestamp"])
-        companions.sort(
-            key=lambda n: (
-                0 if n.startswith("haproxy") else 1 if n.startswith("binlog") else 2,
-                n,
-            )
+            if name in seen:
+                continue
+            seen.add(name)
+            companion_events.append({
+                "name": name,
+                "timestamp": ev["timestamp"],
+            })
+        companion_events.sort(
+            key=lambda c: (_companion_sort_key(c["name"]), c["timestamp"])
         )
-        drain["companions"] = ",".join(companions)
-        drain["companion_first_ts"] = min(companion_times) if companion_times else ""
-        if companions:
+        same_ts = [
+            c["name"] for c in companion_events
+            if _ts_hhmmss(c["timestamp"]) == drain_hhmmss
+        ]
+        drain["companion_events"] = companion_events
+        drain["companions"] = ",".join(same_ts)
+        drain["companion_first_ts"] = (
+            min(c["timestamp"] for c in companion_events) if companion_events else ""
+        )
+        if same_ts:
             drain["label"] = (
-                f"Secondary Drain mysql-{drain['pod']} (+ {', '.join(companions)})"
+                f"Secondary Drain mysql-{drain['pod']} (+ {', '.join(same_ts)})"
             )
 
     # Skip drains covered by an existing Failover label (old primary drain).
@@ -1194,6 +1218,50 @@ def _detect_secondary_drains(
         drains = kept
 
     return drains
+
+
+def _detect_proxy_component_drains(
+    k8s_rows: list[K8sPodRow],
+    run_dir: Path | None,
+) -> list[dict[str, str]]:
+    """HAProxy / binlog / router Killing events during the monitor window.
+
+    Used so separately timed proxy moves appear even when they fall outside the
+    MySQL-drain companion window.
+    """
+    if run_dir is None or not k8s_rows:
+        return []
+    timestamps = [r.timestamp for r in k8s_rows if _VALID_TS_RE.match(r.timestamp)]
+    if not timestamps:
+        return []
+    t_start, t_end = min(timestamps), max(timestamps)
+
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for ev in _load_killing_events(run_dir):
+        obj = ev["object"]
+        ts = ev["timestamp"]
+        if not any(tok in obj for tok in ("haproxy", "binlog", "router")):
+            continue
+        if ts < t_start or ts > t_end:
+            continue
+        name = _component_short_name(obj)
+        key = (name, _ts_hhmmss(ts))
+        if key in seen:
+            continue
+        seen.add(key)
+        kind = (
+            "HAProxy" if name.startswith("haproxy")
+            else "Binlog" if name.startswith("binlog")
+            else "Router"
+        )
+        out.append({
+            "timestamp": ts,
+            "name": name,
+            "label": f"{kind} Drain {name}",
+            "what": f"{name} drained",
+        })
+    return out
 
 
 def _short_node_name(node: str) -> str:
@@ -1464,6 +1532,9 @@ def _drain_failover_summary_rows(
     Includes failover-window companions (e.g. haproxy-1) that were folded into
     the Failover event-band label and would otherwise be invisible, plus
     HAProxy/binlog recovery (ready again + node).
+
+    Companions are only combined onto a MySQL drain/failover row when they share
+    the exact same HH:MM:SS timestamp; otherwise they get their own row.
     """
     # Unfiltered drains — keep companions for failover-overlap rows.
     all_drains = _detect_secondary_drains(k8s_rows, run_dir, failovers=None)
@@ -1471,29 +1542,57 @@ def _drain_failover_summary_rows(
     chart_keys = {(d["pod"], d["timestamp"]) for d in chart_drains}
 
     rows: list[dict[str, str]] = []
+    emitted_proxy: set[tuple[str, str]] = set()  # (name, HH:MM:SS)
+
+    def _emit_proxy_row(ts: str, name: str, what: str | None = None) -> None:
+        key = (name, _ts_hhmmss(ts))
+        if not key[1] or key in emitted_proxy:
+            return
+        emitted_proxy.add(key)
+        rows.append({
+            "sort_ts": ts,
+            "time": key[1],
+            "what": what or f"{name} drained",
+        })
 
     for drain in all_drains:
-        if (drain["pod"], drain["timestamp"]) in chart_keys:
-            companions = [
-                c.strip() for c in (drain.get("companions") or "").split(",") if c.strip()
+        if (drain["pod"], drain["timestamp"]) not in chart_keys:
+            continue
+        drain_hhmmss = _ts_hhmmss(drain["timestamp"])
+        companion_events = drain.get("companion_events") or []
+        same_ts = [
+            c["name"] for c in companion_events
+            if _ts_hhmmss(c.get("timestamp", "")) == drain_hhmmss
+        ]
+        # Fallback for older drain dicts without companion_events.
+        if not companion_events and drain.get("companions"):
+            same_ts = [
+                c.strip() for c in drain["companions"].split(",") if c.strip()
             ]
-            what = f"mysql-{drain['pod']} drain"
-            if companions:
-                what += " + " + " + ".join(companions)
-            rows.append({
-                "sort_ts": drain["timestamp"],
-                "time": drain["timestamp"][11:19],
-                "what": what,
-            })
+
+        what = f"mysql-{drain['pod']} drain"
+        if same_ts:
+            what += " + " + " + ".join(same_ts)
+            for name in same_ts:
+                emitted_proxy.add((name, drain_hhmmss))
+        rows.append({
+            "sort_ts": drain["timestamp"],
+            "time": drain_hhmmss,
+            "what": what,
+        })
+        for ce in companion_events:
+            name = ce.get("name") or ""
+            cts = ce.get("timestamp") or ""
+            if not name or not cts or _ts_hhmmss(cts) == drain_hhmmss:
+                continue
+            _emit_proxy_row(cts, name)
 
     for fo in failovers:
         from_short = fo.get("from", "?")
         to_short = fo.get("to", "?")
         fo_ts = fo["timestamp"]
-        # Companions from the overlapping old-primary drain get their own row(s)
-        # when they occur at a different timestamp than the failover itself.
-        companions: list[str] = []
-        companion_first = ""
+        fo_hhmmss = _ts_hhmmss(fo_ts)
+        companion_events: list[dict[str, str]] = []
         for drain in all_drains:
             if drain["pod"] != from_short:
                 continue
@@ -1505,35 +1604,52 @@ def _drain_failover_summary_rows(
                 continue
             if delta > 90:
                 continue
-            companions = [
-                c.strip() for c in (drain.get("companions") or "").split(",") if c.strip()
-            ]
-            companion_first = drain.get("companion_first_ts") or ""
+            companion_events = list(drain.get("companion_events") or [])
+            if not companion_events and drain.get("companions"):
+                companion_events = [
+                    {
+                        "name": c.strip(),
+                        "timestamp": drain.get("companion_first_ts") or fo_ts,
+                    }
+                    for c in drain["companions"].split(",")
+                    if c.strip()
+                ]
             break
 
-        if companions and companion_first and companion_first[11:19] != fo_ts[11:19]:
-            rows.append({
-                "sort_ts": companion_first,
-                "time": companion_first[11:19],
-                "what": f"{' + '.join(companions)} killed",
-            })
-        elif companions:
-            # Same second as failover — keep companions on the failover row.
+        same_ts = [
+            c["name"] for c in companion_events
+            if _ts_hhmmss(c.get("timestamp", "")) == fo_hhmmss
+        ]
+        diff_ts = [
+            c for c in companion_events
+            if _ts_hhmmss(c.get("timestamp", "")) != fo_hhmmss
+        ]
+
+        for ce in diff_ts:
+            _emit_proxy_row(ce["timestamp"], ce["name"], f"{ce['name']} killed")
+
+        if same_ts:
+            for name in same_ts:
+                emitted_proxy.add((name, fo_hhmmss))
             rows.append({
                 "sort_ts": fo_ts,
-                "time": fo_ts[11:19],
+                "time": fo_hhmmss,
                 "what": (
-                    f"{' + '.join(companions)} killed, then "
+                    f"{' + '.join(same_ts)} killed, then "
                     f"Failover mysql-{from_short} → mysql-{to_short}"
                 ),
             })
-            continue
+        else:
+            rows.append({
+                "sort_ts": fo_ts,
+                "time": fo_hhmmss,
+                "what": f"Failover mysql-{from_short} → mysql-{to_short}",
+            })
 
-        rows.append({
-            "sort_ts": fo_ts,
-            "time": fo_ts[11:19],
-            "what": f"Failover mysql-{from_short} → mysql-{to_short}",
-        })
+    # Proxy/binlog drains during the monitor window that were not tied to a
+    # same-second MySQL drain (e.g. HAProxy moved before secondary drain).
+    for proxy in _detect_proxy_component_drains(k8s_rows, run_dir):
+        _emit_proxy_row(proxy["timestamp"], proxy["name"], proxy["what"])
 
     # Recoveries only for components mentioned as drained/killed above.
     mentioned: dict[str, str] = {}  # name -> earliest kill/drain sort_ts
@@ -1754,6 +1870,35 @@ def _overlay_qps_offline_segments(
     return _merge_adjacent_segments(out)
 
 
+# MySQL secondary drains stay blue; standalone HAProxy drains use amber/yellow.
+_DRAIN_MYSQL_STYLE = {"color": "#0969da", "bg": "rgba(221,244,255,0.95)"}
+_DRAIN_HAPROXY_STYLE = {"color": "#bf8700", "bg": "rgba(255,248,197,0.95)"}
+_DRAIN_OTHER_PROXY_STYLE = {"color": "#8250df", "bg": "rgba(245,238,255,0.95)"}
+
+
+def _is_haproxy_drain(drain: dict[str, Any]) -> bool:
+    """True for standalone HAProxy drain markers (not MySQL drains with companions)."""
+    if (drain.get("kind") or "").lower() == "haproxy":
+        return True
+    name = (drain.get("name") or drain.get("pod") or "").strip()
+    if name.startswith("haproxy"):
+        return True
+    label = drain.get("label") or ""
+    return label.startswith("HAProxy Drain")
+
+
+def _drain_marker_style(drain: dict[str, Any]) -> dict[str, str]:
+    """Line/label colors for a drain marker."""
+    if drain.get("color") and drain.get("bg"):
+        return {"color": drain["color"], "bg": drain["bg"]}
+    if _is_haproxy_drain(drain):
+        return dict(_DRAIN_HAPROXY_STYLE)
+    label = drain.get("label") or ""
+    if label.startswith("Binlog Drain") or label.startswith("Router Drain"):
+        return dict(_DRAIN_OTHER_PROXY_STYLE)
+    return dict(_DRAIN_MYSQL_STYLE)
+
+
 def _collect_scale_events(
     timing: ScaleTiming,
     failovers: list[dict[str, str]],
@@ -1782,13 +1927,79 @@ def _collect_scale_events(
             "bg": "rgba(255,235,233,0.95)",
         })
     for drain in drains or []:
+        style = _drain_marker_style(drain)
         events.append({
             "x": drain["timestamp"],
             "label": drain["label"],
-            "color": "#0969da",
-            "bg": "rgba(221,244,255,0.95)",
+            "color": style["color"],
+            "bg": style["bg"],
         })
     return events
+
+
+def _with_separate_proxy_drain_markers(
+    drains: list[dict[str, str]],
+    k8s_rows: list[K8sPodRow] | None = None,
+    run_dir: Path | None = None,
+) -> list[dict[str, str]]:
+    """Append separately-timed HAProxy/binlog drains as their own chart markers.
+
+    Same-second companions stay on the MySQL drain label; different-second (or
+    fully standalone) proxy moves get their own marker/label.
+    """
+    out: list[dict[str, str]] = list(drains or [])
+    emitted: set[tuple[str, str]] = set()
+
+    for drain in drains or []:
+        drain_hhmmss = _ts_hhmmss(drain["timestamp"])
+        for name in (drain.get("companions") or "").split(","):
+            name = name.strip()
+            if name and drain_hhmmss:
+                emitted.add((name, drain_hhmmss))
+        for ce in drain.get("companion_events") or []:
+            name = (ce.get("name") or "").strip()
+            ts = ce.get("timestamp") or ""
+            hh = _ts_hhmmss(ts)
+            if not name or not hh or hh == drain_hhmmss:
+                continue
+            if (name, hh) in emitted:
+                continue
+            emitted.add((name, hh))
+            kind = (
+                "HAProxy" if name.startswith("haproxy")
+                else "Binlog" if name.startswith("binlog")
+                else "Router"
+            )
+            marker = {
+                "timestamp": ts,
+                "pod": "",
+                "name": name,
+                "label": f"{kind} Drain {name}",
+                "kind": "haproxy" if kind == "HAProxy" else kind.lower(),
+            }
+            marker.update(_drain_marker_style(marker))
+            out.append(marker)
+
+    if k8s_rows is not None and run_dir is not None:
+        for proxy in _detect_proxy_component_drains(k8s_rows, run_dir):
+            key = (proxy["name"], _ts_hhmmss(proxy["timestamp"]))
+            if not key[1] or key in emitted:
+                continue
+            emitted.add(key)
+            marker = {
+                "timestamp": proxy["timestamp"],
+                "pod": "",
+                "name": proxy["name"],
+                "label": proxy["label"],
+                "kind": (
+                    "haproxy" if proxy["name"].startswith("haproxy")
+                    else "binlog" if proxy["name"].startswith("binlog")
+                    else "router"
+                ),
+            }
+            marker.update(_drain_marker_style(marker))
+            out.append(marker)
+    return out
 
 
 def _subplot_y_domain(row: int) -> str:
@@ -1841,7 +2052,7 @@ def _add_scale_event_vlines(
         for drain in drains or []:
             _add_subplot_vline(
                 fig, drain["timestamp"], row_idx,
-                color="#0969da", dash="dot", width=2,
+                color=_drain_marker_style(drain)["color"], dash="dot", width=2,
             )
 
 
@@ -2197,7 +2408,7 @@ def _build_pod_timeline_figure(
     for drain in drains or []:
         fig.add_vline(
             x=drain["timestamp"], line_dash="dot",
-            line_color="#0969da", line_width=2,
+            line_color=_drain_marker_style(drain)["color"], line_width=2,
         )
 
     legend_count = len(legend_seen)
@@ -2277,6 +2488,7 @@ def build_k8s_status_bars(
     vertical = _is_vertical_scale(timing)
     failovers = _resolve_failovers(k8s_rows, run_dir)
     drains = _detect_secondary_drains(k8s_rows, run_dir, failovers=failovers)
+    drains = _with_separate_proxy_drain_markers(drains, k8s_rows, run_dir)
     qps_down = _qps_down_intervals(metrics or [])
 
     role_colors = {"PRIMARY": "#2da44e", "SECONDARY": "#0969da"}
@@ -2444,21 +2656,33 @@ def build_replication_queue_figure(
     failovers: list[dict[str, str]],
     drains: list[dict[str, str]] | None = None,
 ) -> go.Figure | None:
-    """Line charts for GR certification and applier queue depth."""
+    """Line charts for GR certification queue, applier queue, and parallel workers."""
     pods, pod_short = _discover_mysql_pods(k8s_rows)
     if not pods:
         return None
     k8s_rows = _filter_k8s_rows_for_pods(k8s_rows, pods)
 
+    has_workers = any(
+        _safe_metric_int(r.replica_parallel_workers) is not None
+        or _safe_metric_int(r.replica_parallel_active) is not None
+        for r in k8s_rows
+    )
+    num_rows = 3 if has_workers else 2
+    subplot_titles = [
+        "GR Certification Queue (transactions pending certification)",
+        "GR Applier Queue (transactions behind on applier)",
+    ]
+    if has_workers:
+        subplot_titles.append(
+            "Parallel Applier Workers (configured vs active)"
+        )
+
     fig = make_subplots(
-        rows=2,
+        rows=num_rows,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.08,
-        subplot_titles=(
-            "GR Certification Queue (transactions pending certification)",
-            "GR Applier Queue (transactions behind on applier)",
-        ),
+        vertical_spacing=0.06,
+        subplot_titles=tuple(subplot_titles),
     )
 
     pod_colors = ["#0969da", "#d62728", "#2ca02c", "#9467bd", "#8c564b"]
@@ -2479,6 +2703,10 @@ def build_replication_queue_figure(
         cert_vals: list[int] = []
         applier_times: list[str] = []
         applier_vals: list[int] = []
+        rpw_cfg_times: list[str] = []
+        rpw_cfg_vals: list[int] = []
+        rpw_active_times: list[str] = []
+        rpw_active_vals: list[int] = []
 
         for r in pod_rows:
             cert = _safe_metric_int(r.gr_queue)
@@ -2489,6 +2717,14 @@ def build_replication_queue_figure(
             if applier is not None:
                 applier_times.append(r.timestamp)
                 applier_vals.append(applier)
+            rpw_cfg = _safe_metric_int(r.replica_parallel_workers)
+            if rpw_cfg is not None:
+                rpw_cfg_times.append(r.timestamp)
+                rpw_cfg_vals.append(rpw_cfg)
+            rpw_act = _safe_metric_int(r.replica_parallel_active)
+            if rpw_act is not None:
+                rpw_active_times.append(r.timestamp)
+                rpw_active_vals.append(rpw_act)
 
         if cert_times:
             has_data = True
@@ -2510,20 +2746,43 @@ def build_replication_queue_figure(
                 legendgroup=label, showlegend=False,
             ), row=2, col=1)
 
+        if has_workers and rpw_cfg_times:
+            has_data = True
+            fig.add_trace(go.Scatter(
+                x=rpw_cfg_times, y=rpw_cfg_vals,
+                mode="lines", name=f"{label} configured",
+                line=dict(width=2, color=color, dash="dash"),
+                legendgroup=label, showlegend=False,
+                hovertemplate=f"{label} configured: %{{y}}<extra></extra>",
+            ), row=3, col=1)
+
+        if has_workers and rpw_active_times:
+            has_data = True
+            fig.add_trace(go.Scatter(
+                x=rpw_active_times, y=rpw_active_vals,
+                mode="lines+markers", name=f"{label} active",
+                line=dict(width=2, color=color),
+                marker=dict(size=4),
+                legendgroup=label, showlegend=False,
+                hovertemplate=f"{label} active: %{{y}}<extra></extra>",
+            ), row=3, col=1)
+
     if not has_data:
         return None
 
-    _add_scale_event_vlines(fig, timing, failovers, [1, 2], drains)
+    _add_scale_event_vlines(fig, timing, failovers, list(range(1, num_rows + 1)), drains)
 
     fig.update_layout(
-        height=560,
+        height=340 * num_rows,
         hovermode="x unified",
         margin=dict(t=60, b=40),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
     )
     fig.update_yaxes(title_text="Queue depth", row=1, col=1)
     fig.update_yaxes(title_text="Queue depth", row=2, col=1)
-    fig.update_xaxes(title_text="Time (UTC)", row=2, col=1)
+    if has_workers:
+        fig.update_yaxes(title_text="Workers", rangemode="tozero", row=3, col=1)
+    fig.update_xaxes(title_text="Time (UTC)", row=num_rows, col=1)
 
     return fig
 
@@ -2543,6 +2802,7 @@ def render_replication_lag_section(
     k8s_rows = _filter_k8s_rows_for_pods(k8s_rows, pods)
     failovers = _resolve_failovers(k8s_rows, run_dir)
     drains = _detect_secondary_drains(k8s_rows, run_dir, failovers=failovers)
+    drains = _with_separate_proxy_drain_markers(drains, k8s_rows, run_dir)
 
     queue_fig = build_replication_queue_figure(k8s_rows, timing, failovers, drains)
     ro_fig = _build_pod_timeline_figure(
@@ -2583,6 +2843,160 @@ def render_replication_lag_section(
       <h2 class="section-title">GR Replication Lag</h2>
       <p>Queue depth over time (line charts) and read-only / super-read-only state per pod (Gantt timeline).</p>
       {charts_html}
+    </section>"""
+
+
+@dataclass
+class HaproxyConnRow:
+    timestamp: str
+    pod: str
+    curr_conns: float
+    cum_conns: float = 0.0
+    mysql_primary_scur: float = 0.0
+
+
+def load_haproxy_conns(path: Path) -> list[HaproxyConnRow]:
+    """Load per-pod HAProxy session counts from k8s_monitor/haproxy_conns.tsv."""
+    if not path.is_file():
+        return []
+    rows: list[HaproxyConnRow] = []
+    with path.open(encoding="utf-8", errors="replace", newline="") as f:
+        for raw in csv.DictReader(f, delimiter="\t"):
+            ts = (raw.get("timestamp") or "").strip()
+            pod = (raw.get("pod") or "").strip()
+            if not ts or not pod or not _VALID_TS_RE.match(ts):
+                continue
+            try:
+                curr = float(raw.get("curr_conns") or 0)
+            except ValueError:
+                continue
+            try:
+                cum = float(raw.get("cum_conns") or 0)
+            except ValueError:
+                cum = 0.0
+            try:
+                primary_scur = float(raw.get("mysql_primary_scur") or 0)
+            except ValueError:
+                primary_scur = 0.0
+            rows.append(HaproxyConnRow(
+                timestamp=ts, pod=pod, curr_conns=curr, cum_conns=cum,
+                mysql_primary_scur=primary_scur,
+            ))
+    return rows
+
+
+def build_haproxy_conns_figure(
+    rows: list[HaproxyConnRow],
+    timing: ScaleTiming,
+    failovers: list[dict[str, str]] | None = None,
+    drains: list[dict[str, str]] | None = None,
+) -> go.Figure | None:
+    """Line charts of curr_conns and mysql_primary_scur per HAProxy pod."""
+    if not rows:
+        return None
+
+    by_pod: dict[str, list[HaproxyConnRow]] = {}
+    for r in rows:
+        by_pod.setdefault(r.pod, []).append(r)
+
+    palette = ["#bf8700", "#0969da", "#2da44e", "#d62728", "#9467bd", "#8c564b"]
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+        subplot_titles=(
+            "HAProxy curr_conns (frontend sessions)",
+            "mysql_primary_scur (backend sessions to PRIMARY)",
+        ),
+    )
+    for idx, pod in enumerate(sorted(by_pod, key=_component_short_name)):
+        series = sorted(by_pod[pod], key=lambda r: r.timestamp)
+        label = _component_short_name(pod)
+        color = palette[idx % len(palette)]
+        times = [r.timestamp for r in series]
+        fig.add_trace(go.Scatter(
+            x=times,
+            y=[r.curr_conns for r in series],
+            mode="lines",
+            name=label,
+            legendgroup=label,
+            line=dict(width=2, color=color),
+            hovertemplate=f"{label} curr_conns: %{{y}}<extra></extra>",
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=times,
+            y=[r.mysql_primary_scur for r in series],
+            mode="lines",
+            name=label,
+            legendgroup=label,
+            showlegend=False,
+            line=dict(width=2, color=color),
+            hovertemplate=f"{label} mysql_primary_scur: %{{y}}<extra></extra>",
+        ), row=2, col=1)
+
+    failovers = failovers or []
+    drains = drains or []
+    _add_scale_event_vlines(fig, timing, failovers, [1, 2], drains)
+
+    t_start = min(r.timestamp for r in rows)
+    t_end = max(r.timestamp for r in rows)
+    event_band_h, event_items = _prepare_event_band(
+        timing, failovers, t_start, t_end, drains,
+    )
+    plot_h = 520
+    top_margin = 56 + event_band_h
+    if event_items:
+        _render_event_band(fig, event_items, plot_h)
+
+    fig.update_layout(
+        height=plot_h + event_band_h,
+        hovermode="x unified",
+        margin=dict(t=top_margin, b=50, l=60, r=24),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        plot_bgcolor="#fafbfc",
+        paper_bgcolor="#ffffff",
+    )
+    fig.update_yaxes(title_text="curr_conns", rangemode="tozero", row=1, col=1)
+    fig.update_yaxes(title_text="primary scur", rangemode="tozero", row=2, col=1)
+    fig.update_xaxes(title_text="Time (UTC)", row=2, col=1)
+    return fig
+
+
+def render_haproxy_conns_section(
+    run_dir: Path | None,
+    timing: ScaleTiming,
+    k8s_rows: list[K8sPodRow] | None = None,
+) -> str:
+    """HAProxy curr_conns + mysql_primary_scur from k8s_monitor/haproxy_conns.tsv."""
+    if run_dir is None:
+        return ""
+    path = run_dir / "k8s_monitor" / "haproxy_conns.tsv"
+    rows = load_haproxy_conns(path)
+    if not rows:
+        return ""
+
+    failovers = _resolve_failovers(k8s_rows or [], run_dir)
+    drains = _detect_secondary_drains(k8s_rows or [], run_dir, failovers=failovers)
+    drains = _with_separate_proxy_drain_markers(drains, k8s_rows or [], run_dir)
+    fig = build_haproxy_conns_figure(rows, timing, failovers, drains)
+    if fig is None:
+        return ""
+
+    _plotly_config = {"scrollZoom": True, "displayModeBar": True, "responsive": True}
+    chart_html = fig.to_html(
+        full_html=False, include_plotlyjs=False,
+        div_id="haproxy-conns", config=_plotly_config,
+    )
+    n_pods = len({r.pod for r in rows})
+    return f"""
+    <section>
+      <h2 class="section-title">HAProxy Current Connections</h2>
+      <p>
+        Per-proxy session counts from <code>k8s_monitor/haproxy_conns.tsv</code>
+        ({n_pods} proxy pod{'s' if n_pods != 1 else ''}): frontend
+        <code>curr_conns</code> and backend <code>mysql_primary_scur</code>
+        (sessions on the PRIMARY MySQL server). Yellow markers are HAProxy drains;
+        blue are MySQL secondary drains.
+      </p>
+      <div class="chart-box">{chart_html}</div>
     </section>"""
 
 
@@ -3145,8 +3559,10 @@ def render_vertical_scale_timeline(
         event_summary_html = f"""
         <h3 style="margin-top:1.2rem;">Drain &amp; Failover Events</h3>
         <p style="margin:0.35rem 0 0.6rem;font-size:0.88rem;color:#57606a;">
-          Chronological view of secondary drains (with co-drained HAProxy / binlog),
-          primary failover, and when HAProxy / binlog came back (with the node they landed on).
+          Chronological view of secondary drains, separately timed HAProxy / binlog
+          moves, primary failover, and when HAProxy / binlog came back (with the node
+          they landed on). Co-drained components are only combined when they share the
+          exact same timestamp.
         </p>
         <table class="kv">
           <thead><tr><th>Time (UTC)</th><th>What happened</th></tr></thead>
@@ -3658,6 +4074,7 @@ def generate_report(run_dir: Path, output_path: Path | None = None) -> Path:
   {render_temporal_breakdown(activities)}
 
   {build_k8s_status_bars(k8s_rows, timing, run_dir, metrics)}
+  {render_haproxy_conns_section(run_dir, timing, k8s_rows)}
   {render_replication_lag_section(k8s_rows, timing, run_dir)}
   {render_vertical_scale_timeline(k8s_rows, timing, run_dir)}
   {render_node_join_timeline(k8s_rows, timing)}
