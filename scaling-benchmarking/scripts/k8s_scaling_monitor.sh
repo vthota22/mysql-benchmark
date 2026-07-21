@@ -84,6 +84,45 @@ kubectl_ns() {
   kubectl --namespace="${NAMESPACE}" "$@"
 }
 
+# API-server reachability check (short timeout so polls don't hang forever).
+cluster_reachable() {
+  local timeout="${K8S_MONITOR_CONNECT_TIMEOUT_SEC:-10}"
+  kubectl --request-timeout="${timeout}s" get --raw=/readyz >/dev/null 2>&1 \
+    || kubectl --request-timeout="${timeout}s" cluster-info >/dev/null 2>&1
+}
+
+# Block until the Kubernetes API is reachable again.
+# Used after transient API outages during node rolls / control-plane blips.
+# Never exits the monitor — keeps retrying with exponential backoff.
+ensure_cluster_connected() {
+  if cluster_reachable; then
+    return 0
+  fi
+
+  local attempt=0
+  local backoff="${K8S_MONITOR_RECONNECT_BACKOFF_SEC:-5}"
+  local max_backoff="${K8S_MONITOR_RECONNECT_MAX_BACKOFF_SEC:-60}"
+
+  log "WARN: lost connection to Kubernetes API — entering reconnect loop"
+  while true; do
+    attempt=$((attempt + 1))
+    log "reconnect attempt ${attempt} (next wait ${backoff}s if fail)"
+    if cluster_reachable; then
+      log "reconnected to Kubernetes API after ${attempt} attempt(s)"
+      # Re-resolve CR in case the API was mid-upgrade when we lost contact.
+      if ! auto_detect_cluster; then
+        log "WARN: reconnected but cluster CR not found yet — will keep polling"
+      fi
+      return 0
+    fi
+    sleep "${backoff}"
+    if [[ "${backoff}" -lt "${max_backoff}" ]]; then
+      backoff=$((backoff * 2))
+      [[ "${backoff}" -gt "${max_backoff}" ]] && backoff="${max_backoff}"
+    fi
+  done
+}
+
 auto_detect_cluster() {
   if [[ -n "${CLUSTER_NAME}" ]]; then
     if kubectl_ns get ps "${CLUSTER_NAME}" >/dev/null 2>&1; then
@@ -247,7 +286,10 @@ refresh_gr_info() {
   local running_pods
   running_pods="$(kubectl_ns get pods \
     -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=${MYSQL_COMPONENT_LABEL}" \
-    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)" || {
+    log "WARN: refresh_gr_info: failed to list running pods"
+    return 0
+  }
 
   local gr_raw=""
   local queried_pod=""
@@ -342,7 +384,10 @@ refresh_readonly_status() {
   local running_pods
   running_pods="$(kubectl_ns get pods \
     -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=${MYSQL_COMPONENT_LABEL}" \
-    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)" || {
+    log "WARN: refresh_readonly_status: failed to list running pods"
+    return 0
+  }
 
   while IFS= read -r pod_name; do
     [[ -z "${pod_name}" ]] && continue
@@ -403,7 +448,10 @@ refresh_gr_stats() {
   local running_pods
   running_pods="$(kubectl_ns get pods \
     -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=${MYSQL_COMPONENT_LABEL}" \
-    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)"
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)" || {
+    log "WARN: refresh_gr_stats: failed to list running pods"
+    return 0
+  }
 
   local stats_raw="" queried_pod=""
   while IFS= read -r pod_name; do
@@ -705,11 +753,11 @@ poll_once() {
   local ts
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  maybe_refresh_nodes
-  refresh_gr_info
-  refresh_readonly_status
-  refresh_gr_stats
-  refresh_pvc_info
+  maybe_refresh_nodes || true
+  refresh_gr_info || true
+  refresh_readonly_status || true
+  refresh_gr_stats || true
+  refresh_pvc_info || true
 
   # GR member counts (total / online)
   local gr_members="?" gr_online="?"
@@ -857,11 +905,12 @@ for item in data.get('items', []):
   fi
   PREVIOUS_NODE_MAP="${current_node_map}"
 
-  # Poll HAProxy/router pods, endpoints, connections, and K8s events
-  poll_haproxy_pods "${ts}"
-  poll_haproxy_conns "${ts}"
-  poll_endpoints "${ts}"
-  poll_k8s_events "${ts}"
+  # Poll HAProxy/router pods, endpoints, connections, and K8s events.
+  # Each step is independent — one failure must not abort the others.
+  poll_haproxy_pods "${ts}" || log "WARN: poll_haproxy_pods failed"
+  poll_haproxy_conns "${ts}" || log "WARN: poll_haproxy_conns failed"
+  poll_endpoints "${ts}" || log "WARN: poll_endpoints failed"
+  poll_k8s_events "${ts}" || log "WARN: poll_k8s_events failed"
 }
 
 # ── Startup / shutdown ─────────────────────────────────────────────────────
@@ -893,12 +942,17 @@ main() {
   log "NAMESPACE=${NAMESPACE}"
   log "POLL_INTERVAL=${POLL_INTERVAL}s"
 
-  if ! kubectl cluster-info >/dev/null 2>&1; then
-    log "ERROR: cannot connect to Kubernetes cluster"
-    exit 1
-  fi
+  # Wait for initial API connectivity (same reconnect loop as mid-run).
+  ensure_cluster_connected
 
-  auto_detect_cluster
+  # Wait until the Percona CR is visible (API can be up before CRs are).
+  local detect_attempt=0
+  until auto_detect_cluster; do
+    detect_attempt=$((detect_attempt + 1))
+    log "WARN: cluster CR not found yet (attempt ${detect_attempt}) — retrying in 10s"
+    sleep 10
+    ensure_cluster_connected
+  done
   log "CLUSTER=${CLUSTER_NAME} CR_TYPE=${CR_TYPE} CONTAINER=${MYSQL_CONTAINER}"
 
   capture_baseline
@@ -935,8 +989,24 @@ main() {
 
   log "polling started"
 
+  local consecutive_failures=0
   while true; do
-    poll_once
+    # If API is down, block in reconnect loop until it comes back.
+    ensure_cluster_connected
+
+    # Never let a single poll failure kill the monitor (set -e).
+    if poll_once; then
+      consecutive_failures=0
+    else
+      consecutive_failures=$((consecutive_failures + 1))
+      log "WARN: poll_once failed (consecutive=${consecutive_failures}) — retrying after ${POLL_INTERVAL}s"
+      # After repeated poll failures, force a connectivity check next iteration.
+      if [[ "${consecutive_failures}" -ge 3 ]]; then
+        if ! cluster_reachable; then
+          log "WARN: ${consecutive_failures} consecutive poll failures and API unreachable"
+        fi
+      fi
+    fi
     sleep "${POLL_INTERVAL}"
   done
 }
