@@ -134,6 +134,10 @@ echo "--- Patching sysbench-tpcc prepare (COMMIT after bulk inserts for HA MySQL
 "${SCRIPT_DIR}/scripts/patch_tpcc_prepare_commit.sh" "${TPCC_DIR}"
 
 echo ""
+echo "--- Patching sysbench-tpcc for periodic reconnect (--reconnect_time_sec) ---"
+"${SCRIPT_DIR}/scripts/patch_tpcc_reconnect.sh" "${TPCC_DIR}"
+
+echo ""
 install_doctl
 
 echo ""

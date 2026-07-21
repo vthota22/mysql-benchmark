@@ -17,9 +17,59 @@ if [[ ! -f "${TPCC_COMMON}" ]]; then
   exit 1
 fi
 
-if grep -q 'reconnect_time_sec' "${TPCC_COMMON}" && grep -q '_reconn_last_slot' "${TPCC_LUA}"; then
-  echo "tpcc already has reconnect_time_sec support"
-  exit 0
+# If a previous bad patch left broken syntax, reset tpcc_common.lua from git.
+if grep -q 'reconnect_time_sec' "${TPCC_COMMON}"; then
+  # Quick sanity: try loading just the options table with Lua-like checks
+  if python3 -c "
+import sys, re
+text = open(sys.argv[1]).read()
+# Verify every line with reconnect_time_sec has a comma on the line before it
+lines = text.split('\n')
+ok = True
+for i, line in enumerate(lines):
+    if 'reconnect_time_sec' in line and '=' in line:
+        for j in range(i-1, -1, -1):
+            s = lines[j].rstrip()
+            if s:
+                if not s.endswith(','):
+                    ok = False
+                break
+# Also check for duplicate insertions
+count = sum(1 for l in lines if 'reconnect_time_sec' in l and '=' in l)
+if count > 1:
+    ok = False
+if ok:
+    sys.exit(0)
+else:
+    sys.exit(1)
+" "${TPCC_COMMON}" 2>/dev/null; then
+    # Syntax looks correct
+    if grep -q '_reconn_last_slot' "${TPCC_LUA}"; then
+      echo "tpcc already has reconnect_time_sec support"
+      exit 0
+    fi
+  else
+    echo "Detected broken reconnect_time_sec in tpcc_common.lua — resetting from git"
+    if [[ -d "${TPCC_DIR}/.git" ]]; then
+      git -C "${TPCC_DIR}" checkout -- tpcc_common.lua
+    else
+      # No git — strip all reconnect_time_sec lines manually
+      python3 -c "
+import sys
+from pathlib import Path
+p = Path(sys.argv[1])
+lines = p.read_text().split('\n')
+out, skip = [], 0
+for line in lines:
+    if 'reconnect_time_sec' in line:
+        skip = 2; continue
+    if skip > 0:
+        skip -= 1; continue
+    out.append(line)
+p.write_text('\n'.join(out))
+" "${TPCC_COMMON}"
+    fi
+  fi
 fi
 
 # --- 1. Add option to tpcc_common.lua ---
