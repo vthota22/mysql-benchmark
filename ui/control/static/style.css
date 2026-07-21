@@ -396,6 +396,11 @@ button:disabled {
   min-width: 220px;
 }
 
+.runs-list.is-refreshing {
+  opacity: 0.72;
+  transition: opacity 0.15s ease;
+}
+
 .runs-list .run-block {
   border-top: 1px solid var(--border);
   padding: 0.85rem 0;

@@ -65,6 +65,8 @@ failover_defaults() {
   : "${FAILOVER_DETECT_WINDOW_SEC:=60}"
   # Planned (set_as_primary): max seconds after trigger to accept write/connect outage start.
   : "${FAILOVER_PLANNED_DETECT_WINDOW_SEC:=10}"
+  # Pre-trigger band for TTD (seconds). 0 = first connect_ok=0 at/after trigger epoch only.
+  : "${FAILOVER_DETECT_GUARD_SEC:=0}"
   : "${ADVANCED_K8S_MYSQL_CONTAINER:=mysql}"
   # Advanced: fetch kubeconfig early; re-resolve primary pod this many seconds before delete
   : "${FAILOVER_TRIGGER_PREPARE_SEC:=5}"
@@ -3430,9 +3432,9 @@ write_failover_kpi() {
     return 1
   fi
 
-  local primary_monitor_interval detect_guard_sec
-  primary_monitor_interval="$(_failover_primary_monitor_interval)"
-  detect_guard_sec="$(python3 -c "print('%.3f' % (1.5 * float('${primary_monitor_interval}')))" 2>/dev/null || echo 0.375)"
+  # TTD = first connect_ok=0 at/after trigger epoch (no pre-trigger guard).
+  # Pre-trigger VIP flakes must not clamp failure_detection_sec to 0.
+  local detect_guard_sec="${FAILOVER_DETECT_GUARD_SEC:-0}"
 
   awk -v log_trigger="${trigger_log}" \
       -v wall_trigger="${trigger_wall}" \
@@ -3492,6 +3494,8 @@ function load_timeseries(    line, f, sec) {
 function detect_connect_failure_ttd(    sysbench_sec, rel, guard, window) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
   close(monitor)
+  # Default guard=0: first connect_ok=0 at/after trigger epoch only.
+  # Optional FAILOVER_DETECT_GUARD_SEC allows a small pre-trigger band if needed.
   guard = (detect_guard == "" ? 0 : detect_guard + 0)
   window = (detect_window == "" ? 0 : detect_window + 0)
   while ((getline line < monitor) > 0) {
@@ -3499,9 +3503,6 @@ function detect_connect_failure_ttd(    sysbench_sec, rel, guard, window) {
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
     rel = sysbench_sec - wall_trigger
-    # Ignore polls well before the trigger (outside the guard band). A failing
-    # poll inside the guard band (just before the boundary) is a real trigger
-    # detection that landed a fraction of a poll early — clamp it to 0.
     if (rel < -guard) continue
     # Stop once past the plausible detection window so an unrelated late
     # connection blip cannot masquerade as the failover detection.
@@ -4326,9 +4327,7 @@ write_failover_extended_metrics() {
   # Prefer the actual sub-second fire epoch over the planned integer trigger second.
   trigger_wall=$(failover_trigger_wall_subsec "${results_dir}" "${timing_file}")
 
-  local primary_monitor_interval detect_guard_sec
-  primary_monitor_interval="$(_failover_primary_monitor_interval)"
-  detect_guard_sec="$(python3 -c "print('%.3f' % (1.5 * float('${primary_monitor_interval}')))" 2>/dev/null || echo 0.375)"
+  local detect_guard_sec="${FAILOVER_DETECT_GUARD_SEC:-0}"
 
   awk -v log_trigger="${trigger_log}" \
       -v wall_trigger="${trigger_wall}" \
@@ -4493,6 +4492,7 @@ function compute_rto(    sec, stable_count, computed) {
 function detect_connect_failure_ttd(    sysbench_sec, rel, guard, window) {
   if (monitor == "" || ( (getline _ < monitor) <= 0 )) return -1
   close(monitor)
+  # Default guard=0: first connect_ok=0 at/after trigger epoch only.
   guard = (detect_guard == "" ? 0 : detect_guard + 0)
   window = (detect_window == "" ? 0 : detect_window + 0)
   while ((getline line < monitor) > 0) {
@@ -4500,9 +4500,6 @@ function detect_connect_failure_ttd(    sysbench_sec, rel, guard, window) {
     if (f[1] == "timestamp_utc") continue
     sysbench_sec = (f[2] + 0) - monitor_offset
     rel = sysbench_sec - wall_trigger
-    # Ignore polls well before the trigger (outside the guard band). A failing
-    # poll inside the guard band (just before the boundary) is a real trigger
-    # detection that landed a fraction of a poll early — clamp it to 0.
     if (rel < -guard) continue
     # Stop once past the plausible detection window so an unrelated late
     # connection blip cannot masquerade as the failover detection.

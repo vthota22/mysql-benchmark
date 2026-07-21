@@ -4316,6 +4316,8 @@ def generate_combined_sweep_html_report(
     sweep_runs: dict[int, dict[str, Path]],
     *,
     sweep_kind: str = "threads",
+    out_path: Path | None = None,
+    report_heading: str | None = None,
 ) -> Path:
     """Single HTML with sweep + scenario toggle buttons (threads or back-to-back iterations)."""
     if sweep_kind == "iteration":
@@ -4427,27 +4429,30 @@ def generate_combined_sweep_html_report(
         if len(active_scenarios) > 1
         else ""
     )
+    heading = report_heading or f"{edition} failover"
     if len(active_sweep_values) > 1:
-        subtitle = f"{html.escape(edition)} · {html.escape(subtitle_sweep)} · select run and scenario below"
+        subtitle = f"{html.escape(heading)} · {html.escape(subtitle_sweep)} · select run below"
     elif len(active_scenarios) > 1:
-        subtitle = f"{html.escape(edition)} · select scenario below"
+        subtitle = f"{html.escape(heading)} · select scenario below"
     else:
-        scenario_label = html.escape(active_scenarios[0])
-        subtitle = f"{html.escape(edition)} · {scenario_label}"
+        scenario_label = html.escape(_humanize_scenario_path_label(active_scenarios[0]))
+        subtitle = f"{html.escape(heading)} · {scenario_label}"
 
     kpi_summary_html = ""
     if sweep_kind == "iteration":
         kpi_summary_html = _iteration_kpi_comparison_html(sweep_runs)
 
-    out_path = edition_dir / "graphs" / "failover_report.html"
-    out_path.parent.mkdir(exist_ok=True)
+    if out_path is None:
+        out_path = edition_dir / "graphs" / "failover_report.html"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    page_title = f"Failover report — {heading}"
 
     page = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Failover report — {html.escape(edition)} ({html.escape(title_suffix)})</title>
+  <title>{html.escape(page_title)}</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
 {CHARTJS_ZOOM_CDN}
@@ -4538,7 +4543,7 @@ def generate_combined_sweep_html_report(
   </style>
 </head>
 <body>
-  <h1 style="font-size:1.35rem;margin:0 0 0.25rem">Failover benchmark report</h1>
+  <h1 style="font-size:1.35rem;margin:0 0 0.25rem">{html.escape(heading)}</h1>
   <p class="subtitle">{subtitle}</p>
 
   {kpi_summary_html}
@@ -4708,6 +4713,85 @@ def generate_combined_iteration_html_report(edition_dir: Path, iter_runs: dict[i
     return generate_combined_sweep_html_report(edition_dir, iter_runs, sweep_kind="iteration")
 
 
+def _infer_trigger_and_scenario(label: str, path: Path) -> tuple[str, str]:
+    """Extract (trigger_method or '', scenario name) from a discovery label and path."""
+    parts: list[str] = []
+    if label:
+        parts.extend(str(label).split("/"))
+    parts.extend(path.parts)
+    trigger = ""
+    scenario = ""
+    for part in parts:
+        if part in TRIGGER_METHODS and not trigger:
+            trigger = part
+        if part in {"mixed", "write_only"} and not scenario:
+            scenario = part
+    return trigger, scenario or "mixed"
+
+
+def _combined_report_heading(trigger: str, scenario: str, *, include_scenario: bool = True) -> str:
+    mode = _failover_mode_info({"FAILOVER_ADVANCED_TRIGGER_METHOD": trigger} if trigger else {})
+    if mode["mode"] == "planned":
+        base = "Planned failover"
+    elif mode["mode"] == "unplanned":
+        base = "Unplanned failover"
+    else:
+        base = "Failover report"
+    if include_scenario:
+        return f"{base} · {scenario}"
+    return base
+
+
+def _combined_report_out_path(edition_dir: Path, trigger: str, scenario: str) -> Path:
+    base = edition_dir
+    if trigger:
+        base = base / trigger
+    return base / scenario / "graphs" / "failover_report.html"
+
+
+def _partition_runs_by_type(
+    sweep_runs: dict[int, dict[str, Path]],
+) -> dict[tuple[str, str], dict[int, dict[str, Path]]]:
+    """Split sweep runs into (trigger_method, scenario) groups with clean scenario keys."""
+    partitioned: dict[tuple[str, str], dict[int, dict[str, Path]]] = {}
+    for sweep_id, scenarios in sweep_runs.items():
+        for label, scenario_dir in scenarios.items():
+            trigger, scenario = _infer_trigger_and_scenario(label, scenario_dir)
+            partitioned.setdefault((trigger, scenario), {}).setdefault(sweep_id, {})[scenario] = (
+                scenario_dir
+            )
+    return partitioned
+
+
+def _write_type_combined_reports(
+    edition_dir: Path,
+    sweep_runs: dict[int, dict[str, Path]],
+    *,
+    sweep_kind: str,
+) -> list[Path]:
+    """Write one combined HTML per (trigger × scenario); do not mix planned/unplanned."""
+    written: list[Path] = []
+    partitioned = _partition_runs_by_type(sweep_runs)
+    include_scenario = len({scenario for (_, scenario) in partitioned}) > 1
+    for (trigger, scenario), subset in sorted(partitioned.items()):
+        if not subset:
+            continue
+        out_path = _combined_report_out_path(edition_dir, trigger, scenario)
+        heading = _combined_report_heading(
+            trigger, scenario, include_scenario=include_scenario
+        )
+        out = generate_combined_sweep_html_report(
+            edition_dir,
+            subset,
+            sweep_kind=sweep_kind,
+            out_path=out_path,
+            report_heading=heading,
+        )
+        print(f"Wrote {out}")
+        written.append(out)
+    return written
+
+
 def generate_png_for_edition(
     edition_dir: Path,
     rows: list[dict[str, float]],
@@ -4771,15 +4855,21 @@ def generate_for_edition(edition_dir: Path, *, png: bool = True, html: bool = Tr
 
     if html:
         parent_ed = parent_edition_dir(edition_dir)
-        skip_combined = False
-        if parent_ed:
-            iter_runs = discover_iteration_runs(parent_ed)
-            thread_runs = discover_thread_runs(parent_ed)
-            if iter_runs and len(iter_runs) > 1:
-                skip_combined = True
-            elif thread_runs:
-                skip_combined = True
-        if not skip_combined:
+        skip_leaf_html = False
+        if parent_ed is not None and parent_ed != edition_dir:
+            try:
+                rel_parts = edition_dir.relative_to(parent_ed).parts
+            except ValueError:
+                rel_parts = ()
+            # Nested iter/trigger/thread leaves are covered by type-specific combined reports.
+            if any(
+                ITER_DIR_RE.match(p) or THREAD_DIR_RE.match(p) or p in TRIGGER_METHODS
+                for p in rel_parts[:-1]
+            ):
+                skip_leaf_html = True
+            elif len(_collect_scenario_dirs(parent_ed)) > 1:
+                skip_leaf_html = True
+        if not skip_leaf_html:
             html_path = generate_html_report(
                 edition_dir, rows, meta, parsed, event, kpi, png_files, extended, primary
             )
@@ -4839,6 +4929,15 @@ def discover_edition_dirs(path: Path) -> tuple[list[Path], Path]:
 
 
 def maybe_generate_combined_reports(results_root: Path, *, do_html: bool) -> None:
+    """Write type-specific combined reports (trigger × scenario), not one mixed mega-report.
+
+    Output examples:
+      advanced/pod_delete/mixed/graphs/failover_report.html
+      advanced/set_as_primary/mixed/graphs/failover_report.html
+      advanced/mixed/graphs/failover_report.html   # no trigger matrix
+
+    Iteration/thread leaf mirrors are not written — UI lists only these combined paths.
+    """
     if not do_html:
         return
     edition_dirs: list[Path]
@@ -4850,37 +4949,12 @@ def maybe_generate_combined_reports(results_root: Path, *, do_html: bool) -> Non
         )
     for edition_dir in edition_dirs:
         iter_runs = discover_iteration_runs(edition_dir)
-        if iter_runs and len(iter_runs) > 1:
-            out = generate_combined_iteration_html_report(edition_dir, iter_runs)
-            print(f"Wrote {out}")
-            html_content = out.read_text(encoding="utf-8")
-            mirrored: set[Path] = set()
-            for scenarios in iter_runs.values():
-                for scenario_dir in scenarios.values():
-                    if scenario_dir in mirrored:
-                        continue
-                    mirrored.add(scenario_dir)
-                    mirror_out = scenario_dir / "graphs" / "failover_report.html"
-                    mirror_out.parent.mkdir(exist_ok=True)
-                    mirror_out.write_text(html_content, encoding="utf-8")
-                    print(f"Wrote {mirror_out}")
+        if iter_runs:
+            _write_type_combined_reports(edition_dir, iter_runs, sweep_kind="iteration")
             continue
         thread_runs = discover_thread_runs(edition_dir)
-        if not thread_runs:
-            continue
-        out = generate_combined_thread_html_report(edition_dir, thread_runs)
-        print(f"Wrote {out}")
-        html_content = out.read_text(encoding="utf-8")
-        mirrored: set[Path] = set()
-        for scenarios in thread_runs.values():
-            for scenario_dir in scenarios.values():
-                if scenario_dir in mirrored:
-                    continue
-                mirrored.add(scenario_dir)
-                mirror_out = scenario_dir / "graphs" / "failover_report.html"
-                mirror_out.parent.mkdir(exist_ok=True)
-                mirror_out.write_text(html_content, encoding="utf-8")
-                print(f"Wrote {mirror_out}")
+        if thread_runs:
+            _write_type_combined_reports(edition_dir, thread_runs, sweep_kind="threads")
 
 
 def main() -> int:

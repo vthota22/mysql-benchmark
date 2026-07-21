@@ -45,6 +45,7 @@ from control.report_proxy import (  # noqa: E402
     ReportProxy,
     is_allowed_report_path,
     pick_primary_report,
+    report_label,
     report_view_url,
     run_timestamp_meta,
     validate_results_path,
@@ -338,9 +339,10 @@ class ControlServer:
         legacy_report = data.get("report_path", "")
         if not primary and legacy_report:
             try:
+                path = validate_results_path(legacy_report)
                 primary = {
-                    "path": validate_results_path(legacy_report),
-                    "label": "Combined report",
+                    "path": path,
+                    "label": report_label(path),
                     "view_url": report_view_url(legacy_report),
                     "mtime": 0,
                 }

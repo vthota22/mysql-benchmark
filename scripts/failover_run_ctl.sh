@@ -137,9 +137,19 @@ _cmd_status() {
   local log_path="" report_path="" completed=0
   if [[ -n "${results_dir}" ]]; then
     log_path="${results_dir}/full_run.log"
-    report_path="${results_dir}/advanced/graphs/failover_report.html"
+    # Prefer type-specific combined reports (trigger × scenario); fall back to legacy mega-combined.
+    report_path="$(
+      find "${REPO_ROOT}/${results_dir}/advanced" -path '*/graphs/failover_report.html' 2>/dev/null \
+        | grep -Ev '/iter[0-9]+/|/t[0-9]+/' \
+        | sort \
+        | head -1 \
+        | sed "s|^${REPO_ROOT}/||"
+    )"
+    if [[ -z "${report_path}" ]]; then
+      report_path="${results_dir}/advanced/graphs/failover_report.html"
+      [[ -f "${REPO_ROOT}/${report_path}" ]] || report_path=""
+    fi
     [[ -f "${REPO_ROOT}/${log_path}" ]] || log_path=""
-    [[ -f "${REPO_ROOT}/${report_path}" ]] || report_path=""
     if _run_log_complete "${results_dir}"; then
       completed=1
     fi

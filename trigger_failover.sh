@@ -18,8 +18,15 @@ CONFIG="${BENCHMARK_CONF:-${SCRIPT_DIR}/benchmark.conf}"
 
 # shellcheck source=lib/failover_common.sh
 source "${SCRIPT_DIR}/lib/failover_common.sh"
+# Matrix runs export FAILOVER_ADVANCED_TRIGGER_METHOD per method dir; sourcing
+# benchmark.conf must not clobber that override (conf often pins pod_delete).
+_FAILOVER_ADVANCED_TRIGGER_METHOD_OVERRIDE="${FAILOVER_ADVANCED_TRIGGER_METHOD-}"
 load_benchmark_config "${CONFIG}"
 failover_defaults
+if [[ -n "${_FAILOVER_ADVANCED_TRIGGER_METHOD_OVERRIDE}" ]]; then
+  export FAILOVER_ADVANCED_TRIGGER_METHOD="${_FAILOVER_ADVANCED_TRIGGER_METHOD_OVERRIDE}"
+fi
+unset _FAILOVER_ADVANCED_TRIGGER_METHOD_OVERRIDE
 
 EDITION="${1:?Usage: $0 <standard|advanced> <results_dir> [prepare|refresh|fire]}"
 RESULTS_DIR="${2:?Usage: $0 <standard|advanced> <results_dir> [prepare|refresh|fire]}"

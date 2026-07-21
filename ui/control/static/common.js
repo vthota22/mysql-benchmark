@@ -272,7 +272,7 @@ function renderRunsList(container, data, { onGenerate } = {}) {
 
       const primary = run.primary_report;
       const primaryLink = primary
-        ? `<p class="run-primary">${reportLinkHtml(primary, "Open primary report")}</p>`
+        ? `<p class="run-primary">${reportLinkHtml(primary)}</p>`
         : "";
 
       return (

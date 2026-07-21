@@ -131,6 +131,8 @@ FAILOVER_EDITIONS="standard advanced"
 #   total_failover_sec      — same write-path downtime (0 if never unhealthy but primary moved)
 # FAILOVER_DETECT_WINDOW_SEC=60           # unplanned connect-fail accept window
 # FAILOVER_PLANNED_DETECT_WINDOW_SEC=10   # planned write/connect outage accept window
+# FAILOVER_DETECT_GUARD_SEC=0             # 0 = TTD is first connect_ok=0 at/after trigger epoch only
+                                          # (set >0 only to absorb pre-trigger poll skew; can zero TTD on flaky VIP)
 #   app_recovery_sec        — trigger → RTO (TPS ≥ 90% baseline for 30s stable)
 #   transactions_failed_during_failover — excess err/s + reconn/s over pre-trigger baseline (TTD → RTO)
 #   writes_failed_during_failover — monitor polls with connect_ok=1 and write_ok=0 (trigger → max(RTO, promote))

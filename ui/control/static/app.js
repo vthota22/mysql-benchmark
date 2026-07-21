@@ -29,6 +29,10 @@ let runPollTimer = null;
 let reportsPollTimer = null;
 let reportsLoaded = false;
 let compareLoaded = false;
+let reportsRefreshInFlight = null;
+let compareRefreshInFlight = null;
+let initialLoadDone = false;
+let lastStatusResultsDir = "";
 
 function updateReportsCopy(data = {}) {
   const label = data.feature_label || FeatureContext.label || "Failover";
@@ -174,7 +178,7 @@ function bindReportPanelActions(root) {
 
 function renderCurrentReports(status) {
   const reports = status.reports || [];
-  const primary = status.primary_report || (status.report_url ? { view_url: status.report_url, label: "Combined report" } : null);
+  const primary = status.primary_report || (status.report_url ? { view_url: status.report_url, label: "Failover report" } : null);
   const reportsTab = `<button type="button" class="link-button" data-open-tab="reports">Benchmark run reports</button>`;
   const pending = status.running && !primary?.view_url;
 
@@ -268,39 +272,65 @@ async function refreshStatus() {
     runPollTimer = null;
   }
 
-  if (status.running || status.completed) {
+  // Only invalidate report caches when the active results dir changes (new run),
+  // not on every 5s status poll — that was forcing list reload blips.
+  const resultsDir = status.results_dir || "";
+  if (resultsDir && resultsDir !== lastStatusResultsDir) {
+    lastStatusResultsDir = resultsDir;
     reportsLoaded = false;
     compareLoaded = false;
   }
 }
 
-async function refreshReports() {
-  runsList.textContent = "Loading…";
-  runsList.className = "runs-list muted";
-  const data = await api(DropletContext.withHost("/api/reports?limit=50"));
-  updateReportsCopy(data);
-  updateFilterNote(runsFilterNote, data.runs_min_id, "Showing runs from");
-  renderRunsList(runsList, data, {
-    onGenerate: async (resultsDir, button) => {
-      try {
-        await generateRunReport(resultsDir, button, activeHost());
-        await refreshReports();
-        compareLoaded = false;
-      } catch (err) {
-        alert(err.message);
-      }
-    },
-  });
-  reportsLoaded = true;
+async function refreshReports({ quiet = false } = {}) {
+  if (reportsRefreshInFlight) {
+    return reportsRefreshInFlight;
+  }
 
-  const running = (data.runs || []).some((run) => run.running);
-  if (running && !reportsPollTimer) {
-    reportsPollTimer = setInterval(() => refreshReports().catch(() => {}), 10000);
-  }
-  if (!running && reportsPollTimer) {
-    clearInterval(reportsPollTimer);
-    reportsPollTimer = null;
-  }
+  reportsRefreshInFlight = (async () => {
+    // Keep existing list visible during poll refreshes; only show Loading on first load.
+    if (!quiet && !reportsLoaded) {
+      runsList.textContent = "Loading…";
+      runsList.className = "runs-list muted";
+    } else if (quiet) {
+      runsList.classList.add("is-refreshing");
+    }
+
+    try {
+      const data = await api(DropletContext.withHost("/api/reports?limit=50"));
+      updateReportsCopy(data);
+      updateFilterNote(runsFilterNote, data.runs_min_id, "Showing runs from");
+      renderRunsList(runsList, data, {
+        onGenerate: async (resultsDir, button) => {
+          try {
+            await generateRunReport(resultsDir, button, activeHost());
+            await refreshReports({ quiet: true });
+            compareLoaded = false;
+          } catch (err) {
+            alert(err.message);
+          }
+        },
+      });
+      reportsLoaded = true;
+
+      const running = (data.runs || []).some((run) => run.running);
+      if (running && !reportsPollTimer) {
+        reportsPollTimer = setInterval(
+          () => refreshReports({ quiet: true }).catch(() => {}),
+          10000
+        );
+      }
+      if (!running && reportsPollTimer) {
+        clearInterval(reportsPollTimer);
+        reportsPollTimer = null;
+      }
+    } finally {
+      runsList.classList.remove("is-refreshing");
+      reportsRefreshInFlight = null;
+    }
+  })();
+
+  return reportsRefreshInFlight;
 }
 
 function updateCompareLimitNote() {
@@ -311,15 +341,30 @@ function updateCompareLimitNote() {
     `Last ${limit} runs on ${droplet} — failure detection and time to promote (election) from failover_kpi.csv.`;
 }
 
-async function refreshCompare() {
-  updateCompareLimitNote();
-  compareContent.textContent = "Loading…";
-  compareContent.className = "compare-content muted";
-  const limit = DropletContext.compareRunsLimit || 6;
-  const data = await api(DropletContext.withHost(`/api/runs/compare?limit=${limit}`));
-  updateFilterNote(compareFilterNote, data.runs_min_id, "Comparing runs from");
-  renderCompareTable(compareContent, data);
-  compareLoaded = true;
+async function refreshCompare({ quiet = false } = {}) {
+  if (compareRefreshInFlight) {
+    return compareRefreshInFlight;
+  }
+
+  compareRefreshInFlight = (async () => {
+    updateCompareLimitNote();
+    if (!quiet && !compareLoaded) {
+      compareContent.textContent = "Loading…";
+      compareContent.className = "compare-content muted";
+    }
+
+    try {
+      const limit = DropletContext.compareRunsLimit || 6;
+      const data = await api(DropletContext.withHost(`/api/runs/compare?limit=${limit}`));
+      updateFilterNote(compareFilterNote, data.runs_min_id, "Comparing runs from");
+      renderCompareTable(compareContent, data);
+      compareLoaded = true;
+    } finally {
+      compareRefreshInFlight = null;
+    }
+  })();
+
+  return compareRefreshInFlight;
 }
 
 async function reloadActiveDropletData() {
@@ -420,6 +465,7 @@ async function loadInitial() {
     // Warm failover config/status in background for when user opens Run.
     loadRunConfig().catch(() => {});
   }
+  initialLoadDone = true;
 }
 
 btnSave.addEventListener("click", async () => {
@@ -512,6 +558,11 @@ window.addEventListener("benchmark-feature", () => {
 });
 
 window.addEventListener("failover-tab", (event) => {
+  // Skip during bootstrap — loadInitial owns the first fetch. tabs.js also
+  // activates the hash tab on DOMContentLoaded and would otherwise double-load.
+  if (!initialLoadDone) {
+    return;
+  }
   const tab = event.detail?.tab;
   if (tab === "reports" && !reportsLoaded) {
     refreshReports().catch((err) => {
