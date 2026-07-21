@@ -25,27 +25,39 @@ fi
 # --- 1. Add option to tpcc_common.lua ---
 if ! grep -q 'reconnect_time_sec' "${TPCC_COMMON}"; then
   python3 - "${TPCC_COMMON}" <<'PY'
-import sys
+import re, sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
 text = path.read_text()
 
-option_line = (
+new_option = (
     '   reconnect_time_sec =\n'
     '      {"Every N seconds one randomly chosen thread gracefully reconnects (0 = disabled)", 0},\n'
 )
 
-# Insert before the closing brace of sysbench.cmdline.options
-# Find the last "}" that closes the options table (preceded by a line with a value)
-import re
-# Match the final closing brace of the options table
-m = re.search(r'^}\s*$', text, re.MULTILINE)
-if m:
-    text = text[:m.start()] + option_line + text[m.start():]
-    path.write_text(text)
-else:
+# Find "sysbench.cmdline.options = {" then its matching "}"
+opts_start = text.find('sysbench.cmdline.options = {')
+if opts_start < 0:
+    sys.exit("Could not find sysbench.cmdline.options table")
+
+# Find the closing "}" — first standalone "}" after the options table start
+rest = text[opts_start:]
+m = re.search(r'^}\s*$', rest, re.MULTILINE)
+if not m:
     sys.exit("Could not find closing brace of sysbench.cmdline.options")
+
+insert_pos = opts_start + m.start()
+
+# Ensure the last option line before "}" has a trailing comma.
+# Look backwards from insert_pos for the last "}" or quote that ends an option value.
+before = text[:insert_pos].rstrip()
+if before and before[-1] in ('"', '}') and not before.endswith(','):
+    text = before + ',\n' + new_option + text[insert_pos:]
+else:
+    text = text[:insert_pos] + new_option + text[insert_pos:]
+
+path.write_text(text)
 PY
   echo "Patched ${TPCC_COMMON}: added reconnect_time_sec option"
 fi
