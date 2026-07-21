@@ -81,6 +81,9 @@ def load_benchmark_config(edition_dir: Path, meta: dict[str, str]) -> dict[str, 
     runtime_cfg = edition_root / "mysql_runtime.env"
     if runtime_cfg.exists():
         cfg.update(load_metadata(runtime_cfg))
+    haproxy_cfg = edition_root / "haproxy_health.env"
+    if haproxy_cfg.exists():
+        cfg.update(load_metadata(haproxy_cfg))
     timing = edition_dir / "sysbench_timing.txt"
     if timing.exists():
         cfg.update(load_metadata(timing))
@@ -124,6 +127,7 @@ def _mysql_runtime_meta_rows(
             "GR flow control applier threshold",
             "GR_FLOW_CONTROL_APPLIER_THRESHOLD",
         ),
+        ("HAProxy health check (HA_SERVER_OPTIONS)", "HA_SERVER_OPTIONS"),
     )
     for label, key in mapping:
         if key == "REPLICA_PARALLEL_WORKERS" and per_pod_workers:
@@ -495,6 +499,7 @@ def load_scenario_bundle(scenario_dir: Path) -> dict:
 def load_edition_benchmark_config(edition_dir: Path) -> dict[str, str]:
     cfg = load_metadata(edition_dir / "benchmark_config.env")
     cfg.update(load_metadata(edition_dir / "mysql_runtime.env"))
+    cfg.update(load_metadata(edition_dir / "haproxy_health.env"))
     return cfg
 
 

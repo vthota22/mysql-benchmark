@@ -269,6 +269,8 @@ run_failover_edition() {
     echo ""
     apply_haproxy_health_check "${edition_dir}" \
       || { echo "Aborting ${edition}: HAProxy health check apply failed"; return 1; }
+    # Always capture live CR value for report metadata (even when apply is disabled).
+    capture_haproxy_health_metadata "${edition_dir}" || true
     echo ""
   fi
 

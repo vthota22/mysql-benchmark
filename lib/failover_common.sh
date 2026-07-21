@@ -174,6 +174,13 @@ _append_mysql_runtime_to_timing() {
           [[ -n "${val}" ]] && echo "${key}=${val}" >> "${timing_file}"
         done
       fi
+      if [[ -f "${edition_dir}/haproxy_health.env" ]]; then
+        for key in HA_SERVER_OPTIONS HAPROXY_CHECK_INTER_MS \
+          HAPROXY_HEALTH_CHECK_INTERVAL_SEC HAPROXY_HEALTH_CHECK_RISE HAPROXY_HEALTH_CHECK_FALL; do
+          val=$(grep -E "^${key}=" "${edition_dir}/haproxy_health.env" | tail -1 | cut -d= -f2- || true)
+          [[ -n "${val}" ]] && echo "${key}=${val}" >> "${timing_file}"
+        done
+      fi
       return 0
     fi
     edition_dir="$(dirname "${edition_dir}")"
@@ -1456,6 +1463,74 @@ _failover_resolve_kubeconfig() {
     fi
   fi
   return 1
+}
+
+# Read live HA_SERVER_OPTIONS from the PerconaServerMySQL CR into edition_dir/haproxy_health.env.
+# Always safe to call (read-only); used for HTML run-metadata even when apply is disabled.
+capture_haproxy_health_metadata() {
+  local edition_dir="${1:-}"
+  local ns="${ADVANCED_K8S_NAMESPACE:-}"
+  local cr="${ADVANCED_PSMYSQL_CR_NAME:-}"
+  local kubeconfig=""
+  local server_options=""
+  local inter_ms="" interval_sec="" rise="" fall=""
+
+  if [[ -z "${cr}" || -z "${ns}" ]]; then
+    echo "HAProxy health metadata: skipped (set ADVANCED_PSMYSQL_CR_NAME and ADVANCED_K8S_NAMESPACE)" >&2
+    return 0
+  fi
+
+  if ! kubeconfig="$(_failover_resolve_kubeconfig "${edition_dir}")"; then
+    echo "HAProxy health metadata: skipped (no kubeconfig)" >&2
+    return 0
+  fi
+
+  command -v kubectl >/dev/null 2>&1 || {
+    echo "HAProxy health metadata: skipped (kubectl not found)" >&2
+    return 0
+  }
+
+  local -a kubectl=()
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+
+  server_options="$("${kubectl[@]}" get "perconaservermysql" "${cr}" -n "${ns}" \
+    -o jsonpath='{.spec.proxy.haproxy.env[?(@.name=="HA_SERVER_OPTIONS")].value}' 2>/dev/null || true)"
+  server_options="$(echo "${server_options}" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+
+  if [[ -z "${server_options}" ]]; then
+    echo "HAProxy health metadata: HA_SERVER_OPTIONS not set on ${cr}" >&2
+    return 0
+  fi
+
+  if [[ "${server_options}" =~ inter[[:space:]]+([0-9]+) ]]; then
+    inter_ms="${BASH_REMATCH[1]}"
+    interval_sec=$((inter_ms / 1000))
+  fi
+  if [[ "${server_options}" =~ rise[[:space:]]+([0-9]+) ]]; then
+    rise="${BASH_REMATCH[1]}"
+  fi
+  if [[ "${server_options}" =~ fall[[:space:]]+([0-9]+) ]]; then
+    fall="${BASH_REMATCH[1]}"
+  fi
+
+  if [[ -n "${edition_dir}" ]]; then
+    mkdir -p "${edition_dir}"
+    {
+      echo "HA_SERVER_OPTIONS=${server_options}"
+      [[ -n "${inter_ms}" ]] && echo "HAPROXY_CHECK_INTER_MS=${inter_ms}"
+      [[ -n "${interval_sec}" ]] && echo "HAPROXY_HEALTH_CHECK_INTERVAL_SEC=${interval_sec}"
+      [[ -n "${rise}" ]] && echo "HAPROXY_HEALTH_CHECK_RISE=${rise}"
+      [[ -n "${fall}" ]] && echo "HAPROXY_HEALTH_CHECK_FALL=${fall}"
+      echo "ADVANCED_PSMYSQL_CR_NAME=${cr}"
+      echo "ADVANCED_K8S_NAMESPACE=${ns}"
+      echo "HAPROXY_HEALTH_CAPTURE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      echo "HAPROXY_HEALTH_CAPTURE_SOURCE=perconaservermysql_cr"
+    } > "${edition_dir}/haproxy_health.env"
+  fi
+
+  echo "HAProxy health metadata: ${server_options}"
+  echo "  wrote ${edition_dir}/haproxy_health.env"
+  return 0
 }
 
 # Patch PerconaServerMySQL HA_SERVER_OPTIONS (HAProxy backend check inter/rise/fall).
