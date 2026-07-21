@@ -2985,17 +2985,9 @@ def render_haproxy_conns_section(
         full_html=False, include_plotlyjs=False,
         div_id="haproxy-conns", config=_plotly_config,
     )
-    n_pods = len({r.pod for r in rows})
     return f"""
     <section>
       <h2 class="section-title">HAProxy Current Connections</h2>
-      <p>
-        Per-proxy session counts from <code>k8s_monitor/haproxy_conns.tsv</code>
-        ({n_pods} proxy pod{'s' if n_pods != 1 else ''}): frontend
-        <code>curr_conns</code> and backend <code>mysql_primary_scur</code>
-        (sessions on the PRIMARY MySQL server). Yellow markers are HAProxy drains;
-        blue are MySQL secondary drains.
-      </p>
       <div class="chart-box">{chart_html}</div>
     </section>"""
 

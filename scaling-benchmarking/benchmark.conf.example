@@ -42,6 +42,12 @@ TPCC_PERCENTILE=99
 # TPC-C contention (sysbench defaults): 1205=lock wait, 1213=deadlock, 1020=record changed
 TPCC_IGNORE_ERRORS="1290,1836,1053,2013,2006,2055,2011,3100,1205,1213,1020"
 
+# Periodic reconnect: every N seconds, one randomly chosen thread gracefully closes
+# and re-opens its MySQL connection. Helps rebalance connections across HAProxy pods
+# after drains/reloads. 0 = disabled (default). With 16 threads and 10s interval,
+# all 16 connections cycle within ~160s.
+TPCC_RECONNECT_TIME_SEC=0
+
 # 1 = skip prepare when TPC-C tables already exist; 0 = drop DB and reload dataset
 # When SKIP_PREPARE=1, phase 1 runs tpcc check with TPCC_CHECK_THREADS (or TPCC_PREP_THREADS);
 # the run phase still uses TPCC_THREADS below.
