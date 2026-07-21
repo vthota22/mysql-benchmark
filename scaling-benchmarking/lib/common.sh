@@ -1195,6 +1195,17 @@ ensure_tpcc_prepare_commit_patch() {
   bash "${patch_script}" "${tpcc}"
 }
 
+ensure_tpcc_reconnect_patch() {
+  local tpcc patch_script
+  tpcc="$(tpcc_dir)"
+  patch_script="${BENCH_ROOT}/scripts/patch_tpcc_reconnect.sh"
+  if [[ ! -f "${patch_script}" ]]; then
+    echo "WARNING: missing ${patch_script} — tpcc reconnect patch skipped" >&2
+    return 0
+  fi
+  bash "${patch_script}" "${tpcc}"
+}
+
 run_tpcc() {
   local subcommand="${1:?prepare|run|cleanup}"
   shift
@@ -1210,6 +1221,7 @@ run_tpcc() {
 
   if [[ "${subcommand}" == "run" ]]; then
     ensure_tpcc_failover_patch
+    ensure_tpcc_reconnect_patch
   elif [[ "${subcommand}" == "prepare" ]]; then
     ensure_tpcc_prepare_commit_patch
   fi
