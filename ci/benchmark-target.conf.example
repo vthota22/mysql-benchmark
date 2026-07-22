@@ -17,7 +17,7 @@ REMOTE_BENCHMARK_CONF=benchmark.conf
 
 # Optional: git sync on droplet before each scheduled run
 CI_GIT_SYNC=1
-DROPLET_GIT_BRANCH=main_2
+DROPLET_GIT_BRANCH=main
 
 # Wait for benchmark completion (failover can run 30–90+ minutes)
 CI_POLL_INTERVAL_SEC=60

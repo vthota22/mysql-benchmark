@@ -103,7 +103,7 @@ _normalize_ci_flags() {
       ;;
   esac
 
-  DROPLET_GIT_BRANCH="${DROPLET_GIT_BRANCH:-main_2}"
+  DROPLET_GIT_BRANCH="${DROPLET_GIT_BRANCH:-main}"
 }
 
 _validate_required() {

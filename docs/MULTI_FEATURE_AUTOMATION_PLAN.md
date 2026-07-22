@@ -1,6 +1,6 @@
 # Plan: Automate backup + scaling benchmarks alongside failover
 
-Extend the current GitHub Actions failover automation on `main_2` to also run **backup** and **scaling** benchmarks after merging their feature branches.
+Extend the current GitHub Actions failover automation on `main` to also run **backup** and **scaling** benchmarks after merging their feature branches.
 
 ---
 
@@ -35,7 +35,7 @@ Extend the current GitHub Actions failover automation on `main_2` to also run **
 | Conf on droplet | root `benchmark.conf` | feature subdir `benchmark.conf` |
 | UI | App Platform reads droplet `results/` | Same pattern once paths are wired |
 
-**Stubs / workflows on `main_2`:**
+**Stubs / workflows on `main`:**
 
 - `scripts/ci_backup_benchmark.sh`, `scripts/ci_scaling_benchmark.sh` — exit **0** immediately (write `stub_status.env`)
 - `scripts/backup_run_ctl.sh`, `scripts/scaling_run_ctl.sh` — ctl stubs for post-merge wiring
@@ -96,9 +96,9 @@ Notes:
 
 ## Goal
 
-| Feature | Branch today | Target on `main_2` |
+| Feature | Branch today | Target on `main` |
 |---------|--------------|--------------------|
-| Failover | `main_2` (done) | Keep current GHA every 3h |
+| Failover | `main` (done) | Keep current GHA every 3h |
 | Backup | `origin/backup-benchmarking` | Merge + automate like failover |
 | Scaling | `origin/added-scale-benchmarking` | Merge + automate like failover |
 
@@ -110,7 +110,7 @@ Notes:
 
 **Yes — possible.** Backup and scaling already look like sibling harnesses (own `benchmark.conf`, `results/`, HTML reports). They lack the CI control layer failover already has.
 
-| Concern | Failover (`main_2`) | Backup / Scaling (other branches) |
+| Concern | Failover (`main`) | Backup / Scaling (other branches) |
 |---------|---------------------|-----------------------------------|
 | Entrypoint | `run_failover_benchmark.sh` | `*/run_benchmark.sh` |
 | Config | root `benchmark.conf` | `backup-benchmarking/benchmark.conf`, `scaling-benchmarking/benchmark.conf` |
@@ -132,7 +132,7 @@ Same SSH secret / droplet map model can be reused; each feature keeps its **own*
 
 | Phase | Scope | Effort |
 |-------|--------|--------|
-| **A. Merge into `main_2`** | Bring in both subdirs; resolve conflicts in shared root scripts | **1–2 days** |
+| **A. Merge into `main`** | Bring in both subdirs; resolve conflicts in shared root scripts | **1–2 days** |
 | **B. CTL wrappers** | `backup_run_ctl.sh` / `scaling_run_ctl.sh` | **0.5–1 day** |
 | **C. CI orchestrators** | Clone `ci_failover_benchmark.sh` per feature | **1–2 days** |
 | **D. Workflows** | New workflows or one multi-feature workflow | **0.5–1 day** |
@@ -150,13 +150,13 @@ Scaling is heavier (DigitalOcean resize API + optional k8s monitor + larger repo
 
 ## Change list
 
-### 1. Merge branches into `main_2`
+### 1. Merge branches into `main`
 
 - [ ] Merge or cherry-pick `backup-benchmarking/` from `origin/backup-benchmarking`
 - [ ] Merge or cherry-pick `scaling-benchmarking/` from `origin/added-scale-benchmarking`
 - [ ] Resolve conflicts in shared root scripts (`bootstrap/setup_benchmark.sh`, `run_tpcc.sh`, TPCC patches, etc.)
 - [ ] Keep feature confs **gitignored** per droplet; commit only `*.example`
-- [ ] Sync target droplets to `main_2` after merge
+- [ ] Sync target droplets to `main` after merge
 
 ### 2. Add ctl wrappers (mirror failover)
 
@@ -205,7 +205,7 @@ Choose one:
 
 ### 6. Droplet prerequisites (per feature)
 
-- [ ] Repo on `main_2` with both feature subdirs present
+- [ ] Repo on `main` with both feature subdirs present
 - [ ] Feature `benchmark.conf` filled in under the subdir
 - [ ] Valid kubeconfig where backup profiler / scaling k8s paths need it
 - [ ] Scaling: doctl installed and authenticated (or token available to the harness)
@@ -227,7 +227,7 @@ Choose one:
 
 ## Recommended sequence
 
-1. **Merge code** into `main_2`; prove manual `run_benchmark.sh` for backup and scaling on at least one droplet each.
+1. **Merge code** into `main`; prove manual `run_benchmark.sh` for backup and scaling on at least one droplet each.
 2. Add **ctl + `ci_*` + workflow** for **backup** first (closest clone of failover CI).
 3. Repeat for **scaling** (extra DO / k8s secrets and readiness).
 4. Unify or stagger schedules and droplet maps once both are green.

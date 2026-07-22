@@ -11,7 +11,7 @@
 # Optional variables:
 #   BENCHMARK_DROPLET_HOST      — fallback single droplet if MAP is unset
 #   BENCHMARK_DROPLET_USER      — default: root
-#   BENCHMARK_DROPLET_GIT_BRANCH — default: main_2
+#   BENCHMARK_DROPLET_GIT_BRANCH — default: main
 #
 # Each droplet uses its own gitignored benchmark.conf (same as the control UI).
 
@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       git_branch:
-        description: "Git branch to sync on droplet before run (empty = main_2)"
+        description: "Git branch to sync on droplet before run (empty = main)"
         required: false
         default: ""
       droplet:
@@ -164,7 +164,7 @@ jobs:
           BENCHMARK_DROPLET_HOST: ${{ matrix.host }}
           BENCHMARK_DROPLET_USER: ${{ vars.BENCHMARK_DROPLET_USER || 'root' }}
           BENCHMARK_REMOTE_REPO: ${{ vars.BENCHMARK_REMOTE_REPO }}
-          BENCHMARK_DROPLET_GIT_BRANCH: ${{ inputs.git_branch != '' && inputs.git_branch || vars.BENCHMARK_DROPLET_GIT_BRANCH || 'main_2' }}
+          BENCHMARK_DROPLET_GIT_BRANCH: ${{ inputs.git_branch != '' && inputs.git_branch || vars.BENCHMARK_DROPLET_GIT_BRANCH || 'main' }}
           CI_GIT_SYNC: "1"
           CI_ARTIFACTS_DIR: ${{ github.workspace }}/ci-artifacts/${{ matrix.name }}
         run: |

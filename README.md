@@ -71,7 +71,7 @@ GitHub Actions (cron / workflow_dispatch)
 ### Jobs (each workflow)
 
 1. **`prepare`** — Parses the feature droplet map into a JSON matrix (`name` / `host`). Failover uses `BENCHMARK_DROPLET_MAP`; backup/scaling prefer `BACKUP_DROPLET_MAP` / `SCALING_DROPLET_MAP` with fallback to the failover map.
-2. **Matrix run job** — One parallel job per droplet. Syncs the configured branch (default `main_2`), runs the CI orchestrator, and leaves artifacts under that droplet’s `results/` tree. Concurrency groups wait for in-progress runs (`cancel-in-progress: false`).
+2. **Matrix run job** — One parallel job per droplet. Syncs the configured branch (default `main`), runs the CI orchestrator, and leaves artifacts under that droplet’s `results/` tree. Concurrency groups wait for in-progress runs (`cancel-in-progress: false`).
 
 Manual runs: **Actions → workflow → Run workflow**. Failover dispatch can optionally pin a git branch and a single droplet name from the map.
 
@@ -83,6 +83,6 @@ Manual runs: **Actions → workflow → Run workflow**. Failover dispatch can op
 | Variable | `BENCHMARK_DROPLET_MAP` | `name:host` pairs for failover (and map fallback) |
 | Variable | `BENCHMARK_REMOTE_REPO` | Repo path on droplet (e.g. `/root/mysql-benchmark`) |
 | Variable (optional) | `BACKUP_DROPLET_MAP` / `SCALING_DROPLET_MAP` | Feature-specific maps |
-| Variable (optional) | `BENCHMARK_DROPLET_GIT_BRANCH` | Default branch sync (`main_2`) |
+| Variable (optional) | `BENCHMARK_DROPLET_GIT_BRANCH` | Default branch sync (`main`) |
 
 Droplet bootstrap: [bootstrap/README.md](bootstrap/README.md).
