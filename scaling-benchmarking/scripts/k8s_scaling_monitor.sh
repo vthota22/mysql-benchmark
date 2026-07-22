@@ -19,6 +19,7 @@
 #   haproxy_conns.tsv      — CurrConns / backend scur per HAProxy pod
 #   endpoints_monitor.tsv  — service endpoint changes
 #   k8s_events.tsv         — namespace events log
+#   pods_watch.log         — live kubectl get pods -o wide -w stream (timestamped)
 #   k8s_monitor.log        — key events (failovers, changes)
 #
 # Usage (standalone):
@@ -51,8 +52,12 @@ HAPROXY_CONNS_TSV="${OUTPUT_DIR}/haproxy_conns.tsv"
 ENDPOINTS_TSV="${OUTPUT_DIR}/endpoints_monitor.tsv"
 EVENTS_TSV="${OUTPUT_DIR}/k8s_events.tsv"
 MONITOR_LOG="${OUTPUT_DIR}/k8s_monitor.log"
+PODS_WATCH_LOG="${OUTPUT_DIR}/pods_watch.log"
+PODS_WATCH_PID_FILE="${OUTPUT_DIR}/.pods_watch.pid"
+PODS_WATCH_PID=""
 
 : > "${MONITOR_LOG}"
+: > "${PODS_WATCH_LOG}"
 
 CACHED_PASSWORD=""
 PREVIOUS_PRIMARY=""
@@ -914,6 +919,49 @@ for item in data.get('items', []):
 }
 
 # ── Startup / shutdown ─────────────────────────────────────────────────────
+
+# Continuous kubectl get pods -o wide -w into pods_watch.log (separate from poll TSV).
+# Reconnects automatically if the watch stream dies (API blip / timeout).
+start_pods_watch() {
+  (
+    local backoff=5
+    while true; do
+      {
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] === pods watch (re)starting: kubectl get pods -n ${NAMESPACE} -o wide -w ==="
+        # Prefix every watch line with UTC timestamp. Stream stderr into the same file.
+        kubectl --namespace="${NAMESPACE}" get pods -o wide -w 2>&1 | while IFS= read -r line; do
+          echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] ${line}"
+        done
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] === pods watch stream ended — reconnecting in ${backoff}s ==="
+      } >> "${PODS_WATCH_LOG}"
+      sleep "${backoff}"
+      if [[ "${backoff}" -lt 60 ]]; then
+        backoff=$((backoff * 2))
+        [[ "${backoff}" -gt 60 ]] && backoff=60
+      fi
+    done
+  ) &
+  PODS_WATCH_PID=$!
+  echo "${PODS_WATCH_PID}" > "${PODS_WATCH_PID_FILE}"
+  log "pods watch started (pid=${PODS_WATCH_PID}) -> ${PODS_WATCH_LOG}"
+}
+
+stop_pods_watch() {
+  local pid="${PODS_WATCH_PID:-}"
+  if [[ -z "${pid}" && -f "${PODS_WATCH_PID_FILE}" ]]; then
+    pid="$(cat "${PODS_WATCH_PID_FILE}" 2>/dev/null || true)"
+  fi
+  if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+    log "stopping pods watch (pid=${pid})"
+    # Kill kubectl child(ren) first, then the wrapper loop.
+    pkill -TERM -P "${pid}" 2>/dev/null || true
+    kill -TERM "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+  fi
+  rm -f "${PODS_WATCH_PID_FILE}"
+  PODS_WATCH_PID=""
+}
+
 capture_baseline() {
   log "capturing baseline"
   kubectl_ns get pods -l "app.kubernetes.io/instance=${CLUSTER_NAME}" -o wide \
@@ -924,6 +972,7 @@ capture_baseline() {
 
 shutdown() {
   log "monitor shutting down"
+  stop_pods_watch
   kubectl_ns get pods -l "app.kubernetes.io/instance=${CLUSTER_NAME}" -o wide \
     > "${OUTPUT_DIR}/pods_final.txt" 2>/dev/null || true
   kubectl get nodes -o wide > "${OUTPUT_DIR}/nodes_final.txt" 2>/dev/null || true
@@ -988,6 +1037,7 @@ main() {
   : > "${LAST_EVENT_TS_FILE}"
 
   log "polling started"
+  start_pods_watch
 
   local consecutive_failures=0
   while true; do
