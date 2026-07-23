@@ -189,6 +189,9 @@ STANDARD_CLUSTER_UUID=
 #   mysqld_kill     — kubectl exec kill mysqld inside primary pod (process crash)
 #   set_as_primary  — graceful planned primary replacement via group_replication_set_as_primary
 FAILOVER_ADVANCED_TRIGGER_METHOD=pod_delete
+# Optional 2nd arg to group_replication_set_as_primary(uuid[, timeout]): seconds to wait for
+# ongoing transactions before forcing the switch (MySQL UDF). Default 1.
+FAILOVER_SET_AS_PRIMARY_TIMEOUT_SEC=1
 # Run unplanned then planned in one harness invocation (results under advanced/<method>/...).
 # Leave unset to use only FAILOVER_ADVANCED_TRIGGER_METHOD above (no extra method subdir).
 FAILOVER_TRIGGER_MATRIX="pod_delete set_as_primary"

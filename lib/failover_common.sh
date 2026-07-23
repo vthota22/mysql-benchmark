@@ -65,6 +65,9 @@ failover_defaults() {
   : "${FAILOVER_DETECT_WINDOW_SEC:=60}"
   # Planned (set_as_primary): max seconds after trigger to accept write/connect outage start.
   : "${FAILOVER_PLANNED_DETECT_WINDOW_SEC:=10}"
+  # Optional 2nd arg to group_replication_set_as_primary(member_uuid[, timeout]):
+  # seconds to wait for ongoing transactions before forcing the switch (MySQL UDF).
+  : "${FAILOVER_SET_AS_PRIMARY_TIMEOUT_SEC:=1}"
   # Pre-trigger band for TTD (seconds). 0 = first connect_ok=0 at/after trigger epoch only.
   : "${FAILOVER_DETECT_GUARD_SEC:=0}"
   : "${ADVANCED_K8S_MYSQL_CONTAINER:=mysql}"
@@ -2839,9 +2842,10 @@ _failover_promote_mysql_pod_to_primary() {
     return 1
   }
   exec_pod="${REPLICA_WORKERS_PRIMARY_POD:-${pod}}"
-  echo "  promoting ${pod} (${member_id}) via ${exec_pod}" | tee -a "${log_file}"
+  local udf_timeout="${FAILOVER_SET_AS_PRIMARY_TIMEOUT_SEC:-1}"
+  echo "  promoting ${pod} (${member_id}) via ${exec_pod} (udf_timeout=${udf_timeout}s)" | tee -a "${log_file}"
   if ! _failover_mysql_root_exec "${kubeconfig}" "${ns}" "${exec_pod}" \
-    "SELECT group_replication_set_as_primary('${member_id}');" 60 | tee -a "${log_file}"; then
+    "SELECT group_replication_set_as_primary('${member_id}', ${udf_timeout});" 60 | tee -a "${log_file}"; then
     echo "ERROR: group_replication_set_as_primary failed for ${pod}" | tee -a "${log_file}"
     return 1
   fi

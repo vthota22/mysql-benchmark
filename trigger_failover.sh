@@ -435,16 +435,24 @@ _advanced_failover_set_as_primary() {
   fi
   echo "FAILOVER_PROMOTE_MEMBER_ID=${member_id}" >> "${EVENT_FILE}"
 
-  echo "Graceful primary replacement: promoting ${promote_pod} (${member_id}) via ${primary_pod}..." \
+  local udf_timeout="${FAILOVER_SET_AS_PRIMARY_TIMEOUT_SEC:-1}"
+  if ! [[ "${udf_timeout}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: FAILOVER_SET_AS_PRIMARY_TIMEOUT_SEC must be an integer (seconds); got '${udf_timeout}'" \
+      | tee -a "${TRIGGER_LOG}"
+    return 1
+  fi
+
+  echo "Graceful primary replacement: promoting ${promote_pod} (${member_id}) via ${primary_pod} (udf_timeout=${udf_timeout}s)..." \
     | tee -a "${TRIGGER_LOG}"
-  echo "SQL: SELECT group_replication_set_as_primary('${member_id}');" >> "${TRIGGER_LOG}"
+  echo "SQL: SELECT group_replication_set_as_primary('${member_id}', ${udf_timeout});" >> "${TRIGGER_LOG}"
+  echo "FAILOVER_SET_AS_PRIMARY_TIMEOUT_SEC=${udf_timeout}" >> "${EVENT_FILE}"
 
   echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
   echo "FAILOVER_TRIGGER_EPOCH=$(python3 -c 'import time; print("%.3f" % time.time())')" >> "${EVENT_FILE}"
   echo "FAILOVER_SET_AS_PRIMARY_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
 
   if ! _failover_mysql_root_exec "${kubeconfig}" "${ns}" "${primary_pod}" \
-    "SELECT group_replication_set_as_primary('${member_id}');" 60 | tee -a "${TRIGGER_LOG}"; then
+    "SELECT group_replication_set_as_primary('${member_id}', ${udf_timeout});" 60 | tee -a "${TRIGGER_LOG}"; then
     echo "ERROR: group_replication_set_as_primary failed for ${promote_pod}" | tee -a "${TRIGGER_LOG}"
     return 1
   fi
