@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Failover benchmark: continuous TPC-C load, trigger failover mid-run, capture RTO metrics.
 #
-# Runs each configured scenario sequentially (default: mixed read/write, then write_only).
+# Runs each configured scenario sequentially (default: read_heavy = 90% read / 10% write).
 #
 # Usage:
 #   cp benchmark.conf.example benchmark.conf   # fill in credentials + failover settings
@@ -10,7 +10,8 @@
 # Optional:
 #   BENCHMARK_CONF=/path/to/benchmark.conf ./run_failover_benchmark.sh
 #   FAILOVER_EDITIONS="advanced" ./run_failover_benchmark.sh   # single edition
-#   FAILOVER_SCENARIOS="mixed" ./run_failover_benchmark.sh    # skip write_only scenario
+#   FAILOVER_SCENARIOS="read_heavy" ./run_failover_benchmark.sh  # 90% read / 10% write (default)
+#   FAILOVER_SCENARIOS="mixed write_only" ./run_failover_benchmark.sh
 #   FAILOVER_THREAD_MATRIX="4 8 16 32" ./run_failover_benchmark.sh  # thread sweep
 #   FAILOVER_TRIGGER_MATRIX="pod_delete set_as_primary" ./run_failover_benchmark.sh  # unplanned + planned
 #
@@ -20,8 +21,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG="${BENCHMARK_CONF:-${SCRIPT_DIR}/benchmark.conf}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-RESULTS_ROOT="${SCRIPT_DIR}/results/failover_${TIMESTAMP}"
-FULL_LOG="${RESULTS_ROOT}/full_run.log"
 
 export PATH="${SCRIPT_DIR}/sysbench-1.1/bin:${PATH}"
 
@@ -30,9 +29,23 @@ source "${SCRIPT_DIR}/lib/failover_common.sh"
 load_benchmark_config "${CONFIG}"
 failover_defaults
 
+if [[ -n "${FAILOVER_RESULTS_RESUME:-}" ]]; then
+  if [[ ! -d "${FAILOVER_RESULTS_RESUME}" ]]; then
+    echo "ERROR: FAILOVER_RESULTS_RESUME not found: ${FAILOVER_RESULTS_RESUME}" >&2
+    exit 1
+  fi
+  RESULTS_ROOT="${FAILOVER_RESULTS_RESUME}"
+  FULL_LOG="${RESULTS_ROOT}/full_run_resume_${TIMESTAMP}.log"
+else
+  RESULTS_ROOT="${SCRIPT_DIR}/results/failover_${TIMESTAMP}"
+  FULL_LOG="${RESULTS_ROOT}/full_run.log"
+fi
+
 mkdir -p "${RESULTS_ROOT}"
 {
   echo "FAILOVER_ITERATIONS=${FAILOVER_ITERATIONS:-1}"
+  echo "FAILOVER_ITERATION_START=${FAILOVER_ITERATION_START:-1}"
+  echo "FAILOVER_RESULTS_RESUME=${FAILOVER_RESULTS_RESUME:-}"
   echo "FAILOVER_ITERATION_DELAY_SEC=${FAILOVER_ITERATION_DELAY_SEC:-120}"
   echo "FAILOVER_TRIGGER_MATRIX=${FAILOVER_TRIGGER_MATRIX:-}"
   echo "FAILOVER_TRIGGER_MATRIX_DELAY_SEC=${FAILOVER_TRIGGER_MATRIX_DELAY_SEC:-180}"
@@ -61,7 +74,17 @@ echo "Timeline: warmup=${FAILOVER_WARMUP_SEC}s + baseline=${FAILOVER_BASELINE_SE
 echo "          trigger at second $(failover_trigger_second) | total=$(_per_scenario_runtime_sec)s per scenario"
 echo "Scenarios:${FAILOVER_SCENARIOS} (delay between=${FAILOVER_SCENARIO_DELAY_SEC}s)"
 if [[ "${FAILOVER_ITERATIONS:-1}" -gt 1 ]]; then
-  echo "Iterations:${FAILOVER_ITERATIONS} back-to-back (delay between=${FAILOVER_ITERATION_DELAY_SEC}s)"
+  if [[ "${FAILOVER_ITERATION_START:-1}" -gt 1 ]]; then
+    echo "Iterations:${FAILOVER_ITERATION_START}-${FAILOVER_ITERATIONS} (resume; delay between=${FAILOVER_ITERATION_DELAY_SEC}s)"
+  else
+    echo "Iterations:${FAILOVER_ITERATIONS} back-to-back (delay between=${FAILOVER_ITERATION_DELAY_SEC}s)"
+  fi
+fi
+if [[ -n "${FAILOVER_RESULTS_RESUME:-}" ]]; then
+  echo "Resume:   ${FAILOVER_RESULTS_RESUME} from iteration ${FAILOVER_ITERATION_START:-1}"
+fi
+if [[ "${FAILOVER_SECONDARY_WARMUP:-0}" == "1" ]]; then
+  echo "Secondary warm: enabled (port=${FAILOVER_SECONDARY_WARMUP_PORT:-3307} before_run=${FAILOVER_SECONDARY_WARMUP_BEFORE_RUN:-1}/${FAILOVER_SECONDARY_WARMUP_SEC:-300}s during_delay=${FAILOVER_SECONDARY_WARMUP_DURING_DELAY:-1})"
 fi
 verify_failover_tpcc_profiles || exit 1
 echo "Editions: ${FAILOVER_EDITIONS}"
@@ -271,6 +294,8 @@ run_failover_edition() {
       || { echo "Aborting ${edition}: HAProxy health check apply failed"; return 1; }
     # Always capture live CR value for report metadata (even when apply is disabled).
     capture_haproxy_health_metadata "${edition_dir}" || true
+    apply_mysql_probe_tuning "${edition_dir}" \
+      || { echo "Aborting ${edition}: MySQL probe tuning apply failed"; return 1; }
     echo ""
   fi
 
@@ -289,6 +314,7 @@ run_failover_edition() {
   local thread_index=0
   local trigger_index=0
   local iterations="${FAILOVER_ITERATIONS:-1}"
+  local iter_start="${FAILOVER_ITERATION_START:-1}"
   # Preserve conf default so matrix loops can restore after export overrides.
   local configured_advanced_trigger="${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}"
 
@@ -296,6 +322,35 @@ run_failover_edition() {
     echo "ERROR: FAILOVER_ITERATIONS must be an integer >= 1" >&2
     return 1
   fi
+  if ! [[ "${iter_start}" =~ ^[0-9]+$ ]] || (( iter_start < 1 )); then
+    echo "ERROR: FAILOVER_ITERATION_START must be an integer >= 1" >&2
+    return 1
+  fi
+  if (( iter_start > iterations )); then
+    echo "ERROR: FAILOVER_ITERATION_START (${iter_start}) > FAILOVER_ITERATIONS (${iterations})" >&2
+    return 1
+  fi
+
+  _warm_secondaries_or_sleep() {
+    local duration_sec="${1:?duration required}"
+    local label="${2:?label required}"
+    local log_dir="${3:?log dir required}"
+
+    if [[ "${FAILOVER_SECONDARY_WARMUP:-0}" == "1" ]] \
+      && [[ "${FAILOVER_SECONDARY_WARMUP_DURING_DELAY:-1}" == "1" ]] \
+      && (( duration_sec > 0 )); then
+      # Prefer warming over idle sleep; fall back to sleep if warmup fails.
+      if ! warm_secondaries_buffer_pool "${log_dir}" "${duration_sec}" "${label}"; then
+        echo "WARNING: secondary warmup failed; sleeping ${duration_sec}s instead"
+        sleep "${duration_sec}"
+      fi
+      return 0
+    fi
+    if (( duration_sec > 0 )); then
+      sleep "${duration_sec}"
+    fi
+    return 0
+  }
 
   _run_scenarios_for_base_dir() {
     local base_dir="${1:?base dir required}"
@@ -441,13 +496,36 @@ run_failover_edition() {
     return 0
   }
 
-  if (( iterations > 1 )); then
+  if [[ "${FAILOVER_SECONDARY_WARMUP:-0}" == "1" ]] \
+    && [[ "${FAILOVER_SECONDARY_WARMUP_BEFORE_RUN:-1}" == "1" ]] \
+    && (( iter_start == 1 )); then
+    echo ""
+    echo "======== Pre-run secondary buffer-pool warmup ========"
+    # Ensure cluster is healthy before pulling pages into secondaries.
+    if ! _run_iteration_gr_readiness_gate "${edition_dir}"; then
+      return 1
+    fi
+    if ! _run_iteration_replica_workers_gate "${edition_dir}"; then
+      return 1
+    fi
+    warm_secondaries_buffer_pool \
+      "${edition_dir}/secondary_warmup" \
+      "${FAILOVER_SECONDARY_WARMUP_SEC:-300}" \
+      "before_run" \
+      || echo "WARNING: pre-run secondary warmup failed; continuing"
+    echo ""
+  fi
+
+  if (( iterations > 1 )) || (( iter_start > 1 )); then
     local iter=0
-    for iter in $(seq 1 "${iterations}"); do
-      if (( iter > 1 )) && [[ "${FAILOVER_ITERATION_DELAY_SEC:-0}" -gt 0 ]]; then
+    for iter in $(seq "${iter_start}" "${iterations}"); do
+      if (( iter > iter_start )) && [[ "${FAILOVER_ITERATION_DELAY_SEC:-0}" -gt 0 ]]; then
         echo ""
-        echo "--- Waiting ${FAILOVER_ITERATION_DELAY_SEC}s before iteration ${iter}/${iterations} ---"
-        sleep "${FAILOVER_ITERATION_DELAY_SEC}"
+        echo "--- Iteration delay ${FAILOVER_ITERATION_DELAY_SEC}s before iteration ${iter}/${iterations} ---"
+        _warm_secondaries_or_sleep \
+          "${FAILOVER_ITERATION_DELAY_SEC}" \
+          "iter${iter}_delay" \
+          "${edition_dir}/secondary_warmup"
       fi
       echo ""
       echo "======== Failover iteration ${iter}/${iterations} ========"

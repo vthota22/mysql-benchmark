@@ -21,6 +21,10 @@ TPCC_TABLES=10
 TPCC_SCALE=100
 TPCC_FORCE_PK=1
 TPCC_TRX_LEVEL=RR
+# Optional: comma-separated warehouse IDs to skip during TPC-C *run* sampling
+# (incomplete holes). Clear / unset when the dataset is fully loaded.
+# Requires bootstrap/patch_tpcc_skip_warehouses.sh applied to tpcc_run.lua.
+# TPCC_SKIP_WAREHOUSE_IDS=977,978,979,980,988,1023,1271,1953,2210
 
 # --- Test matrix ---
 # Thread counts (space-separated)
@@ -100,8 +104,9 @@ FAILOVER_EDITIONS="standard advanced"
 # FAILOVER_COLLECT_K8S_EVENTS=1    # kubectl event snapshots (Advanced only)
 # FAILOVER_RUN_TPCC_CHECK=0        # 1 = TPC-C check after failover (sets data_loss in failover_kpi.csv)
 #
-# Dual TPC-C scenarios in one run (mixed read/write, then write-only new_order+payment):
-# FAILOVER_SCENARIOS="mixed write_only"   # default; use "mixed" to skip write_only
+# TPC-C scenarios (trx_profile mapping):
+# FAILOVER_SCENARIOS="read_heavy"           # default: 90% read / 10% write
+# FAILOVER_SCENARIOS="mixed write_only"     # classic TPC-C mix, then write-only
 # FAILOVER_SCENARIO_DELAY_SEC=120         # pause between scenarios (cooldown / cluster settle)
 # FAILOVER_THREAD_MATRIX="4 8 16 32"      # run failover at each thread count (results under edition/t<N>/)
 # FAILOVER_THREAD_DELAY_SEC=120             # pause between thread counts in a matrix run
@@ -109,8 +114,27 @@ FAILOVER_EDITIONS="standard advanced"
 # FAILOVER_TRIGGER_MATRIX="pod_delete set_as_primary"
 # FAILOVER_TRIGGER_MATRIX_DELAY_SEC=180     # settle between trigger methods (GR readiness also re-checked)
 # FAILOVER_ITERATIONS=1                     # repeat full scenario loop N times (results under edition/iter<N>/)
+# FAILOVER_ITERATION_START=1                # resume: first iteration number (use with FAILOVER_RESULTS_RESUME)
+# FAILOVER_RESULTS_RESUME=                  # resume into existing results/failover_* dir (combined report at end)
 # FAILOVER_ITERATION_DELAY_SEC=120          # soft cooldown between iters; readiness gate waits for full health
-# TPC-C trx_profile is passed to tpcc.lua: mixed = standard TPC-C mix; write_only = 50/50 new_order/payment
+# FAILOVER_GR_READINESS_TIMEOUT_SEC=1800    # increase for 5TB GR rejoin after pod delete (default 600)
+# Warm secondary InnoDB BPs via HAProxy replica/read port (read_only_fat = 100% SELECTs):
+# FAILOVER_SECONDARY_WARMUP=1               # 0=off; 1=warm secondaries before run + during iter delay
+# FAILOVER_SECONDARY_WARMUP_BEFORE_RUN=1    # once before first iteration
+# FAILOVER_SECONDARY_WARMUP_DURING_DELAY=1  # replace idle sleep with :3307 read load
+# FAILOVER_SECONDARY_WARMUP_PORT=3307       # HAProxy replica/read pool
+# FAILOVER_SECONDARY_WARMUP_HOST=           # default = ADVANCED_MYSQL_HOST / MYSQL_HOST
+# FAILOVER_SECONDARY_WARMUP_SEC=300         # pre-run warmup duration
+# FAILOVER_SECONDARY_WARMUP_THREADS=        # default = FAILOVER_THREADS
+# FAILOVER_SECONDARY_WARMUP_FAT_ROWS=       # default = TPCC_FAT_READ_ROWS
+# TPC-C trx_profile (tpcc.lua):
+#   read_heavy     — 90% orderstatus/stocklevel + 10% new_order/payment (tiny payloads)
+#   read_heavy_fat — 90% fat_stock_scan + 10% new_order/payment (tens of KB/trx; for ~20MB/s)
+#   read_only_fat  — 100% fat_stock_scan (secondary BP warmup on :3307)
+#   mixed          — standard TPC-C mix
+#   write_only     — 50/50 new_order/payment
+# TPCC_FAT_READ_ROWS=150              # rows per fat_stock_scan (~250-300 bytes/row on wire)
+# FAILOVER_SCENARIOS="read_heavy_fat" # use fat reads for network throughput targets
 #
 # Output layouts (any combination of the optional nest levels):
 #   results/failover_*/advanced/<scenario>/
@@ -118,8 +142,10 @@ FAILOVER_EDITIONS="standard advanced"
 #   results/failover_*/advanced/pod_delete/<scenario>/   # when FAILOVER_TRIGGER_MATRIX is set
 #   results/failover_*/advanced/iter<N>/set_as_primary/t<N>/<scenario>/
 # Combined HTML (thread toggle): results/failover_*/advanced/graphs/failover_report.html
-#   mixed/      — standard TPC-C transaction mix (reads + writes)
-#   write_only/ — 100% new_order/payment; writes_failed_during_failover KPI populated
+#   read_heavy/     — 90% read / 10% write (tiny orderstatus/stocklevel)
+#   read_heavy_fat/ — 90% fat stock range scans (large result sets)
+#   mixed/          — standard TPC-C transaction mix (reads + writes)
+#   write_only/     — 100% new_order/payment; writes_failed_during_failover KPI populated
 # Combined rollup: results/failover_*/failover_kpi.csv and failover_comparison.txt
 # Unplanned (pod_delete / mysqld_kill):
 #   failure_detection_sec   — trigger → first connect_ok=0 (within FAILOVER_DETECT_WINDOW_SEC)
@@ -140,7 +166,7 @@ FAILOVER_EDITIONS="standard advanced"
 #   peak_latency_failover_ms, transactions_failed_during_failover, data_loss
 #
 # Sysbench reconnect through GR/failover errors (keep full list):
-# FAILOVER_MYSQL_IGNORE_ERRORS=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011
+# FAILOVER_MYSQL_IGNORE_ERRORS=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011,4094
 #
 # Trigger control (same timeline either way):
 # FAILOVER_TRIGGER_ENABLED=1       # 0 = skip all failover actions
@@ -161,7 +187,7 @@ FAILOVER_EDITIONS="standard advanced"
 # TPCC_SCALE=10
 # FAILOVER_POD_DELETE=0              # step 1: control run (no pod delete)
 # FAILOVER_POD_DELETE=1              # step 2: real failover test
-# FAILOVER_MYSQL_IGNORE_ERRORS=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011
+# FAILOVER_MYSQL_IGNORE_ERRORS=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011,4094
 
 # --- Standard Edition failover trigger ---
 # Method: power_off | install_update | storage_resize | manual
@@ -221,12 +247,22 @@ ADVANCED_K8S_NAMESPACE=
 # ADVANCED_PSMYSQL_CR_NAME=benchmark-failover2
 
 # HAProxy backend health check (Advanced): maps to HA_SERVER_OPTIONS check inter N ms
-# Defaults match Percona Server MySQL operator (haproxy_add_mysql_nodes.sh): inter 10000ms, rise 1, fall 2
-# HAPROXY_HEALTH_CHECK_INTERVAL_SEC=10
+# Operator default is often inter 10000ms rise 1 fall 2; tighter failover-friendly example:
+# HAPROXY_HEALTH_CHECK_INTERVAL_SEC=2
 # HAPROXY_HEALTH_CHECK_RISE=1
-# HAPROXY_HEALTH_CHECK_FALL=2
+# HAPROXY_HEALTH_CHECK_FALL=1
 # HAPROXY_APPLY_BEFORE_FAILOVER=1
 # HAPROXY_APPLY_WAIT_SEC=90
+#
+# MySQL pod probes (one-time CR patch — persists until changed; relaxes GR RECOVERING kills):
+# MYSQL_PROBE_APPLY_BEFORE_FAILOVER=0       # 1 = patch CR when harness starts (usually run script once instead)
+# MYSQL_PROBE_APPLY_WAIT_SEC=120
+# MYSQL_LIVENESS_INITIAL_DELAY_SEC=60
+# MYSQL_LIVENESS_PERIOD_SEC=30
+# MYSQL_LIVENESS_FAILURE_THRESHOLD=40       # ~20 min tolerance after initial delay
+# MYSQL_READINESS_INITIAL_DELAY_SEC=60
+# MYSQL_READINESS_PERIOD_SEC=10
+# MYSQL_READINESS_FAILURE_THRESHOLD=60
 
 # PMM client integration (Advanced, once per cluster — skipped if spec.pmm.enabled=true)
 # PMM_APPLY_BEFORE_FAILOVER=0       # 1 = patch secrets + CR before first failover run

@@ -84,6 +84,20 @@ if [[ ! -f "${TPCC_DIR}/tpcc.lua" ]]; then
 fi
 
 echo ""
+echo "--- Patching sysbench-tpcc prepare retry ---"
+"${SCRIPT_DIR}/patch_tpcc_prepare_retry.sh" "${TPCC_DIR}"
+
+echo ""
+echo "--- Patching sysbench-tpcc failover restart (safe ROLLBACK) ---"
+"${SCRIPT_DIR}/patch_tpcc_failover_restart.sh" "${TPCC_DIR}"
+
+echo ""
+echo "--- Patching sysbench-tpcc skip-warehouse sampling ---"
+"${SCRIPT_DIR}/patch_tpcc_skip_warehouses.sh" "${TPCC_DIR}"
+"${SCRIPT_DIR}/patch_tpcc_read_heavy.sh" "${TPCC_DIR}"
+"${SCRIPT_DIR}/patch_tpcc_read_heavy_fat.sh" "${TPCC_DIR}"
+
+echo ""
 echo "--- Verification ---"
 export PATH="${PREFIX}/bin:${PATH}"
 sysbench --version

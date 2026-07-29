@@ -54,7 +54,8 @@ failover_defaults() {
   : "${FAILOVER_REPLICA_WORKERS_ABORT_ON_TIMEOUT:=1}"
   : "${FAILOVER_COLLECT_K8S_EVENTS:=1}"
   : "${FAILOVER_RUN_TPCC_CHECK:=0}"
-  : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011}"
+  # 4094: queries blocked while group_replication_set_as_primary() runs (planned timeout).
+  : "${FAILOVER_MYSQL_IGNORE_ERRORS:=1053,2013,1290,3100,1205,1213,2006,2014,2003,2055,1047,1158,1159,1161,3011,4094}"
   : "${FAILOVER_TRIGGER_ENABLED:=1}"
   : "${FAILOVER_ADVANCED_TRIGGER_METHOD:=pod_delete}"
   : "${FAILOVER_POD_DELETE:=${FAILOVER_TRIGGER_ENABLED}}"
@@ -73,7 +74,7 @@ failover_defaults() {
   : "${ADVANCED_K8S_MYSQL_CONTAINER:=mysql}"
   # Advanced: fetch kubeconfig early; re-resolve primary pod this many seconds before delete
   : "${FAILOVER_TRIGGER_PREPARE_SEC:=5}"
-  : "${FAILOVER_SCENARIOS:=mixed write_only}"
+  : "${FAILOVER_SCENARIOS:=read_heavy}"
   : "${FAILOVER_SCENARIO_DELAY_SEC:=120}"
   # Space-separated load thread counts; when set, runs each under edition/t<N>/<scenario>/
   : "${FAILOVER_THREAD_MATRIX:=}"
@@ -85,12 +86,37 @@ failover_defaults() {
   # Repeat full failover scenario loop N times (results under edition/iter<N>/); single combined report at end
   : "${FAILOVER_ITERATIONS:=1}"
   : "${FAILOVER_ITERATION_DELAY_SEC:=120}"
+  # Warm secondary buffer pools via HAProxy replica/read port (default :3307).
+  # Uses read_only_fat (100% SELECTs) so writes never hit the replica pool.
+  : "${FAILOVER_SECONDARY_WARMUP:=0}"
+  : "${FAILOVER_SECONDARY_WARMUP_BEFORE_RUN:=1}"
+  : "${FAILOVER_SECONDARY_WARMUP_DURING_DELAY:=1}"
+  : "${FAILOVER_SECONDARY_WARMUP_PORT:=3307}"
+  : "${FAILOVER_SECONDARY_WARMUP_HOST:=}"
+  : "${FAILOVER_SECONDARY_WARMUP_SEC:=300}"
+  : "${FAILOVER_SECONDARY_WARMUP_THREADS:=}"
+  : "${FAILOVER_SECONDARY_WARMUP_FAT_ROWS:=}"
   # Advanced HAProxy: check inter N ms (N = interval_sec * 1000); Percona operator script default inter 10000 rise 1 fall 2
   : "${HAPROXY_HEALTH_CHECK_INTERVAL_SEC:=10}"
   : "${HAPROXY_HEALTH_CHECK_RISE:=1}"
   : "${HAPROXY_HEALTH_CHECK_FALL:=2}"
   : "${HAPROXY_APPLY_BEFORE_FAILOVER:=1}"
   : "${HAPROXY_APPLY_WAIT_SEC:=90}"
+  # MySQL pod probes (Percona CR): relax liveness/readiness so GR RECOVERING is not killed.
+  # One-time CR patch; set MYSQL_PROBE_APPLY_BEFORE_FAILOVER=1 only when you want the harness to apply it.
+  : "${MYSQL_PROBE_APPLY_BEFORE_FAILOVER:=0}"
+  : "${MYSQL_PROBE_APPLY_WAIT_SEC:=120}"
+  : "${MYSQL_LIVENESS_INITIAL_DELAY_SEC:=60}"
+  : "${MYSQL_LIVENESS_PERIOD_SEC:=30}"
+  : "${MYSQL_LIVENESS_FAILURE_THRESHOLD:=40}"
+  : "${MYSQL_LIVENESS_TIMEOUT_SEC:=10}"
+  : "${MYSQL_READINESS_INITIAL_DELAY_SEC:=60}"
+  : "${MYSQL_READINESS_PERIOD_SEC:=10}"
+  : "${MYSQL_READINESS_FAILURE_THRESHOLD:=60}"
+  : "${MYSQL_READINESS_TIMEOUT_SEC:=10}"
+  # Resume a multi-iteration run into an existing results tree (combined report at end).
+  : "${FAILOVER_RESULTS_RESUME:=}"
+  : "${FAILOVER_ITERATION_START:=1}"
   : "${ADVANCED_PSMYSQL_CR_NAME:=}"
   # PMM client integration (Advanced): patch secrets + CR once per cluster (skipped if spec.pmm.enabled=true)
   : "${PMM_APPLY_BEFORE_FAILOVER:=0}"
@@ -102,9 +128,12 @@ failover_defaults() {
 }
 
 failover_scenario_trx_profile() {
-  case "${1:-mixed}" in
+  case "${1:-read_heavy}" in
     write_only) echo "write_only" ;;
-    mixed|*) echo "mixed" ;;
+    read_heavy) echo "read_heavy" ;;
+    read_heavy_fat) echo "read_heavy_fat" ;;
+    mixed) echo "mixed" ;;
+    *) echo "mixed" ;;
   esac
 }
 
@@ -218,7 +247,12 @@ write_failover_benchmark_config() {
     echo "FAILOVER_THREAD_MATRIX=${FAILOVER_THREAD_MATRIX:-}"
     echo "FAILOVER_TRIGGER_MATRIX=${FAILOVER_TRIGGER_MATRIX:-}"
     echo "FAILOVER_ADVANCED_TRIGGER_METHOD=${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}"
-    echo "FAILOVER_SCENARIOS=${FAILOVER_SCENARIOS:-mixed write_only}"
+    echo "FAILOVER_SCENARIOS=${FAILOVER_SCENARIOS:-read_heavy}"
+    echo "FAILOVER_SECONDARY_WARMUP=${FAILOVER_SECONDARY_WARMUP:-0}"
+    echo "FAILOVER_SECONDARY_WARMUP_PORT=${FAILOVER_SECONDARY_WARMUP_PORT:-3307}"
+    echo "FAILOVER_SECONDARY_WARMUP_SEC=${FAILOVER_SECONDARY_WARMUP_SEC:-300}"
+    echo "FAILOVER_SECONDARY_WARMUP_BEFORE_RUN=${FAILOVER_SECONDARY_WARMUP_BEFORE_RUN:-1}"
+    echo "FAILOVER_SECONDARY_WARMUP_DURING_DELAY=${FAILOVER_SECONDARY_WARMUP_DURING_DELAY:-1}"
   } > "${edition_dir}/benchmark_config.env"
 }
 
@@ -1645,6 +1679,134 @@ PY
   return 0
 }
 
+# Patch PerconaServerMySQL mysql liveness/readiness probes (tolerate long GR RECOVERING on rejoin).
+# Persists on the CR until changed — typically a one-time patch before a long iteration matrix.
+apply_mysql_probe_tuning() {
+  local edition_dir="${1:-}"
+
+  [[ "${MYSQL_PROBE_APPLY_BEFORE_FAILOVER:-0}" == "1" ]] || return 0
+
+  local ns="${ADVANCED_K8S_NAMESPACE:-}"
+  local cr="${ADVANCED_PSMYSQL_CR_NAME:-}"
+  local wait_sec="${MYSQL_PROBE_APPLY_WAIT_SEC:-120}"
+  local liv_initial="${MYSQL_LIVENESS_INITIAL_DELAY_SEC:-60}"
+  local liv_period="${MYSQL_LIVENESS_PERIOD_SEC:-30}"
+  local liv_fail="${MYSQL_LIVENESS_FAILURE_THRESHOLD:-40}"
+  local liv_timeout="${MYSQL_LIVENESS_TIMEOUT_SEC:-10}"
+  local rd_initial="${MYSQL_READINESS_INITIAL_DELAY_SEC:-60}"
+  local rd_period="${MYSQL_READINESS_PERIOD_SEC:-10}"
+  local rd_fail="${MYSQL_READINESS_FAILURE_THRESHOLD:-60}"
+  local rd_timeout="${MYSQL_READINESS_TIMEOUT_SEC:-10}"
+  local kubeconfig=""
+
+  if [[ -z "${cr}" || -z "${ns}" ]]; then
+    echo "MySQL probe tuning: skipped (set ADVANCED_PSMYSQL_CR_NAME and ADVANCED_K8S_NAMESPACE)" >&2
+    return 0
+  fi
+
+  if ! kubeconfig="$(_failover_resolve_kubeconfig "${edition_dir}")"; then
+    echo "MySQL probe tuning: skipped (no kubeconfig — set ADVANCED_KUBECONFIG_PATH on droplet)" >&2
+    return 0
+  fi
+
+  for var_name in liv_initial liv_period liv_fail liv_timeout rd_initial rd_period rd_fail rd_timeout; do
+    if ! [[ "${!var_name}" =~ ^[0-9]+$ ]] || (( ${!var_name} < 1 )); then
+      echo "ERROR: MySQL probe tuning: ${var_name}=${!var_name} must be a positive integer" >&2
+      return 1
+    fi
+  done
+
+  command -v kubectl >/dev/null 2>&1 || {
+    echo "ERROR: kubectl not found — cannot apply MySQL probe tuning" >&2
+    return 1
+  }
+
+  local -a kubectl=()
+  mapfile -t kubectl < <(_failover_kubectl_cmd "${kubeconfig}")
+
+  echo "--- MySQL probe tuning (CR ${cr}) ---"
+  echo "    liveness:  initial=${liv_initial}s period=${liv_period}s failure=${liv_fail} timeout=${liv_timeout}s"
+  echo "    readiness: initial=${rd_initial}s period=${rd_period}s failure=${rd_fail} timeout=${rd_timeout}s"
+  echo "    (~$(( liv_initial + liv_period * liv_fail ))s max liveness tolerance after start)"
+
+  if ! python3 - \
+      "${cr}" "${ns}" "${kubeconfig}" "${ADVANCED_K8S_CONTEXT:-}" \
+      "${liv_initial}" "${liv_period}" "${liv_fail}" "${liv_timeout}" \
+      "${rd_initial}" "${rd_period}" "${rd_fail}" "${rd_timeout}" <<'PY'
+import json
+import subprocess
+import sys
+
+(cr, ns, kubeconfig, context,
+ liv_initial, liv_period, liv_fail, liv_timeout,
+ rd_initial, rd_period, rd_fail, rd_timeout) = sys.argv[1:13]
+
+base = ["kubectl", f"--kubeconfig={kubeconfig}"]
+if context:
+    base.extend(["--context", context])
+
+get_cmd = base + ["get", "perconaservermysql", cr, "-n", ns, "-o", "json"]
+doc = json.loads(subprocess.check_output(get_cmd, text=True))
+mysql = doc.setdefault("spec", {}).setdefault("mysql", {})
+mysql["livenessProbe"] = {
+    "exec": {"command": ["/opt/percona/healthcheck", "liveness"]},
+    "initialDelaySeconds": int(liv_initial),
+    "periodSeconds": int(liv_period),
+    "failureThreshold": int(liv_fail),
+    "timeoutSeconds": int(liv_timeout),
+    "successThreshold": 1,
+}
+mysql["readinessProbe"] = {
+    "exec": {"command": ["/opt/percona/healthcheck", "readiness"]},
+    "initialDelaySeconds": int(rd_initial),
+    "periodSeconds": int(rd_period),
+    "failureThreshold": int(rd_fail),
+    "timeoutSeconds": int(rd_timeout),
+    "successThreshold": 1,
+}
+apply_cmd = base + ["apply", "-f", "-"]
+subprocess.run(apply_cmd, input=json.dumps(doc), check=True, text=True)
+PY
+  then
+    echo "ERROR: failed to patch PerconaServerMySQL ${cr} probe settings" >&2
+    return 1
+  fi
+
+  if [[ -n "${edition_dir}" ]]; then
+    mkdir -p "${edition_dir}"
+    {
+      echo "MYSQL_LIVENESS_INITIAL_DELAY_SEC=${liv_initial}"
+      echo "MYSQL_LIVENESS_PERIOD_SEC=${liv_period}"
+      echo "MYSQL_LIVENESS_FAILURE_THRESHOLD=${liv_fail}"
+      echo "MYSQL_LIVENESS_TIMEOUT_SEC=${liv_timeout}"
+      echo "MYSQL_READINESS_INITIAL_DELAY_SEC=${rd_initial}"
+      echo "MYSQL_READINESS_PERIOD_SEC=${rd_period}"
+      echo "MYSQL_READINESS_FAILURE_THRESHOLD=${rd_fail}"
+      echo "MYSQL_READINESS_TIMEOUT_SEC=${rd_timeout}"
+      echo "ADVANCED_PSMYSQL_CR_NAME=${cr}"
+      echo "ADVANCED_K8S_NAMESPACE=${ns}"
+      echo "MYSQL_PROBE_APPLY_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "${edition_dir}/mysql_probe_tuning.env"
+  fi
+
+  if (( wait_sec > 0 )); then
+    echo "Waiting up to ${wait_sec}s for mysql pods to reconcile probe changes..."
+    local deadline=$((SECONDS + wait_sec)) ready=""
+    while (( SECONDS < deadline )); do
+      ready="$("${kubectl[@]}" get "perconaservermysql" "${cr}" -n "${ns}" \
+        -o jsonpath='{.status.mysql.ready}/{.status.mysql.size}' 2>/dev/null || true)"
+      if [[ "${ready}" == "3/3" ]]; then
+        echo "MySQL CR status: ${ready} ready"
+        return 0
+      fi
+      sleep 5
+    done
+    echo "WARNING: mysql not 3/3 ready after ${wait_sec}s (status=${ready:-unknown}) — continuing" >&2
+  fi
+
+  return 0
+}
+
 _failover_kubectl_resource_exists() {
   local kubeconfig="${1:?kubeconfig required}"
   local resource="${2:?resource required}"
@@ -2239,6 +2401,8 @@ run_tpcc_failover_load() {
   export TPCC_TIME="${sysbench_time}"
   export TPCC_WARMUP="${FAILOVER_WARMUP_SEC}"
   export TPCC_REPORT_INTERVAL="${FAILOVER_REPORT_INTERVAL}"
+  # Optional: exclude incomplete warehouse IDs from run sampling (see patch_tpcc_skip_warehouses.sh).
+  export TPCC_SKIP_WAREHOUSE_IDS="${TPCC_SKIP_WAREHOUSE_IDS:-}"
 
   echo "SYSBENCH_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${results_dir}/sysbench_timing.txt"
   echo "FAILOVER_EDITION=${FAILOVER_EDITION:-advanced}" >> "${results_dir}/sysbench_timing.txt"
@@ -2261,6 +2425,7 @@ run_tpcc_failover_load() {
   echo "TPCC_SCALE=${TPCC_SCALE:-100}" >> "${results_dir}/sysbench_timing.txt"
   echo "TPCC_TABLES=${TPCC_TABLES:-10}" >> "${results_dir}/sysbench_timing.txt"
   echo "TPCC_THREADS=${FAILOVER_THREADS}" >> "${results_dir}/sysbench_timing.txt"
+  echo "TPCC_SKIP_WAREHOUSE_IDS=${TPCC_SKIP_WAREHOUSE_IDS:-}" >> "${results_dir}/sysbench_timing.txt"
   echo "PREP_THREADS=${PREP_THREADS:-16}" >> "${results_dir}/sysbench_timing.txt"
   _append_mysql_runtime_to_timing "${results_dir}"
 
@@ -2287,6 +2452,10 @@ run_tpcc_failover_load() {
     echo "NOTE: omitting --trx_profile (not in tpcc.lua); using default TPC-C mixed workload"
   fi
 
+  if [[ "${trx_profile}" == "read_heavy_fat" ]]; then
+    opts+=(--fat_read_rows="${TPCC_FAT_READ_ROWS:-150}")
+  fi
+
   opts+=(
     --mysql-ignore-errors="${ignore_errors}"
     --db-ps-mode=disable
@@ -2295,7 +2464,7 @@ run_tpcc_failover_load() {
     --report-interval="${FAILOVER_REPORT_INTERVAL}"
   )
 
-  echo "Sysbench failover opts: scenario=${scenario} trx_profile=${trx_profile} mysql-ignore-errors=${ignore_errors} db-ps-mode=disable"
+  echo "Sysbench failover opts: scenario=${scenario} trx_profile=${trx_profile} fat_read_rows=${TPCC_FAT_READ_ROWS:-} mysql-ignore-errors=${ignore_errors} db-ps-mode=disable skip_warehouses=${TPCC_SKIP_WAREHOUSE_IDS:-}"
 
   # Foreground load job (not a wrapper subshell) so $! is the sysbench driver process.
   export SYSBENCH_LINE_BUFFER=1
@@ -2327,6 +2496,103 @@ stop_sysbench_load() {
     rm -f "${pid_file}"
   fi
   echo "SYSBENCH_END_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${results_dir}/sysbench_timing.txt"
+}
+
+failover_secondary_warmup_enabled() {
+  failover_defaults
+  [[ "${FAILOVER_SECONDARY_WARMUP}" == "1" ]]
+}
+
+# Pull pages into secondary buffer pools via HAProxy replica/read port.
+# Blocking: runs read_only_fat sysbench for duration_sec, then restores MYSQL_*.
+warm_secondaries_buffer_pool() {
+  local log_dir="${1:?log dir required}"
+  local duration_sec="${2:?duration required}"
+  local label="${3:-secondary_warmup}"
+
+  failover_defaults
+
+  if ! failover_secondary_warmup_enabled; then
+    return 0
+  fi
+  if ! [[ "${duration_sec}" =~ ^[0-9]+$ ]] || (( duration_sec < 1 )); then
+    echo "NOTE: skipping secondary warmup (${label}): duration=${duration_sec}"
+    return 0
+  fi
+
+  local tpcc host port threads fat_rows tables scale ignore_errors
+  local saved_host saved_port log_file rc
+  tpcc="$(tpcc_dir)"
+  host="${FAILOVER_SECONDARY_WARMUP_HOST:-${MYSQL_HOST}}"
+  port="${FAILOVER_SECONDARY_WARMUP_PORT:-3307}"
+  threads="${FAILOVER_SECONDARY_WARMUP_THREADS:-${FAILOVER_THREADS:-16}}"
+  fat_rows="${FAILOVER_SECONDARY_WARMUP_FAT_ROWS:-${TPCC_FAT_READ_ROWS:-150}}"
+  tables="${TPCC_TABLES:-10}"
+  scale="${TPCC_SCALE:-100}"
+  ignore_errors="${FAILOVER_MYSQL_IGNORE_ERRORS}"
+
+  if ! tpcc_supports_trx_profile "${tpcc}"; then
+    echo "ERROR: secondary warmup needs --trx_profile support in ${tpcc}" >&2
+    return 1
+  fi
+
+  mkdir -p "${log_dir}"
+  log_file="${log_dir}/${label}.log"
+  {
+    echo "SECONDARY_WARMUP_LABEL=${label}"
+    echo "SECONDARY_WARMUP_HOST=${host}"
+    echo "SECONDARY_WARMUP_PORT=${port}"
+    echo "SECONDARY_WARMUP_SEC=${duration_sec}"
+    echo "SECONDARY_WARMUP_THREADS=${threads}"
+    echo "SECONDARY_WARMUP_FAT_ROWS=${fat_rows}"
+    echo "SECONDARY_WARMUP_TRX_PROFILE=read_only_fat"
+    echo "SECONDARY_WARMUP_START_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "${log_dir}/${label}.env"
+
+  echo "--- Secondary BP warmup (${label}): ${host}:${port} threads=${threads} fat_rows=${fat_rows} time=${duration_sec}s (read_only_fat) ---"
+
+  saved_host="${MYSQL_HOST}"
+  saved_port="${MYSQL_PORT}"
+  export MYSQL_HOST="${host}"
+  export MYSQL_PORT="${port}"
+  # Rebuild connection opts for the replica port.
+  build_mysql_base_opts
+
+  rc=0
+  export SYSBENCH_LINE_BUFFER=1
+  if ! run_sysbench_tpcc "${tpcc}" \
+    "${MYSQL_BASE_OPTS[@]}" \
+    "${MYSQL_SSL_OPTS[@]}" \
+    --tables="${tables}" \
+    --scale="${scale}" \
+    --threads="${threads}" \
+    --trx_level="${TPCC_TRX_LEVEL:-RR}" \
+    --force_pk="${TPCC_FORCE_PK:-1}" \
+    --trx_profile=read_only_fat \
+    --fat_read_rows="${fat_rows}" \
+    --mysql-ignore-errors="${ignore_errors}" \
+    --db-ps-mode=disable \
+    --time="${duration_sec}" \
+    --warmup-time=0 \
+    --report-interval="${FAILOVER_REPORT_INTERVAL:-1}" \
+    run > >(_failover_tee_linebuffer "${log_file}") 2>&1; then
+    rc=$?
+  fi
+  unset SYSBENCH_LINE_BUFFER
+
+  export MYSQL_HOST="${saved_host}"
+  export MYSQL_PORT="${saved_port}"
+  build_mysql_base_opts
+
+  echo "SECONDARY_WARMUP_END_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${log_dir}/${label}.env"
+  echo "SECONDARY_WARMUP_EXIT=${rc}" >> "${log_dir}/${label}.env"
+
+  if (( rc != 0 )); then
+    echo "WARNING: secondary warmup (${label}) exited rc=${rc}; see ${log_file}" >&2
+    return "${rc}"
+  fi
+  echo "Secondary BP warmup (${label}) complete"
+  return 0
 }
 
 wait_for_sysbench_start() {

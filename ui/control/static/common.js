@@ -128,8 +128,13 @@ const DropletContext = {
     this.mapEmpty = !!data.map_empty;
     this.mapHint = data.map_hint || "";
 
-    // Locked Active droplet = first entry in the feature map (ignore saved host).
-    this.setHost(this.defaultHost, { persist: persistHost, notify });
+    // Prefer current/saved host when it is still in this feature's map; else default.
+    const saved = localStorage.getItem(ACTIVE_DROPLET_KEY) || "";
+    const preferred =
+      (this.host && this.findDroplet(this.host)?.host) ||
+      (saved && this.findDroplet(saved)?.host) ||
+      this.defaultHost;
+    this.setHost(preferred, { persist: persistHost, notify });
     return this;
   },
 
@@ -188,18 +193,21 @@ const DropletContext = {
 
   renderPicker(selectEl, wrapEl) {
     if (!selectEl) return;
-    selectEl.disabled = true;
     if (!(this.droplets || []).length) {
+      selectEl.disabled = true;
       selectEl.innerHTML = `<option value="">No droplets for this feature</option>`;
       if (wrapEl) wrapEl.hidden = false;
       return;
     }
-    // Show only the locked default (first map entry) as a read-only field.
-    const active = this.findDroplet(this.defaultHost) || this.droplets[0];
+    // Full map in the picker; enable when more than one droplet is configured.
+    selectEl.innerHTML = this.droplets
+      .map((d) => `<option value="${d.host}">${this.dropletLabel(d)}</option>`)
+      .join("");
+    const active = this.findDroplet(this.host) || this.findDroplet(this.defaultHost) || this.droplets[0];
     this.host = active.host;
     this.name = active.name;
-    selectEl.innerHTML = `<option value="${active.host}">${this.dropletLabel(active)}</option>`;
     selectEl.value = active.host;
+    selectEl.disabled = this.droplets.length <= 1;
     if (wrapEl) wrapEl.hidden = false;
   },
 };

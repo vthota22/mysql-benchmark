@@ -459,6 +459,7 @@ def load_scenario_bundle(scenario_dir: Path) -> dict:
     recovery = float(parsed.get("RECOVERY_THRESHOLD", str(baseline * 0.9 if baseline else 0)))
     outage_start, outage_end = _derive_outage_bounds(rows, trigger_log, baseline)
     cluster_data = build_cluster_monitor_chart_data(scenario_dir, trigger_wall)
+    mode_info = _failover_mode_info(event, scenario_dir)
     return {
         "dir": str(scenario_dir),
         "edition": edition,
@@ -487,6 +488,11 @@ def load_scenario_bundle(scenario_dir: Path) -> dict:
             "reconn": [r["reconn_per_sec"] for r in rows],
             "lat_p95": [r["lat_p95_ms"] for r in rows],
             "trigger_sec": trigger_log,
+            "trigger_label": (
+                "planned failover"
+                if mode_info.get("mode") == "planned"
+                else "failover trigger"
+            ),
             "baseline_tps": baseline,
             "recovery_threshold": recovery,
             "outage_start": outage_start,
@@ -4007,6 +4013,7 @@ def generate_html_report(
     outage_start, outage_end = _derive_outage_bounds(rows, trigger_log, baseline_tps)
 
     elapsed = [r["elapsed_sec"] for r in rows]
+    mode_info = _failover_mode_info(event, edition_dir)
     chart_data = {
         "elapsed": elapsed,
         "tps": [r["tps"] for r in rows],
@@ -4015,6 +4022,11 @@ def generate_html_report(
         "reconn": [r["reconn_per_sec"] for r in rows],
         "lat_p95": [r["lat_p95_ms"] for r in rows],
         "trigger_sec": trigger_log,
+        "trigger_label": (
+            "planned failover"
+            if mode_info.get("mode") == "planned"
+            else "failover trigger"
+        ),
         "baseline_tps": baseline_tps,
         "recovery_threshold": recovery,
         "outage_start": outage_start,
@@ -4232,18 +4244,26 @@ def generate_html_report(
     Chart.defaults.color = "#94a3b8";
     Chart.defaults.borderColor = "#334155";
 
+    function xySeries(xs, ys) {{
+      return (xs || []).map((x, i) => ({{ x: x, y: ys[i] }}));
+    }}
+
     function triggerAnnotations() {{
+      const label = DATA.trigger_label || "failover trigger";
       return {{
         annotation: {{
           annotations: {{
             trigger: {{
               type: "line", xMin: DATA.trigger_sec, xMax: DATA.trigger_sec,
               borderColor: "#f87171", borderWidth: 2, borderDash: [6, 4],
-              label: {{ display: true, content: "failover trigger", color: "#fca5a5", backgroundColor: "rgba(30,41,59,0.8)" }}
-            }},
-            outage: {{
-              type: "box", xMin: DATA.outage_start, xMax: DATA.outage_end,
-              backgroundColor: "rgba(248,113,113,0.08)", borderWidth: 0,
+              label: {{
+                display: true,
+                content: label,
+                position: "start",
+                color: "#fecaca",
+                backgroundColor: "rgba(127,29,29,0.92)",
+                font: {{ weight: "600" }}
+              }}
             }}
           }}
         }}
@@ -4252,7 +4272,7 @@ def generate_html_report(
 
     function baseScales(yTitle) {{
       return {{
-        x: {{ title: {{ display: true, text: "Elapsed time (s from sysbench start)" }} }},
+        x: {{ type: "linear", title: {{ display: true, text: "Elapsed time (s from sysbench start)" }} }},
         y: {{ title: {{ display: true, text: yTitle }}, beginAtZero: true }}
       }};
     }}
@@ -4261,17 +4281,16 @@ def generate_html_report(
     new Chart(document.getElementById("tpsQpsChart"), {{
       type: "line",
       data: {{
-        labels: DATA.elapsed,
         datasets: [
-          {{ label: "TPS", data: DATA.tps, borderColor: "#60a5fa", backgroundColor: "rgba(96,165,250,0.1)", borderWidth: 1.5, pointRadius: 0, yAxisID: "y" }},
-          {{ label: "QPS", data: DATA.qps, borderColor: "#34d399", backgroundColor: "rgba(52,211,153,0.08)", borderWidth: 1.2, pointRadius: 0, yAxisID: "y1" }},
+          {{ label: "TPS", data: xySeries(DATA.elapsed, DATA.tps), borderColor: "#60a5fa", backgroundColor: "rgba(96,165,250,0.1)", borderWidth: 1.5, pointRadius: 0, yAxisID: "y" }},
+          {{ label: "QPS", data: xySeries(DATA.elapsed, DATA.qps), borderColor: "#34d399", backgroundColor: "rgba(52,211,153,0.08)", borderWidth: 1.2, pointRadius: 0, yAxisID: "y1" }},
         ]
       }},
       options: {{
         responsive: true, maintainAspectRatio: false, interaction: {{ mode: "index", intersect: false }},
         plugins: Object.assign({{}}, triggerAnnotations(), chartZoomPlugin()),
         scales: {{
-          x: {{ title: {{ display: true, text: "Elapsed time (s)" }} }},
+          x: {{ type: "linear", title: {{ display: true, text: "Elapsed time (s)" }} }},
           y: {{ type: "linear", position: "left", title: {{ display: true, text: "TPS" }}, beginAtZero: true }},
           y1: {{ type: "linear", position: "right", title: {{ display: true, text: "QPS" }}, beginAtZero: true, grid: {{ drawOnChartArea: false }} }}
         }}
@@ -4281,10 +4300,9 @@ def generate_html_report(
     new Chart(document.getElementById("errorsChart"), {{
       type: "line",
       data: {{
-        labels: DATA.elapsed,
         datasets: [
-          {{ label: "errors/s", data: DATA.err, borderColor: "#f87171", borderWidth: 1.5, pointRadius: 0 }},
-          {{ label: "reconnects/s", data: DATA.reconn, borderColor: "#c084fc", borderWidth: 1.2, pointRadius: 0 }},
+          {{ label: "errors/s", data: xySeries(DATA.elapsed, DATA.err), borderColor: "#f87171", borderWidth: 1.5, pointRadius: 0 }},
+          {{ label: "reconnects/s", data: xySeries(DATA.elapsed, DATA.reconn), borderColor: "#c084fc", borderWidth: 1.2, pointRadius: 0 }},
         ]
       }},
       options: {{
@@ -4296,9 +4314,8 @@ def generate_html_report(
     new Chart(document.getElementById("latencyChart"), {{
       type: "line",
       data: {{
-        labels: DATA.elapsed,
         datasets: [
-          {{ label: "p95 latency (ms)", data: DATA.lat_p95, borderColor: "#2dd4bf", borderWidth: 1.5, pointRadius: 0 }},
+          {{ label: "p95 latency (ms)", data: xySeries(DATA.elapsed, DATA.lat_p95), borderColor: "#2dd4bf", borderWidth: 1.5, pointRadius: 0 }},
         ]
       }},
       options: {{
@@ -4578,18 +4595,26 @@ def generate_combined_sweep_html_report(
       charts = {{}};
     }}
 
+    function xySeries(xs, ys) {{
+      return (xs || []).map((x, i) => ({{ x: x, y: ys[i] }}));
+    }}
+
     function triggerAnnotations(DATA) {{
+      const label = (DATA && DATA.trigger_label) || "failover trigger";
       return {{
         annotation: {{
           annotations: {{
             trigger: {{
               type: "line", xMin: DATA.trigger_sec, xMax: DATA.trigger_sec,
               borderColor: "#f87171", borderWidth: 2, borderDash: [6, 4],
-              label: {{ display: true, content: "failover trigger", color: "#fca5a5", backgroundColor: "rgba(30,41,59,0.8)" }}
-            }},
-            outage: {{
-              type: "box", xMin: DATA.outage_start, xMax: DATA.outage_end,
-              backgroundColor: "rgba(248,113,113,0.08)", borderWidth: 0,
+              label: {{
+                display: true,
+                content: label,
+                position: "start",
+                color: "#fecaca",
+                backgroundColor: "rgba(127,29,29,0.92)",
+                font: {{ weight: "600" }}
+              }}
             }}
           }}
         }}
@@ -4598,7 +4623,7 @@ def generate_combined_sweep_html_report(
 
     function baseScales(yTitle) {{
       return {{
-        x: {{ title: {{ display: true, text: "Elapsed time (s from sysbench start)" }} }},
+        x: {{ type: "linear", title: {{ display: true, text: "Elapsed time (s from sysbench start)" }} }},
         y: {{ title: {{ display: true, text: yTitle }}, beginAtZero: true }}
       }};
     }}
@@ -4617,17 +4642,16 @@ def generate_combined_sweep_html_report(
       charts.tps = new Chart(document.getElementById("tpsQps_" + panelId), {{
         type: "line",
         data: {{
-          labels: DATA.elapsed,
           datasets: [
-            {{ label: "TPS", data: DATA.tps, borderColor: "#60a5fa", borderWidth: 1.5, pointRadius: 0, yAxisID: "y" }},
-            {{ label: "QPS", data: DATA.qps, borderColor: "#34d399", borderWidth: 1.2, pointRadius: 0, yAxisID: "y1" }},
+            {{ label: "TPS", data: xySeries(DATA.elapsed, DATA.tps), borderColor: "#60a5fa", borderWidth: 1.5, pointRadius: 0, yAxisID: "y" }},
+            {{ label: "QPS", data: xySeries(DATA.elapsed, DATA.qps), borderColor: "#34d399", borderWidth: 1.2, pointRadius: 0, yAxisID: "y1" }},
           ]
         }},
         options: {{
           responsive: true, maintainAspectRatio: false, interaction: {{ mode: "index", intersect: false }},
           plugins: Object.assign({{}}, triggerAnnotations(DATA), chartZoomPlugin()),
           scales: {{
-            x: {{ title: {{ display: true, text: "Elapsed time (s)" }} }},
+            x: {{ type: "linear", title: {{ display: true, text: "Elapsed time (s)" }} }},
             y: {{ type: "linear", position: "left", title: {{ display: true, text: "TPS" }}, beginAtZero: true }},
             y1: {{ type: "linear", position: "right", title: {{ display: true, text: "QPS" }}, beginAtZero: true, grid: {{ drawOnChartArea: false }} }}
           }}
@@ -4636,10 +4660,9 @@ def generate_combined_sweep_html_report(
       charts.err = new Chart(document.getElementById("errors_" + panelId), {{
         type: "line",
         data: {{
-          labels: DATA.elapsed,
           datasets: [
-            {{ label: "errors/s", data: DATA.err, borderColor: "#f87171", borderWidth: 1.5, pointRadius: 0 }},
-            {{ label: "reconnects/s", data: DATA.reconn, borderColor: "#c084fc", borderWidth: 1.2, pointRadius: 0 }},
+            {{ label: "errors/s", data: xySeries(DATA.elapsed, DATA.err), borderColor: "#f87171", borderWidth: 1.5, pointRadius: 0 }},
+            {{ label: "reconnects/s", data: xySeries(DATA.elapsed, DATA.reconn), borderColor: "#c084fc", borderWidth: 1.2, pointRadius: 0 }},
           ]
         }},
         options: {{
@@ -4650,9 +4673,8 @@ def generate_combined_sweep_html_report(
       charts.lat = new Chart(document.getElementById("latency_" + panelId), {{
         type: "line",
         data: {{
-          labels: DATA.elapsed,
           datasets: [
-            {{ label: "p95 latency (ms)", data: DATA.lat_p95, borderColor: "#2dd4bf", borderWidth: 1.5, pointRadius: 0 }},
+            {{ label: "p95 latency (ms)", data: xySeries(DATA.elapsed, DATA.lat_p95), borderColor: "#2dd4bf", borderWidth: 1.5, pointRadius: 0 }},
           ]
         }},
         options: {{

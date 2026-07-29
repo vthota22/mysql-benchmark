@@ -61,11 +61,12 @@ tpcc_dir() {
   echo "${TPCC_DIR:-${BENCH_ROOT}/TPCC/sysbench-tpcc}"
 }
 
-# True when tpcc_common.lua defines --trx_profile (mixed / write_only transaction mix).
+# True when tpcc_common.lua defines --trx_profile (mixed / write_only / read_heavy).
+# Prefer grepping Lua over `sysbench help` so PATH/SYSBENCH_BIN glitches cannot false-negative mid-run.
 tpcc_supports_trx_profile() {
   local tpcc="${1:-$(tpcc_dir)}"
-  [[ -f "${tpcc}/tpcc.lua" ]] || return 1
-  (cd "${tpcc}" && "${SYSBENCH_BIN}" tpcc.lua help 2>&1) | grep -q -- '--trx_profile'
+  [[ -f "${tpcc}/tpcc_common.lua" ]] || return 1
+  grep -qE '^\s*trx_profile\s*=' "${tpcc}/tpcc_common.lua"
 }
 
 run_tpcc_command() {

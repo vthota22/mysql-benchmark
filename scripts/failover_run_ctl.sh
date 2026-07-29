@@ -138,12 +138,15 @@ _cmd_status() {
   if [[ -n "${results_dir}" ]]; then
     log_path="${results_dir}/full_run.log"
     # Prefer type-specific combined reports (trigger × scenario); fall back to legacy mega-combined.
+    # Empty find/grep must not abort under `set -o pipefail` (no reports yet while run is in progress).
     report_path="$(
-      find "${REPO_ROOT}/${results_dir}/advanced" -path '*/graphs/failover_report.html' 2>/dev/null \
-        | grep -Ev '/iter[0-9]+/|/t[0-9]+/' \
-        | sort \
-        | head -1 \
-        | sed "s|^${REPO_ROOT}/||"
+      {
+        find "${REPO_ROOT}/${results_dir}/advanced" -path '*/graphs/failover_report.html' 2>/dev/null \
+          | grep -Ev '/iter[0-9]+/|/t[0-9]+/' \
+          | sort \
+          | head -1 \
+          | sed "s|^${REPO_ROOT}/||"
+      } || true
     )"
     if [[ -z "${report_path}" ]]; then
       report_path="${results_dir}/advanced/graphs/failover_report.html"
