@@ -107,7 +107,7 @@ for each sidecar.
 
 | Variable | Default | Description |
 |---|---|---|
-| `KUBECONFIG` | `/root/.kube/config_4_16` | Path to admin kubeconfig |
+| `KUBECONFIG` | `/root/.kube/config` | Path to admin kubeconfig |
 | `POD_PREFIX` | `mysql` | Pod name prefix (e.g. `<cluster-name>-mysql`) |
 | `EDITION` | `advanced` | Which cluster edition to use |
 | `K8S_NAMESPACE` | `percona` | Kubernetes namespace |
@@ -188,12 +188,85 @@ Output:
 | Sidecar Memory — slow-log-tailer | Should stay well under 32 Mi limit |
 | All Sidecar Memory Combined | Total non-mysql memory pressure per pod |
 
+## 7. OOM Reproduction Tests
+
+To reproduce slow-log-tailer OOM kills (for verification or operator
+testing), use the targeted OOM scripts:
+
+### Multi-line OOM test (recommended)
+
+```bash
+ssh root@<droplet>
+
+POD=<cluster-name>-mysql-0 \
+KUBECONFIG=/root/.kube/config_cluster \
+  bash scripts/oom_multiline_test.sh [num_queries] [target_mb]
+```
+
+- `num_queries`: number of large INSERT queries to fire (default 1000)
+- `target_mb`: size per INSERT in MiB (default 35 — exceeds 32 MiB limit)
+
+The script creates a test table, generates multi-line INSERTs, monitors
+the tailer's cgroup memory and restart count, and reports OOM if detected.
+
+### Single INSERT OOM test
+
+```bash
+POD=<cluster-name>-mysql-0 \
+KUBECONFIG=/root/.kube/config_cluster \
+  bash scripts/oom_slowlog_test.sh
+```
+
+Fires a single ~25 MiB INSERT and monitors tailer memory.
+
+## 8. mysqld-exporter Pressure Test
+
+Tests whether the `mysqld-exporter` sidecar can be pushed to OOM under
+extreme concurrent connection load:
+
+```bash
+POD=<cluster-name>-mysql-0 \
+KUBECONFIG=/root/.kube/config_cluster \
+EDITION=advanced \
+  bash scripts/exporter_pressure_test.sh
+```
+
+Phases: baseline → 100/300/500 connections with 10KB queries → 200
+connections with 50KB queries → TPC-C load with rapid scrapes.
+
+Output: `logs/exporter_pressure/memory_samples.csv` and experiment log.
+
+**Prerequisite:** `pip3 install mysql-connector-python` on the droplet.
+
+## 9. Slow-Log-Tailer Pressure Test
+
+Long-running test with bulk INSERTs and OLTP load, measuring
+slow-log-tailer cgroup memory growth over time:
+
+```bash
+KUBECONFIG=/root/.kube/config_cluster \
+POD_PREFIX=<cluster-name>-mysql \
+EDITION=advanced \
+  nohup bash scripts/run_slowlog_pressure.sh \
+  > logs/slowlog_pressure/full.log 2>&1 &
+```
+
+Phases: baseline → TPC-C prepare (bulk writes with `long_query_time=0.1s`)
+→ OLTP load (200 TPS).
+
+Output: memory CSV, slowlog size CSV, proc snapshots, experiment log.
+
 ## Scripts Reference
 
-| Script | Description |
-|---|---|
-| `scripts/sample_sidecar_memory.sh` | Cgroup memory sampler (start/stop/status/set-phase) |
-| `scripts/run_sidecar_experiment.sh` | Full experiment orchestrator |
-| `scripts/build_sidecar_report.py` | Parse memory CSV → text + HTML report |
-| `scripts/k8s_pod_exporter.py` | Pod + sidecar metrics exporter for PMM |
-| `scripts/pmm_create_dashboard.py` | Creates/updates PMM Grafana dashboard |
+| Script | Where to run | Description |
+|---|---|---|
+| `scripts/sample_sidecar_memory.sh` | Droplet | Cgroup memory sampler (start/stop/status/set-phase) |
+| `scripts/run_sidecar_experiment.sh` | Droplet | Full experiment orchestrator |
+| `scripts/run_slowlog_pressure.sh` | Droplet | Slow-log-tailer targeted pressure test |
+| `scripts/oom_slowlog_test.sh` | Droplet | OOM reproduction: single massive INSERT |
+| `scripts/oom_multiline_test.sh` | Droplet | OOM reproduction: multi-line queries |
+| `scripts/exporter_pressure_test.sh` | Droplet | mysqld-exporter memory stress test |
+| `scripts/build_sidecar_report.py` | Droplet or local | Parse memory CSV → text + HTML report |
+| `scripts/k8s_pod_exporter.py` | Droplet | Pod + sidecar metrics exporter for PMM |
+| `scripts/start_pod_monitor.sh` | Droplet | Launches pod exporter + vmagent → PMM |
+| `scripts/pmm_create_dashboard.py` | Local or droplet | Creates/updates PMM Grafana dashboard |

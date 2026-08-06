@@ -1,31 +1,30 @@
-results
-reports
-TPCC/sysbench-tpcc/
-src/sysbench/
-ci-artifacts
-ci/benchmark-target.conf
-control.local.conf
+# Local credentials — never commit
 benchmark.conf
-benchmark.conf.sanitized
-sysbench-1.1/bin/sysbench
+control.local.conf
 
-# Legacy root UI copy (canonical package is ui/)
-/control/
+# TLS material
+ssl-certs/*.pem
 
-# App Platform UI — track sources; ignore local secrets/cache
-ui/control.local.conf
-ui/control/.report_cache/
-
-# Python / OS junk
-**/__pycache__/
-*.py[cod]
-.DS_Store
-.matplotlib_cache/
-.write-test
-foo
-
-# Local secrets / one-off artifacts (never commit)
+# Kubeconfigs are cluster credentials — never commit
+kubeconfig
 kubeconfig-*
-*.pem
-Failover report*.html
-install_sysbench_11.log
+*.kubeconfig
+
+# Results / logs
+results/
+logs/
+
+# SSH keys — never commit
+ankit-dbaas-benchmarking
+ankit-dbaas-benchmarking.pub
+
+# Python cruft
+__pycache__/
+*.pyc
+.venv/
+
+# Generated dashboards
+*_pmm_dashboard.html
+
+# OS cruft
+.DS_Store

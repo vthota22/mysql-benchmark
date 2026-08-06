@@ -22,7 +22,7 @@ PHASE_ORDER = [
     "load_300tps",
 ]
 
-SIDECAR_CONTAINERS = ["mysqld-exporter", "slow-log-tailer", "do-agent", "mysql"]
+SIDECAR_CONTAINERS = ["mysqld-exporter", "slow-log-tailer", "do-agent", "xtrabackup", "mysql"]
 
 
 def mi(b: int) -> str:
@@ -74,6 +74,7 @@ LIMITS = {
     "mysqld-exporter": 256 * 1024 * 1024,
     "slow-log-tailer": 32 * 1024 * 1024,
     "do-agent": 192 * 1024 * 1024,
+    "xtrabackup": 256 * 1024 * 1024,
     "mysql": 13926 * 1024 * 1024,
 }
 

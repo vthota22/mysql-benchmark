@@ -1,0 +1,122 @@
+[2026-08-05T16:54:32Z] ==========================================
+[2026-08-05T16:54:32Z] SIDECAR MEMORY PROFILING EXPERIMENT v2
+[2026-08-05T16:54:32Z]   cluster  : compare-am-gp-n3-4-16-i-adv-4hiew.db1.ondigitalocean.com
+[2026-08-05T16:54:32Z]   edition  : advanced
+[2026-08-05T16:54:32Z]   sampler  : /root/mysql-benchmark/scripts/sample_sidecar_memory.sh
+[2026-08-05T16:54:32Z] ==========================================
+[2026-08-05T16:54:32Z] PHASE 0: Cleanup old data + Prepare (scale=100, tables=1, 1 thread)
+[2026-08-05T16:54:32Z] PHASE -> prepare
+[2026-08-05T16:54:32Z] Cleaning up old tables...
+sysbench 1.1.0-3ceba0b (using system LuaJIT 2.1.1703358377)
+
+Dropping tables '1'...
+[2026-08-05T16:54:43Z] Starting TPC-C prepare (scale=100, tables=1, 1 thread — expect ~45 min)...
+[2026-08-05T16:54:43Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_prepare_start.txt
+[2026-08-05T17:27:19Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_prepare_end.txt
+[2026-08-05T17:27:19Z] TPC-C prepare completed successfully.
+[2026-08-05T17:27:20Z] Verification: stock1 row count = 10000000 (expected ~10000000)
+[2026-08-05T17:27:20Z] Lowering long_query_time to 0.1s (was 2s) to stress slow-log-tailer...
+[2026-08-05T17:27:21Z] long_query_time set to 0.1s
+[2026-08-05T17:27:21Z] Starting memory sampler...
+[2026-08-05T17:27:21Z] PHASE 1: Baseline (5 min, no load)
+[2026-08-05T17:27:21Z] PHASE -> baseline
+[2026-08-05T17:27:21Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_baseline_start.txt
+[2026-08-05T17:32:21Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_baseline_end.txt
+[2026-08-05T17:32:21Z] Baseline complete.
+[2026-08-05T17:32:21Z] PHASE 2: OLTP load ramp-up (30 min per level)
+[2026-08-05T17:32:21Z] PHASE -> load_50tps
+[2026-08-05T17:32:21Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_load_50tps_start.txt
+[2026-08-05T17:32:21Z] Triggering on-demand backup 'sidecar-exp-load_50tps-173221' during phase load_50tps...
+The PerconaServerMySQLBackup "sidecar-exp-load_50tps-173221" is invalid: metadata.name: Invalid value: "sidecar-exp-load_50tps-173221": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')
+[2026-08-05T17:32:21Z] Backup CR 'sidecar-exp-load_50tps-173221' submitted
+[2026-08-05T17:32:21Z] Starting TPC-C run: rate=50 threads=8 duration=1800s
+[2026-08-05T18:02:52Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_load_50tps_end.txt
+[2026-08-05T18:02:52Z] TPC-C run finished for phase load_50tps (log: /root/mysql-benchmark/logs/sidecar_load_load_50tps.log)
+[2026-08-05T18:02:52Z] Cooldown 2 min...
+[2026-08-05T18:02:52Z] PHASE -> cooldown_50_100
+[2026-08-05T18:04:52Z] PHASE -> load_100tps
+[2026-08-05T18:04:52Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_load_100tps_start.txt
+[2026-08-05T18:04:52Z] Triggering on-demand backup 'sidecar-exp-load_100tps-180452' during phase load_100tps...
+The PerconaServerMySQLBackup "sidecar-exp-load_100tps-180452" is invalid: metadata.name: Invalid value: "sidecar-exp-load_100tps-180452": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')
+[2026-08-05T18:04:52Z] Backup CR 'sidecar-exp-load_100tps-180452' submitted
+[2026-08-05T18:04:52Z] Starting TPC-C run: rate=100 threads=16 duration=1800s
+[2026-08-05T18:35:23Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_load_100tps_end.txt
+[2026-08-05T18:35:23Z] TPC-C run finished for phase load_100tps (log: /root/mysql-benchmark/logs/sidecar_load_load_100tps.log)
+[2026-08-05T18:35:23Z] Cooldown 2 min...
+[2026-08-05T18:35:23Z] PHASE -> cooldown_100_200
+[2026-08-05T18:37:23Z] PHASE -> load_200tps
+[2026-08-05T18:37:23Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_load_200tps_start.txt
+[2026-08-05T18:37:23Z] Triggering on-demand backup 'sidecar-exp-load_200tps-183723' during phase load_200tps...
+The PerconaServerMySQLBackup "sidecar-exp-load_200tps-183723" is invalid: metadata.name: Invalid value: "sidecar-exp-load_200tps-183723": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')
+[2026-08-05T18:37:23Z] Backup CR 'sidecar-exp-load_200tps-183723' submitted
+[2026-08-05T18:37:23Z] Starting TPC-C run: rate=200 threads=32 duration=1800s
+[2026-08-05T19:07:54Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_load_200tps_end.txt
+[2026-08-05T19:07:54Z] TPC-C run finished for phase load_200tps (log: /root/mysql-benchmark/logs/sidecar_load_load_200tps.log)
+[2026-08-05T19:07:54Z] PHASE -> load_50tps
+[2026-08-05T19:07:55Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_load_50tps_start.txt
+[2026-08-05T19:07:55Z] Triggering on-demand backup 'sidecar-exp-load_50tps-190755' during phase load_50tps...
+The PerconaServerMySQLBackup "sidecar-exp-load_50tps-190755" is invalid: metadata.name: Invalid value: "sidecar-exp-load_50tps-190755": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')
+[2026-08-05T19:07:55Z] Backup CR 'sidecar-exp-load_50tps-190755' submitted
+[2026-08-05T19:07:55Z] Starting TPC-C run: rate=50 threads=8 duration=1800s
+[2026-08-05T19:38:25Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_load_50tps_end.txt
+[2026-08-05T19:38:25Z] TPC-C run finished for phase load_50tps (log: /root/mysql-benchmark/logs/sidecar_load_load_50tps.log)
+[2026-08-05T19:38:25Z] Cooldown 2 min...
+[2026-08-05T19:38:25Z] PHASE -> cooldown_50_100
+[2026-08-05T19:40:25Z] PHASE -> load_100tps
+[2026-08-05T19:40:25Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_load_100tps_start.txt
+[2026-08-05T19:40:25Z] Triggering on-demand backup 'sidecar-exp-load_100tps-194025' during phase load_100tps...
+The PerconaServerMySQLBackup "sidecar-exp-load_100tps-194025" is invalid: metadata.name: Invalid value: "sidecar-exp-load_100tps-194025": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')
+[2026-08-05T19:40:25Z] Backup CR 'sidecar-exp-load_100tps-194025' submitted
+[2026-08-05T19:40:25Z] Starting TPC-C run: rate=100 threads=16 duration=1800s
+[2026-08-05T20:10:56Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_load_100tps_end.txt
+[2026-08-05T20:10:56Z] TPC-C run finished for phase load_100tps (log: /root/mysql-benchmark/logs/sidecar_load_load_100tps.log)
+[2026-08-05T20:10:56Z] Cooldown 2 min...
+[2026-08-05T20:10:56Z] PHASE -> cooldown_100_200
+[2026-08-05T20:12:56Z] PHASE -> load_200tps
+[2026-08-05T20:12:56Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_load_200tps_start.txt
+[2026-08-05T20:12:56Z] Triggering on-demand backup 'sidecar-exp-load_200tps-201256' during phase load_200tps...
+The PerconaServerMySQLBackup "sidecar-exp-load_200tps-201256" is invalid: metadata.name: Invalid value: "sidecar-exp-load_200tps-201256": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')
+[2026-08-05T20:12:56Z] Backup CR 'sidecar-exp-load_200tps-201256' submitted
+[2026-08-05T20:12:56Z] Starting TPC-C run: rate=200 threads=32 duration=1800s
+[2026-08-05T20:43:28Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_load_200tps_end.txt
+[2026-08-05T20:43:28Z] TPC-C run finished for phase load_200tps (log: /root/mysql-benchmark/logs/sidecar_load_load_200tps.log)
+[2026-08-05T20:43:28Z] Cooldown 2 min...
+[2026-08-05T20:43:28Z] PHASE -> cooldown_200_300
+[2026-08-05T20:45:28Z] PHASE -> load_300tps
+[2026-08-05T20:45:28Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_load_300tps_start.txt
+[2026-08-05T20:45:28Z] Triggering on-demand backup 'sidecar-exp-load_300tps-204528' during phase load_300tps...
+The PerconaServerMySQLBackup "sidecar-exp-load_300tps-204528" is invalid: metadata.name: Invalid value: "sidecar-exp-load_300tps-204528": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character (e.g. 'example.com', regex used for validation is '[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*')
+[2026-08-05T20:45:28Z] Backup CR 'sidecar-exp-load_300tps-204528' submitted
+[2026-08-05T20:45:28Z] Starting TPC-C run: rate=300 threads=64 duration=1800s
+[2026-08-05T21:16:00Z] MySQL status snapshot -> /root/mysql-benchmark/logs/mysql_status_load_300tps_end.txt
+[2026-08-05T21:16:00Z] TPC-C run finished for phase load_300tps (log: /root/mysql-benchmark/logs/sidecar_load_load_300tps.log)
+[2026-08-05T21:16:00Z] PHASE -> done
+[2026-08-05T21:16:00Z] All load phases complete.
+[2026-08-05T21:16:00Z] Restoring long_query_time to 2s...
+[2026-08-05T21:16:01Z] long_query_time restored.
+[2026-08-05T21:16:01Z] Stopping memory sampler...
+[2026-08-05T21:16:01Z] Generating sidecar memory report...
+Container            |          Peak baseline |           Peak prepare |        Peak load_50tps |       Peak load_100tps |       Peak load_200tps |       Peak load_300tps
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+mysqld-exporter      |           15.6 Mi (6%) |                 N/A Mi |           16.1 Mi (6%) |           16.1 Mi (6%) |           16.2 Mi (6%) |           16.2 Mi (6%)
+slow-log-tailer      |           6.8 Mi (21%) |                 N/A Mi |           6.9 Mi (22%) |           6.7 Mi (21%) |           7.4 Mi (23%) |           6.5 Mi (20%)
+do-agent             |                 N/A Mi |                 N/A Mi |                 N/A Mi |                 N/A Mi |                 N/A Mi |                 N/A Mi
+xtrabackup           |           24.0 Mi (9%) |                 N/A Mi |        496.5 Mi (194%) |        505.8 Mi (198%) |        996.0 Mi (389%) |       1613.7 Mi (630%)
+mysql                |       12845.4 Mi (92%) |                 N/A Mi |       12853.2 Mi (92%) |       12863.2 Mi (92%) |       12856.6 Mi (92%) |       12782.2 Mi (92%)
+
+Limits: mysqld-exporter=256Mi, slow-log-tailer=32Mi, do-agent=192Mi, mysql=13926Mi
+
+  mysqld-exporter: peak 16.2 Mi / 256.0 Mi limit = 6.3% [OK]
+  slow-log-tailer: peak 7.4 Mi / 32.0 Mi limit = 23.2% [OK]
+  xtrabackup: peak 1613.7 Mi / 256.0 Mi limit = 630.3% [CRITICAL]
+  mysql: peak 12863.2 Mi / 13926.0 Mi limit = 92.4% [WARNING]
+
+HTML report: /root/mysql-benchmark/logs/sidecar_report.html
+[2026-08-05T21:16:01Z] ==========================================
+[2026-08-05T21:16:01Z] EXPERIMENT COMPLETE
+[2026-08-05T21:16:01Z]   Memory CSV     : /root/mysql-benchmark/logs/sidecar_memory.csv
+[2026-08-05T21:16:01Z]   HTML report    : /root/mysql-benchmark/logs/sidecar_report.html
+[2026-08-05T21:16:01Z]   Experiment log : /root/mysql-benchmark/logs/sidecar_experiment.log
+[2026-08-05T21:16:01Z]   Load logs      : /root/mysql-benchmark/logs/sidecar_load_*.log
+[2026-08-05T21:16:01Z]   MySQL snapshots: /root/mysql-benchmark/logs/mysql_status_*.txt
+[2026-08-05T21:16:01Z] ==========================================

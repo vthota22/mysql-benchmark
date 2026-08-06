@@ -1,0 +1,85 @@
+[2026-08-05T21:16:09Z] ==========================================
+[2026-08-05T21:16:09Z] SIDECAR MEMORY PROFILING EXPERIMENT v2
+[2026-08-05T21:16:09Z]   cluster  : compare-am-gp-n3-4-16-i-adv-4hiew.db1.ondigitalocean.com
+[2026-08-05T21:16:09Z]   edition  : advanced
+[2026-08-05T21:16:09Z]   sampler  : /root/mysql-benchmark/scripts/sample_sidecar_memory.sh
+[2026-08-05T21:16:09Z] ==========================================
+[2026-08-05T21:16:09Z] SKIP_PREPARE=1 — skipping cleanup and prepare, reusing existing data
+[2026-08-05T21:16:11Z] Verification: stock1 row count = 10000000 (expected ~10000000)
+[2026-08-05T21:16:11Z] Lowering long_query_time to 0.1s (was 2s) to stress slow-log-tailer...
+[2026-08-05T21:16:11Z] long_query_time set to 0.1s
+[2026-08-05T21:16:11Z] Starting memory sampler...
+[2026-08-05T21:16:11Z] PHASE 1: Baseline (5 min, no load)
+[2026-08-05T21:16:11Z] PHASE -> baseline
+[2026-08-05T21:16:11Z] MySQL status snapshot -> /root/mysql-benchmark/logs/run2/mysql_status_baseline_start.txt
+[2026-08-05T21:21:11Z] MySQL status snapshot -> /root/mysql-benchmark/logs/run2/mysql_status_baseline_end.txt
+[2026-08-05T21:21:11Z] Baseline complete.
+[2026-08-05T21:21:11Z] PHASE 2: OLTP load ramp-up (30 min per level)
+[2026-08-05T21:21:11Z] PHASE -> load_50tps
+[2026-08-05T21:21:11Z] MySQL status snapshot -> /root/mysql-benchmark/logs/run2/mysql_status_load_50tps_start.txt
+[2026-08-05T21:21:11Z] Triggering on-demand backup 'sidecar-exp-load-50tps-212111' during phase load-50tps...
+perconaservermysqlbackup.ps.percona.com/sidecar-exp-load-50tps-212111 created
+[2026-08-05T21:21:11Z] Backup CR 'sidecar-exp-load-50tps-212111' submitted
+[2026-08-05T21:21:11Z] Starting TPC-C run: rate=50 threads=8 duration=1800s
+[2026-08-05T21:51:42Z] MySQL status snapshot -> /root/mysql-benchmark/logs/run2/mysql_status_load_50tps_end.txt
+[2026-08-05T21:51:42Z] TPC-C run finished for phase load_50tps (log: /root/mysql-benchmark/logs/run2/sidecar_load_load_50tps.log)
+[2026-08-05T21:51:42Z] Cooldown 2 min...
+[2026-08-05T21:51:42Z] PHASE -> cooldown_50_100
+[2026-08-05T21:53:42Z] PHASE -> load_100tps
+[2026-08-05T21:53:42Z] MySQL status snapshot -> /root/mysql-benchmark/logs/run2/mysql_status_load_100tps_start.txt
+[2026-08-05T21:53:42Z] Triggering on-demand backup 'sidecar-exp-load-100tps-215342' during phase load-100tps...
+perconaservermysqlbackup.ps.percona.com/sidecar-exp-load-100tps-215342 created
+[2026-08-05T21:53:42Z] Backup CR 'sidecar-exp-load-100tps-215342' submitted
+[2026-08-05T21:53:42Z] Starting TPC-C run: rate=100 threads=16 duration=1800s
+[2026-08-05T22:24:13Z] MySQL status snapshot -> /root/mysql-benchmark/logs/run2/mysql_status_load_100tps_end.txt
+[2026-08-05T22:24:13Z] TPC-C run finished for phase load_100tps (log: /root/mysql-benchmark/logs/run2/sidecar_load_load_100tps.log)
+[2026-08-05T22:24:13Z] Cooldown 2 min...
+[2026-08-05T22:24:13Z] PHASE -> cooldown_100_200
+[2026-08-05T22:26:13Z] PHASE -> load_200tps
+[2026-08-05T22:26:13Z] MySQL status snapshot -> /root/mysql-benchmark/logs/run2/mysql_status_load_200tps_start.txt
+[2026-08-05T22:26:13Z] Triggering on-demand backup 'sidecar-exp-load-200tps-222613' during phase load-200tps...
+perconaservermysqlbackup.ps.percona.com/sidecar-exp-load-200tps-222613 created
+[2026-08-05T22:26:13Z] Backup CR 'sidecar-exp-load-200tps-222613' submitted
+[2026-08-05T22:26:13Z] Starting TPC-C run: rate=200 threads=32 duration=1800s
+[2026-08-05T22:56:44Z] MySQL status snapshot -> /root/mysql-benchmark/logs/run2/mysql_status_load_200tps_end.txt
+[2026-08-05T22:56:44Z] TPC-C run finished for phase load_200tps (log: /root/mysql-benchmark/logs/run2/sidecar_load_load_200tps.log)
+[2026-08-05T22:56:44Z] Cooldown 2 min...
+[2026-08-05T22:56:44Z] PHASE -> cooldown_200_300
+[2026-08-05T22:58:44Z] PHASE -> load_300tps
+[2026-08-05T22:58:45Z] MySQL status snapshot -> /root/mysql-benchmark/logs/run2/mysql_status_load_300tps_start.txt
+[2026-08-05T22:58:45Z] Triggering on-demand backup 'sidecar-exp-load-300tps-225845' during phase load-300tps...
+perconaservermysqlbackup.ps.percona.com/sidecar-exp-load-300tps-225845 created
+[2026-08-05T22:58:45Z] Backup CR 'sidecar-exp-load-300tps-225845' submitted
+[2026-08-05T22:58:45Z] Starting TPC-C run: rate=300 threads=64 duration=1800s
+[2026-08-05T23:29:17Z] MySQL status snapshot -> /root/mysql-benchmark/logs/run2/mysql_status_load_300tps_end.txt
+[2026-08-05T23:29:17Z] TPC-C run finished for phase load_300tps (log: /root/mysql-benchmark/logs/run2/sidecar_load_load_300tps.log)
+[2026-08-05T23:29:17Z] PHASE -> done
+[2026-08-05T23:29:17Z] All load phases complete.
+[2026-08-05T23:29:17Z] Restoring long_query_time to 2s...
+[2026-08-05T23:29:17Z] long_query_time restored.
+[2026-08-05T23:29:17Z] Stopping memory sampler...
+[2026-08-05T23:29:17Z] Generating sidecar memory report...
+Container            |          Peak baseline |           Peak prepare |        Peak load_50tps |       Peak load_100tps |       Peak load_200tps |       Peak load_300tps
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+mysqld-exporter      |           15.9 Mi (6%) |                 N/A Mi |           16.5 Mi (6%) |           16.2 Mi (6%) |           16.2 Mi (6%) |           16.1 Mi (6%)
+slow-log-tailer      |           6.6 Mi (21%) |                 N/A Mi |           7.1 Mi (22%) |           6.8 Mi (21%) |           6.9 Mi (22%) |          10.6 Mi (33%)
+do-agent             |                 N/A Mi |                 N/A Mi |                 N/A Mi |                 N/A Mi |                 N/A Mi |                 N/A Mi
+xtrabackup           |       1056.2 Mi (413%) |                 N/A Mi |       1931.6 Mi (755%) |       1334.0 Mi (521%) |        791.1 Mi (309%) |       1177.7 Mi (460%)
+mysql                |       12767.9 Mi (92%) |                 N/A Mi |       12765.9 Mi (92%) |       12769.6 Mi (92%) |       12765.1 Mi (92%) |       12760.7 Mi (92%)
+
+Limits: mysqld-exporter=256Mi, slow-log-tailer=32Mi, do-agent=192Mi, mysql=13926Mi
+
+  mysqld-exporter: peak 16.5 Mi / 256.0 Mi limit = 6.5% [OK]
+  slow-log-tailer: peak 10.6 Mi / 32.0 Mi limit = 33.1% [OK]
+  xtrabackup: peak 1931.6 Mi / 256.0 Mi limit = 754.6% [CRITICAL]
+  mysql: peak 12769.6 Mi / 13926.0 Mi limit = 91.7% [WARNING]
+
+HTML report: /root/mysql-benchmark/logs/run2/sidecar_report.html
+[2026-08-05T23:29:17Z] ==========================================
+[2026-08-05T23:29:17Z] EXPERIMENT COMPLETE
+[2026-08-05T23:29:17Z]   Memory CSV     : /root/mysql-benchmark/logs/run2/sidecar_memory.csv
+[2026-08-05T23:29:17Z]   HTML report    : /root/mysql-benchmark/logs/run2/sidecar_report.html
+[2026-08-05T23:29:17Z]   Experiment log : /root/mysql-benchmark/logs/run2/sidecar_experiment.log
+[2026-08-05T23:29:17Z]   Load logs      : /root/mysql-benchmark/logs/run2/sidecar_load_*.log
+[2026-08-05T23:29:17Z]   MySQL snapshots: /root/mysql-benchmark/logs/run2/mysql_status_*.txt
+[2026-08-05T23:29:17Z] ==========================================

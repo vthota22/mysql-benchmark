@@ -105,10 +105,15 @@ run_tpcc_command() {
       local time_sec="${TPCC_TIME:?TPCC_TIME required for run}"
       local warmup="${TPCC_WARMUP:-60}"
       local report_interval="${TPCC_REPORT_INTERVAL:-10}"
+      # Optional open-loop rate cap (transactions/sec). 0/empty = unlimited.
+      local rate="${TPCC_RATE:-0}"
+      local rate_opt=()
+      [[ -n "${rate}" && "${rate}" != "0" ]] && rate_opt=(--rate="${rate}")
       run_sysbench_tpcc "${tpcc}" "${opts[@]}" \
         --time="${time_sec}" \
         --warmup-time="${warmup}" \
         --report-interval="${report_interval}" \
+        ${rate_opt[@]+"${rate_opt[@]}"} \
         run
       ;;
     *)

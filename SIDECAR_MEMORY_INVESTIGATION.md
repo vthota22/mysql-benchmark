@@ -183,6 +183,90 @@ Panels added under **"Sidecar Container Memory"** row:
 - MySQL container memory (per pod)
 - All sidecars combined (per pod)
 
+## Deep-Dive: slow-log-tailer OOM
+
+The `slow-log-tailer` is an inline shell script (busybox ash) embedded in the
+pod spec. It tails `/var/lib/mysql/slow.log` and groups multi-line entries
+before printing them to stdout (for Fluent Bit / logging).
+
+### Mechanism
+
+The tailer buffers multi-line slow-log entries using string concatenation:
+
+```
+entry="${entry}\n${line}"
+```
+
+For a slow query that produces a multi-line log entry (e.g. a large
+multi-line INSERT), the `entry` variable grows with each line. In busybox
+ash, this is O(N^2) because each concatenation copies the entire string.
+
+### Reproduction
+
+We reproduced an OOM kill by generating a single 34 MiB multi-line INSERT
+(28,000 lines). The tailer's cgroup memory hit the 32 MiB limit and
+Kubernetes OOM-killed the container (exit code 137). It restarted within
+seconds and resumed normal operation.
+
+**Impact:** Minimal. The pod stays running. Slow-log entries buffered in
+the killed process are lost, but the tailer reconnects to the slow.log on
+restart. No effect on MySQL or GR stability.
+
+### Recommendations
+
+- **Increase limit to 64 MiB** — simple and safe, but wastes memory for
+  normal operations.
+- **Cap entry size in the operator** — modify the Percona Operator's Go code
+  to limit the `entry` variable to ~8 MiB. Entries beyond that are truncated
+  with a marker. This prevents OOM without wasting resources.
+
+## Deep-Dive: mysqld-exporter
+
+The `mysqld-exporter` is a Go binary (`prom/mysqld-exporter`) that exposes
+MySQL metrics at `:9104/metrics` for Prometheus scraping. It runs with
+`--collect.info_schema.processlist` among other collectors.
+
+### Stress Test
+
+We ran a pressure test (`exporter_pressure_test.sh`) with escalating phases:
+
+| Phase | Connections | Query Size | Total in processlist |
+|---|---|---|---|
+| Baseline | idle | — | — |
+| 100 conn x 10KB | 100 | 10 KB | 1 MB |
+| 300 conn x 10KB | 300 | 10 KB | 3 MB |
+| 500 conn x 10KB | 500 | 10 KB | 5 MB |
+| 200 conn x 50KB | 200 | 50 KB | 10 MB |
+| TPC-C (200 TPS) | 32 | mixed | mixed |
+
+### Result
+
+| Metric | Value |
+|---|---|
+| VmHWM (peak RSS) | 20.4 MiB — **constant across all phases** |
+| cgroup memory | 25–26 MiB |
+| Current limit | 256 MiB |
+| Utilization | 8% of limit |
+
+The exporter's Go runtime efficiently streams MySQL data and releases memory
+via GC. The disabled collectors (`global_status`, `global_variables`) keep
+the baseline low.
+
+### Recommendation
+
+Reduce `mysqld-exporter` limits from 256 MiB → **64 MiB** (limit) and
+128 MiB → **32 MiB** (request). This saves 192 MiB per pod.
+
+## Final Recommendations Summary
+
+| Container | Current Request | Current Limit | Proposed Request | Proposed Limit | Rationale |
+|---|---|---|---|---|---|
+| pmm-client (mysql pod) | 0 | none | 300 Mi | 512 Mi | Invisible to scheduler; 257 Mi at idle |
+| pmm-client (haproxy pod) | 0 | none | 150 Mi | 256 Mi | 113 Mi at idle |
+| xtrabackup | 0 | none | 64 Mi | 256 Mi | Invisible; grows during backup |
+| mysqld-exporter | 128 Mi | 256 Mi | 32 Mi | 64 Mi | Peak 20.4 Mi even under extreme load |
+| slow-log-tailer | 10 Mi | 32 Mi | 10 Mi | 64 Mi | Can OOM on 34 MiB+ multi-line entries |
+
 ## Scripts Created
 
 | Script | Purpose |
@@ -190,3 +274,10 @@ Panels added under **"Sidecar Container Memory"** row:
 | `scripts/sample_sidecar_memory.sh` | Cgroup memory sampler via kubectl exec (start/stop/status) |
 | `scripts/run_sidecar_experiment.sh` | Orchestrator: baseline → prepare → load ramp (50/100/200/300 TPS) |
 | `scripts/build_sidecar_report.py` | Parse CSV, generate text + HTML summary |
+| `scripts/run_slowlog_pressure.sh` | Slow-log-tailer targeted pressure test |
+| `scripts/oom_slowlog_test.sh` | OOM reproduction: single massive INSERT |
+| `scripts/oom_multiline_test.sh` | OOM reproduction: multi-line queries (confirmed OOM) |
+| `scripts/exporter_pressure_test.sh` | mysqld-exporter memory stress test |
+| `scripts/k8s_pod_exporter.py` | Prometheus exporter for pod/sidecar metrics |
+| `scripts/start_pod_monitor.sh` | Launcher for pod exporter + vmagent → PMM |
+| `scripts/pmm_create_dashboard.py` | Creates PMM Grafana dashboard with sidecar memory panels |

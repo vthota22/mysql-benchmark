@@ -18,14 +18,15 @@
 set -uo pipefail
 
 ROOT="${ROOT:-/root/mysql-benchmark}"
-KUBECONFIG="${KUBECONFIG:-/root/.kube/config_4_16}"
+KUBECONFIG="${KUBECONFIG:-/root/.kube/config}"
 NS="${K8S_NAMESPACE:-percona}"
 INTERVAL="${SAMPLE_INTERVAL:-30}"
+LOG_BASE="$(dirname "${CSV_FILE:-${ROOT}/logs/sidecar_memory.csv}")"
 CSV_FILE="${CSV_FILE:-${ROOT}/logs/sidecar_memory.csv}"
-PIDFILE="${ROOT}/logs/sidecar_sampler.pid"
-PHASE_FILE="${ROOT}/logs/sidecar_sampler_phase.txt"
+PIDFILE="${LOG_BASE}/sidecar_sampler.pid"
+PHASE_FILE="${LOG_BASE}/sidecar_sampler_phase.txt"
 
-CONTAINERS=(mysql mysqld-exporter slow-log-tailer do-agent)
+CONTAINERS=(mysql mysqld-exporter slow-log-tailer do-agent xtrabackup)
 POD_PREFIX="${POD_PREFIX:-mysql}"
 PODS=("${POD_PREFIX}-0" "${POD_PREFIX}-1" "${POD_PREFIX}-2")
 
