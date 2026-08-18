@@ -3994,6 +3994,264 @@ code { font-size: 0.88em; }
 """
 
 
+def _parse_probe_ts(raw: str) -> datetime | None:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def load_write_probe(run_dir: Path) -> dict[str, Any] | None:
+    probe_dir = run_dir / "write_probe"
+    attempts_path = probe_dir / "test_writes_attempts.csv"
+    if not attempts_path.is_file():
+        return None
+
+    attempts: list[dict[str, str]] = []
+    with attempts_path.open(encoding="utf-8", newline="") as f:
+        attempts = list(csv.DictReader(f))
+    if not attempts:
+        return None
+
+    committed_path = probe_dir / "test_writes.csv"
+    committed: list[dict[str, str]] = []
+    if committed_path.is_file():
+        with committed_path.open(encoding="utf-8", newline="") as f:
+            committed = list(csv.DictReader(f))
+    committed_seqs = {int(r["seq"]) for r in committed if r.get("seq")}
+
+    summary: dict[str, Any] = {}
+    summary_path = probe_dir / "test_writes_summary.json"
+    if summary_path.is_file():
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            summary = {}
+
+    return {
+        "attempts": attempts,
+        "committed": committed,
+        "committed_seqs": committed_seqs,
+        "summary": summary,
+    }
+
+
+def build_write_probe_figure(
+    probe: dict[str, Any],
+    timing: ScaleTiming,
+    k8s_rows: list[K8sPodRow],
+    run_dir: Path,
+) -> go.Figure | None:
+    attempts: list[dict[str, str]] = probe["attempts"]
+    committed_seqs: set[int] = probe["committed_seqs"]
+    committed: list[dict[str, str]] = probe["committed"]
+
+    ok_t: list[str] = []
+    ok_ms: list[float] = []
+    fail_t: list[str] = []
+    fail_ms: list[float] = []
+    fail_text: list[str] = []
+    server_t: list[str] = []
+    server_ms: list[float] = []
+
+    for row in attempts:
+        sent = _parse_probe_ts(row.get("sent_at_utc", ""))
+        if sent is None:
+            continue
+        ts = sent.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        try:
+            seq = int(row.get("seq", ""))
+            lat = float(row.get("latency_ms") or 0)
+        except ValueError:
+            continue
+        status = (row.get("status") or "").strip()
+        errno = (row.get("errno") or "").strip()
+        in_table = seq in committed_seqs
+        if status == "ok" and in_table:
+            ok_t.append(ts)
+            ok_ms.append(lat)
+        else:
+            fail_t.append(ts)
+            fail_ms.append(lat if lat > 0 else 0.0)
+            label = "ack missing" if status == "ok" and not in_table else status
+            if errno:
+                label = f"{label} {errno}"
+            fail_text.append(f"seq={seq} {label}")
+
+    for row in committed:
+        sent = _parse_probe_ts(row.get("sent_at", ""))
+        if sent is None:
+            continue
+        raw = (row.get("commit_delay_us") or "").strip()
+        if raw in ("", "NULL"):
+            continue
+        try:
+            delay_ms = int(raw) / 1000.0
+        except ValueError:
+            continue
+        ts = sent.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        server_t.append(ts)
+        server_ms.append(delay_ms)
+
+    if not ok_t and not fail_t and not server_t:
+        return None
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.12,
+        subplot_titles=(
+            "Client latency (ack − sent, same clock)",
+            "Server delay (created_at − sent_at, mixed clocks)",
+        ),
+    )
+
+    if ok_t:
+        fig.add_trace(go.Scatter(
+            x=ok_t, y=ok_ms, mode="markers",
+            name="committed",
+            marker=dict(color="#2da44e", size=5),
+            hovertemplate="latency=%{y:.1f} ms<extra>committed</extra>",
+        ), row=1, col=1)
+    if fail_t:
+        fig.add_trace(go.Scatter(
+            x=fail_t, y=fail_ms, mode="markers",
+            name="failed / lost",
+            marker=dict(color="#cf222e", size=8, symbol="x"),
+            text=fail_text,
+            hovertemplate="%{text}<br>wait=%{y:.1f} ms<extra>failed</extra>",
+        ), row=1, col=1)
+    if server_t:
+        fig.add_trace(go.Scatter(
+            x=server_t, y=server_ms, mode="markers",
+            name="created_at − sent_at",
+            marker=dict(color="#0969da", size=5),
+            hovertemplate="delay=%{y:.1f} ms<extra>server</extra>",
+            showlegend=True,
+        ), row=2, col=1)
+
+    failovers = _resolve_failovers(k8s_rows or [], run_dir)
+    drains = _detect_secondary_drains(k8s_rows or [], run_dir, failovers=failovers)
+    drains = _with_separate_proxy_drain_markers(drains, k8s_rows or [], run_dir)
+    _add_scale_event_vlines(fig, timing, failovers, [1, 2], drains)
+    if timing.scale_start_utc and timing.scale_complete_utc:
+        for row_idx in (1, 2):
+            fig.add_vrect(
+                x0=timing.scale_start_utc, x1=timing.scale_complete_utc,
+                fillcolor="#ff7f0e", opacity=0.06, line_width=0,
+                row=row_idx, col=1,
+            )
+
+    fig.update_layout(
+        height=620,
+        hovermode="closest",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        margin=dict(t=80, b=48),
+    )
+    fig.update_yaxes(title_text="ms", row=1, col=1)
+    fig.update_yaxes(title_text="ms", row=2, col=1)
+    fig.update_xaxes(title_text="Time (UTC)", row=2, col=1)
+    return fig
+
+
+def render_write_probe_section(
+    run_dir: Path,
+    timing: ScaleTiming,
+    k8s_rows: list[K8sPodRow],
+) -> str:
+    probe = load_write_probe(run_dir)
+    if probe is None:
+        return ""
+
+    summary = probe["summary"]
+    attempted = int(summary.get("attempted") or len(probe["attempts"]))
+    committed = int(summary.get("committed") or len(probe["committed"]))
+    lost = int(summary.get("lost") or 0)
+    ack_missing = summary.get("ack_but_missing") or []
+    never_committed = summary.get("never_committed") or []
+    late_commit = summary.get("late_commit") or []
+    by_errno = summary.get("by_errno") or {}
+    client_stats = summary.get("client_latency_ms") or {}
+    server_stats = summary.get("server_delay_ms") or {}
+
+    lost_class = "stat-zero-alert" if lost else "stat-zero-safe"
+    p99 = client_stats.get("p99")
+    p99_txt = f"{p99:.1f}" if isinstance(p99, (int, float)) else "–"
+    server_p99 = server_stats.get("p99")
+    server_p99_txt = f"{server_p99:.1f}" if isinstance(server_p99, (int, float)) else "–"
+
+    errno_rows = ""
+    if by_errno:
+        errno_rows = "".join(
+            f"<tr><th>{html_mod.escape(str(k))}</th><td>{v}</td></tr>"
+            for k, v in sorted(by_errno.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))
+        )
+        errno_html = f"""
+        <table class="kv"><thead><tr><th>errno / status</th><th>attempts</th></tr></thead>
+        <tbody>{errno_rows}</tbody></table>"""
+    else:
+        errno_html = ""
+
+    def _seq_preview(seqs: list[Any], label: str) -> str:
+        if not seqs:
+            return ""
+        shown = ", ".join(str(s) for s in seqs[:30])
+        extra = f" … +{len(seqs) - 30} more" if len(seqs) > 30 else ""
+        return f"<p><strong>{html_mod.escape(label)} ({len(seqs)}):</strong> <code>{html_mod.escape(shown + extra)}</code></p>"
+
+    fig = build_write_probe_figure(probe, timing, k8s_rows, run_dir)
+    chart_html = "<p><em>No plottable write-probe samples.</em></p>"
+    if fig is not None:
+        chart_html = fig.to_html(full_html=False, include_plotlyjs=False, div_id="write-probe-chart")
+
+    return f"""
+    <section>
+      <h2 class="section-title">Write-Loss Canary (<code>test_writes</code>)</h2>
+      <p>
+        One autocommit INSERT every 0.25s with a client-assigned <code>seq</code>.
+        <code>sent_at</code> is the client clock when the query was fired;
+        <code>created_at</code> is MySQL <code>CURRENT_TIMESTAMP(6)</code> when the row was written.
+        Failed attempts are <em>not</em> queued — they must be retried.
+        Client latency (ack − sent) is the reliable number; server delay mixes two clocks.
+      </p>
+      <div class="impact-highlights">
+        <div class="highlight-stat stat-duration">
+          <div class="highlight-value">{attempted}</div>
+          <div class="highlight-label">Attempts sent</div>
+        </div>
+        <div class="highlight-stat {"stat-duration" if committed else "stat-zero-safe"}">
+          <div class="highlight-value">{committed}</div>
+          <div class="highlight-label">Rows committed</div>
+        </div>
+        <div class="highlight-stat {lost_class}">
+          <div class="highlight-value">{lost}</div>
+          <div class="highlight-label">Lost (no row)</div>
+          <div class="highlight-sub">ack-missing {len(ack_missing)} · never committed {len(never_committed)}</div>
+        </div>
+        <div class="highlight-stat stat-duration">
+          <div class="highlight-value">{html_mod.escape(p99_txt)}<span class="highlight-unit">ms</span></div>
+          <div class="highlight-label">Client latency p99</div>
+          <div class="highlight-sub">server delay p99 {html_mod.escape(server_p99_txt)} ms</div>
+        </div>
+      </div>
+      {_seq_preview(ack_missing, "Ack but missing (true durability miss)")}
+      {_seq_preview(never_committed, "Never committed (timeout / 4094 / disconnect)")}
+      {_seq_preview(late_commit, "Late commit (client gave up, row still landed)")}
+      {errno_html}
+      <div class="chart-box">{chart_html}</div>
+    </section>
+    """
+
+
 def generate_report(run_dir: Path, output_path: Path | None = None) -> Path:
     run_dir = run_dir.resolve()
     if not run_dir.is_dir():
@@ -4062,6 +4320,8 @@ def generate_report(run_dir: Path, output_path: Path | None = None) -> Path:
     <h2 class="section-title">TPC-C Metrics & Temporal Activity Timeline</h2>
     <div class="chart-box">{main_chart_html}</div>
   </section>
+
+  {render_write_probe_section(run_dir, timing, k8s_rows)}
 
   {render_temporal_breakdown(activities)}
 

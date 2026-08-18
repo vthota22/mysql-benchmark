@@ -46,6 +46,7 @@ export TPCC_FORCE_PK="${TPCC_FORCE_PK:-1}"
 export TPCC_TRX_LEVEL="${TPCC_TRX_LEVEL:-RR}"
 export TPCC_PERCENTILE="${TPCC_PERCENTILE:-99}"
 export TPCC_IGNORE_ERRORS="${TPCC_IGNORE_ERRORS:-1290,1836,1053,2013,2006,2055,2011,3100,1205,1213,1020}"
+export TPCC_VERBOSITY="${TPCC_VERBOSITY:-}"
 export TPCC_RECONNECT_TIME_SEC="${TPCC_RECONNECT_TIME_SEC:-0}"
 export DO_API_TOKEN="${DO_API_TOKEN:-}"
 export DO_API_URL="${DO_API_URL:-}"
@@ -76,9 +77,18 @@ export DURING_SCALING_GR_FLOW_CONTROL_HOLD_PERCENT="${DURING_SCALING_GR_FLOW_CON
 export GR_REPLICA_PARALLEL_WORKERS="${GR_REPLICA_PARALLEL_WORKERS:-}"
 
 K8S_MONITOR_DIR="${RUN_DIR}/k8s_monitor"
+WRITE_PROBE_DIR="${RUN_DIR}/write_probe"
+
+export WRITE_PROBE_ENABLED="${WRITE_PROBE_ENABLED:-1}"
+export WRITE_PROBE_INTERVAL_SEC="${WRITE_PROBE_INTERVAL_SEC:-0.25}"
+export WRITE_PROBE_TIMEOUT_SEC="${WRITE_PROBE_TIMEOUT_SEC:-8}"
 
 on_exit() {
   local rc=$?
+  stop_write_probe 2>/dev/null || true
+  if [[ -f "${WRITE_PROBE_DIR:-}/test_writes_attempts.csv" && ! -f "${WRITE_PROBE_DIR:-}/test_writes_summary.json" ]]; then
+    finalize_write_probe "${WRITE_PROBE_DIR}" 2>/dev/null || true
+  fi
   stop_k8s_monitor 2>/dev/null || true
   if [[ "${rc}" -ne 0 ]]; then
     log_phase "ERROR" "benchmark exited with status ${rc}"
@@ -120,6 +130,11 @@ print_startup_banner() {
     echo "K8s mon:  enabled (kubeconfig=${K8S_KUBECONFIG} ns=${K8S_NAMESPACE} cluster=${PXC_CLUSTER_NAME:-auto} poll=${K8S_MONITOR_POLL_SEC}s)"
   else
     echo "K8s mon:  disabled (K8S_KUBECONFIG='${K8S_KUBECONFIG:-}' not set or file not found)"
+  fi
+  if write_probe_enabled; then
+    echo "Writes:   canary table test_writes every ${WRITE_PROBE_INTERVAL_SEC}s (timeout=${WRITE_PROBE_TIMEOUT_SEC}s)"
+  else
+    echo "Writes:   canary disabled (WRITE_PROBE_ENABLED=0)"
   fi
   echo ""
 }
@@ -304,6 +319,9 @@ phase2_run_with_scaling() {
   gr_apply_replica_parallel_workers
 
   log_phase "2_RUN" "starting TPC-C (threads=${TPCC_THREADS} duration=${tpcc_max_time}s)"
+  if [[ -n "${TPCC_VERBOSITY:-}" ]]; then
+    log_phase "2_RUN" "sysbench --verbosity=${TPCC_VERBOSITY}"
+  fi
   if scaling_enabled; then
     log_phase "2_RUN" "scale trigger at +${SCALE_TRIGGER_DELAY}s — timing in ${SCALE_TIMING_FILE}"
   else
@@ -331,6 +349,15 @@ phase2_run_with_scaling() {
   # Start K8s pod monitor in background (observation only — independent of scaling)
   if k8s_monitor_enabled; then
     start_k8s_monitor "${K8S_MONITOR_DIR}"
+  fi
+
+  local write_probe_started=0
+  if write_probe_enabled; then
+    if prepare_write_probe_table && start_write_probe "${WRITE_PROBE_DIR}"; then
+      write_probe_started=1
+    else
+      log_phase "WRITE_PROBE" "WARNING: canary writer did not start — continuing TPC-C"
+    fi
   fi
 
   local scale_pid=""
@@ -373,6 +400,11 @@ phase2_run_with_scaling() {
     wait "${scale_pid}" || true
   fi
 
+  if [[ "${write_probe_started}" -eq 1 ]]; then
+    stop_write_probe
+    finalize_write_probe "${WRITE_PROBE_DIR}" || true
+  fi
+
   if [[ "${tpcc_rc}" -ne 0 ]]; then
     return "${tpcc_rc}"
   fi
@@ -384,6 +416,9 @@ phase3_finalize_logs() {
   log_phase "3_LOG" "scale timing:  ${SCALE_TIMING_FILE}"
   log_phase "3_LOG" "scale log:     ${SCALE_LOG}"
   log_phase "3_LOG" "full log:      ${FULL_LOG}"
+  if write_probe_enabled; then
+    log_phase "3_LOG" "write probe:   ${WRITE_PROBE_DIR}"
+  fi
 }
 
 phase4_parse_metrics() {

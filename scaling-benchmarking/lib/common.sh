@@ -409,6 +409,112 @@ parse_k8s_monitor_data() {
   log_phase "K8S_PARSE" "parse complete"
 }
 
+# ── Write-loss / write-latency canary (test_writes) ──────────────────────────
+
+write_probe_enabled() {
+  [[ "${WRITE_PROBE_ENABLED:-1}" == "1" ]]
+}
+
+write_probe_script() {
+  echo "${SCRIPT_DIR:-$(scaling_root)}/scripts/write_probe.py"
+}
+
+write_probe_pid_file() {
+  echo "${RUN_DIR:-.}/.write_probe.pid"
+}
+
+prepare_write_probe_table() {
+  local script
+  script="$(write_probe_script)"
+  if [[ ! -f "${script}" ]]; then
+    log_phase "WRITE_PROBE" "ERROR: script not found: ${script}"
+    return 1
+  fi
+  log_phase "WRITE_PROBE" "creating/truncating table test_writes"
+  python3 "${script}" prepare
+}
+
+start_write_probe() {
+  local output_dir="${1:?output directory required}"
+  local script
+  script="$(write_probe_script)"
+  if [[ ! -f "${script}" ]]; then
+    log_phase "WRITE_PROBE" "ERROR: script not found: ${script}"
+    return 1
+  fi
+
+  mkdir -p "${output_dir}"
+  local interval="${WRITE_PROBE_INTERVAL_SEC:-0.25}"
+  local timeout_sec="${WRITE_PROBE_TIMEOUT_SEC:-8}"
+  local attempts="${output_dir}/test_writes_attempts.csv"
+
+  log_phase "WRITE_PROBE" "starting canary writer (every ${interval}s, timeout=${timeout_sec}s)"
+  python3 "${script}" run \
+    --attempts "${attempts}" \
+    --interval "${interval}" \
+    --timeout "${timeout_sec}" \
+    >> "${output_dir}/write_probe.log" 2>&1 &
+  local pid=$!
+  echo "${pid}" > "$(write_probe_pid_file)"
+  sleep 0.3
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    log_phase "WRITE_PROBE" "ERROR: canary writer exited immediately — see ${output_dir}/write_probe.log"
+    rm -f "$(write_probe_pid_file)"
+    return 1
+  fi
+  log_phase "WRITE_PROBE" "started (pid=${pid}) attempts=${attempts}"
+}
+
+stop_write_probe() {
+  local pid_file
+  pid_file="$(write_probe_pid_file)"
+  if [[ ! -f "${pid_file}" ]]; then
+    return 0
+  fi
+  local pid
+  pid="$(cat "${pid_file}")"
+  if kill -0 "${pid}" 2>/dev/null; then
+    log_phase "WRITE_PROBE" "stopping canary writer (pid=${pid})"
+    kill -TERM "${pid}" 2>/dev/null || true
+    wait "${pid}" 2>/dev/null || true
+    log_phase "WRITE_PROBE" "canary writer stopped"
+  fi
+  rm -f "${pid_file}"
+}
+
+finalize_write_probe() {
+  local output_dir="${1:?output directory required}"
+  local script
+  script="$(write_probe_script)"
+  if [[ ! -f "${script}" ]]; then
+    log_phase "WRITE_PROBE" "ERROR: script not found: ${script}"
+    return 1
+  fi
+
+  local committed="${output_dir}/test_writes.csv"
+  local attempts="${output_dir}/test_writes_attempts.csv"
+  local summary_json="${output_dir}/test_writes_summary.json"
+  local summary_txt="${output_dir}/test_writes_summary.txt"
+
+  log_phase "WRITE_PROBE" "dumping committed rows from test_writes"
+  if ! python3 "${script}" dump --out "${committed}"; then
+    log_phase "WRITE_PROBE" "WARNING: dump failed — summary will use the attempt log only"
+  fi
+
+  if [[ ! -f "${attempts}" ]]; then
+    log_phase "WRITE_PROBE" "WARNING: no attempts CSV at ${attempts}"
+    return 0
+  fi
+
+  log_phase "WRITE_PROBE" "summarizing write loss and latency"
+  python3 "${script}" summarize \
+    --attempts "${attempts}" \
+    --committed "${committed}" \
+    --summary-json "${summary_json}" \
+    --summary-txt "${summary_txt}"
+  log_phase "WRITE_PROBE" "summary: ${summary_txt}"
+}
+
 setup_paths() {
   local root
   root="$(scaling_root)"
@@ -1266,6 +1372,10 @@ run_tpcc() {
       if [[ -n "${TPCC_RECONNECT_TIME_SEC:-}" && "${TPCC_RECONNECT_TIME_SEC}" != "0" ]]; then
         reconn_opts+=(--reconnect_time_sec="${TPCC_RECONNECT_TIME_SEC}")
       fi
+      local verbosity_opts=()
+      if [[ -n "${TPCC_VERBOSITY:-}" ]]; then
+        verbosity_opts+=(--verbosity="${TPCC_VERBOSITY}")
+      fi
       run_sysbench_tpcc "${tpcc}" "${opts[@]}" \
         --time="${run_time}" \
         --warmup-time="${TPCC_WARMUP_SEC:-0}" \
@@ -1273,6 +1383,7 @@ run_tpcc() {
         --percentile="${TPCC_PERCENTILE:-99}" \
         --mysql-ignore-errors="${ignore_errors}" \
         --db-ps-mode=disable \
+        "${verbosity_opts[@]+"${verbosity_opts[@]}"}" \
         "${reconn_opts[@]+"${reconn_opts[@]}"}" \
         run
       ;;
