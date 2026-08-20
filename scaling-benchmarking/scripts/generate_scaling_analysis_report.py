@@ -1034,7 +1034,12 @@ def _resolve_failovers(
     k8s_rows: list[K8sPodRow],
     run_dir: Path | None = None,
 ) -> list[dict[str, str]]:
-    """Use failover_time.txt when present; otherwise detect from k8s monitor."""
+    """Use failover_time.txt when present; otherwise detect from k8s monitor.
+
+    Keep every GR primary change, including switchovers during in-place
+    restamp and after the old primary node is drained. Drain markers are
+    filtered separately so those failovers are not paired with extra drains.
+    """
     detected = _detect_failovers(k8s_rows)
     if run_dir is None:
         return detected
@@ -1059,6 +1064,88 @@ def _resolve_failovers(
         "to": "?",
         "label": f"Failover ({file_ts[11:19]} UTC)",
     }]
+
+
+def _load_temporal_scale_ops(run_dir: Path | None) -> dict[str, str]:
+    """Promote / restamp timestamps from temporal_history.json, if present.
+
+    Scale-up restamps after the node-pool drain. Scale-down restamps first
+    (in-place resize), then creates the new pool. `restamp_until` is the end
+    of the wait-for-cluster-ready that follows restamp so that restamp
+    rolling is not labeled as the vertical-scale drain.
+    """
+    if run_dir is None:
+        return {}
+    path = run_dir / "temporal_history.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except json.JSONDecodeError:
+        return {}
+    timeline = data.get("activity_timeline") or []
+    out: dict[str, str] = {}
+    for a in timeline:
+        kind = a.get("activity_type") or ""
+        started = a.get("started_at") or a.get("scheduled_at") or ""
+        if not started:
+            continue
+        if kind == "promoteMySQLPrimaryOffNode" and "promote_at" not in out:
+            out["promote_at"] = started
+        elif kind == "restampMySQLPlanDefaultsCR" and "restamp_at" not in out:
+            out["restamp_at"] = started
+    restamp_at = out.get("restamp_at")
+    if restamp_at:
+        waits: list[tuple[str, str]] = []
+        for a in timeline:
+            if a.get("activity_type") != "scale-cluster-wait-for-cluster-ready-scale":
+                continue
+            started = a.get("started_at") or a.get("scheduled_at") or ""
+            ended = a.get("ended_at") or ""
+            if started and ended and started >= restamp_at:
+                waits.append((started, ended))
+        if waits:
+            waits.sort()
+            out["restamp_until"] = waits[0][1]
+    return out
+
+
+def _in_restamp_roll_window(ts: str, ops: dict[str, str]) -> bool:
+    """True if `ts` falls in the CR-restamp rolling window."""
+    start, end = ops.get("restamp_at"), ops.get("restamp_until")
+    if not start or not end:
+        return False
+    try:
+        t = _parse_utc(ts)
+        return _parse_utc(start) <= t <= _parse_utc(end)
+    except Exception:
+        return False
+
+
+def _target_vcpu_from_run(run_dir: Path | None) -> int | None:
+    """vCPU of SCALE_TARGET_SIZE, used to label new vs old nodes."""
+    if run_dir is None:
+        return None
+    timing = load_scale_timing(run_dir / "scale_timing.env")
+    return _slug_vcpu(timing.target_size)
+
+
+def _primary_short_before(k8s_rows: list[K8sPodRow], ts: str) -> str:
+    """mysql-N that was PRIMARY immediately before `ts`."""
+    try:
+        cutoff = _parse_utc(ts)
+    except Exception:
+        return ""
+    last = ""
+    for row in sorted(k8s_rows, key=lambda r: r.timestamp):
+        try:
+            if _parse_utc(row.timestamp) > cutoff:
+                break
+        except Exception:
+            continue
+        if row.gr_role == "PRIMARY" and "-mysql-" in row.pod:
+            last = row.pod.split("-mysql-")[-1]
+    return last
 
 
 def _component_short_name(pod: str) -> str:
@@ -1115,16 +1202,18 @@ def _detect_secondary_drains(
     failovers: list[dict[str, str]] | None = None,
     failover_overlap_sec: float = 90.0,
 ) -> list[dict[str, str]]:
-    """Detect SECONDARY mysql pods entering deleting=yes (rolling drain).
+    """Detect mysql pods entering deleting=yes (rolling drain).
+
+    Vertical scale drains secondaries first, then switches primary, then
+    drains the old primary. A pod that was PRIMARY at delete time — or that
+    matches failover.from shortly after the switch — is labeled Primary Drain,
+    not Secondary Drain.
 
     Companion HAProxy / binlog pods killed within companion_window_sec are
     recorded on each drain. Only companions that share the exact same HH:MM:SS
     timestamp are folded into the drain label
     (e.g. 'Secondary Drain mysql-0 (+ haproxy-0)'). Companions at a different
     second are kept in companion_events for separate labels/rows.
-
-    Drains of the old PRIMARY that already have a Failover label (same pod /
-    near the same timestamp) are omitted to avoid duplicate markers.
     """
     last_role: dict[str, str] = {}
     prev_deleting: dict[str, str] = {}
@@ -1140,15 +1229,19 @@ def _detect_secondary_drains(
         prev_deleting[row.pod] = row.deleting
         if prev == "yes" or row.deleting != "yes":
             continue
-        if last_role.get(row.pod) != "SECONDARY":
+        role = last_role.get(row.pod, "")
+        if role not in ("PRIMARY", "SECONDARY"):
             continue
 
         short = row.pod.split("-mysql-")[-1]
+        kind = "primary" if role == "PRIMARY" else "secondary"
+        prefix = "Primary Drain" if kind == "primary" else "Secondary Drain"
         drains.append({
             "timestamp": row.timestamp,
             "pod": short,
             "full_pod": row.pod,
-            "label": f"Secondary Drain mysql-{short}",
+            "kind": kind,
+            "label": f"{prefix} mysql-{short}",
         })
 
     if not drains:
@@ -1193,13 +1286,57 @@ def _detect_secondary_drains(
             min(c["timestamp"] for c in companion_events) if companion_events else ""
         )
         if same_ts:
+            prefix = (
+                "Primary Drain" if drain.get("kind") == "primary"
+                else "Secondary Drain"
+            )
             drain["label"] = (
-                f"Secondary Drain mysql-{drain['pod']} (+ {', '.join(same_ts)})"
+                f"{prefix} mysql-{drain['pod']} (+ {', '.join(same_ts)})"
             )
 
-    # Skip drains covered by an existing Failover label (old primary drain).
-    if failovers:
+    # Vertical scale (Temporal): drain secondaries, promote primary off the
+    # old node, failover, then evict the old node. The eviction is not a
+    # MySQL drain. CR restamp rolling (before or after that sequence) is
+    # also not the node-pool drain — ignore it.
+    ops = _load_temporal_scale_ops(run_dir)
+    promote_at = ops.get("promote_at")
+    restamp_at = ops.get("restamp_at")
+    if promote_at or restamp_at:
+        cutoff_ts = promote_at or restamp_at
+        try:
+            cutoff = _parse_utc(cutoff_ts)
+        except Exception:
+            cutoff = None
         kept: list[dict[str, str]] = []
+        for drain in drains:
+            if _in_restamp_roll_window(drain["timestamp"], ops):
+                continue
+            if cutoff is not None:
+                try:
+                    if _parse_utc(drain["timestamp"]) >= cutoff:
+                        continue
+                except Exception:
+                    pass
+            kept.append(drain)
+        drains = kept
+        if promote_at:
+            pod = _primary_short_before(k8s_rows, promote_at)
+            if pod:
+                drains.append({
+                    "timestamp": promote_at,
+                    "pod": pod,
+                    "full_pod": "",
+                    "kind": "primary",
+                    "label": f"Primary Drain mysql-{pod}",
+                    "companions": "",
+                    "companion_events": [],
+                })
+        return drains
+
+    # No Temporal: omit a drain of failover.from near the failover (old
+    # primary eviction after switchover), do not draw a drain after it.
+    if failovers:
+        kept = []
         for drain in drains:
             drain_ts = _parse_utc(drain["timestamp"])
             redundant = False
@@ -1207,10 +1344,11 @@ def _detect_secondary_drains(
                 if drain["pod"] != fo.get("from", ""):
                     continue
                 try:
-                    delta = abs((drain_ts - _parse_utc(fo["timestamp"])).total_seconds())
+                    delta = (_parse_utc(fo["timestamp"]) - drain_ts).total_seconds()
                 except Exception:
                     continue
-                if delta <= failover_overlap_sec:
+                # Drain after (or at) failover of this pod = old primary eviction.
+                if -5 <= delta <= failover_overlap_sec:
                     redundant = True
                     break
             if not redundant:
@@ -1235,6 +1373,7 @@ def _detect_proxy_component_drains(
     if not timestamps:
         return []
     t_start, t_end = min(timestamps), max(timestamps)
+    ops = _load_temporal_scale_ops(run_dir)
 
     out: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -1244,6 +1383,8 @@ def _detect_proxy_component_drains(
         if not any(tok in obj for tok in ("haproxy", "binlog", "router")):
             continue
         if ts < t_start or ts > t_end:
+            continue
+        if _in_restamp_roll_window(ts, ops):
             continue
         name = _component_short_name(obj)
         key = (name, _ts_hhmmss(ts))
@@ -1277,11 +1418,15 @@ def _slug_vcpu(slug: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def _relative_slug_label(slug: str, known_slugs: set[str]) -> str:
+def _relative_slug_label(
+    slug: str,
+    known_slugs: set[str],
+    new_vcpu: int | None = None,
+) -> str:
     """Label placement as 'new node' / 'old node' when the run has two sizes.
 
-    Larger vCPU slug => new node; smaller => old node. Falls back to the raw
-    slug when size can't be ranked.
+    Target slug vCPU (scale-up or scale-down) is the new node. Falls back to
+    larger vCPU = new node when the target size is unknown.
     """
     slug = (slug or "").strip()
     if not slug or slug == "?":
@@ -1294,9 +1439,15 @@ def _relative_slug_label(slug: str, known_slugs: set[str]) -> str:
     if v is None or len(sized) < 2:
         return slug
     min_v, max_v = sized[0][0], sized[-1][0]
-    if v == max_v and max_v != min_v:
+    if max_v == min_v:
+        return slug
+    if new_vcpu is not None and new_vcpu in (min_v, max_v):
+        if v == new_vcpu:
+            return "new node"
+        return "old node"
+    if v == max_v:
         return "new node"
-    if v == min_v and max_v != min_v:
+    if v == min_v:
         return "old node"
     return slug
 
@@ -1305,15 +1456,30 @@ def _collect_run_slugs(k8s_rows: list[K8sPodRow]) -> set[str]:
     return {r.slug for r in k8s_rows if r.slug and r.slug not in ("?", "")}
 
 
+def _slug_for_node(k8s_rows: list[K8sPodRow], node: str) -> str:
+    """First non-empty slug observed on this DOKS node."""
+    if not node or node == "?":
+        return ""
+    node_short = _short_node_name(node)
+    for row in k8s_rows:
+        doks = row.doks_node or ""
+        if not doks or not row.slug or row.slug in ("?", ""):
+            continue
+        if doks == node or _short_node_name(doks) == node_short:
+            return row.slug
+    return ""
+
+
 def _resolve_mysql_on_node(
     k8s_rows: list[K8sPodRow],
     node: str,
     at_ts: str,
 ) -> tuple[str, str] | None:
-    """Find which mysql-* shares `node` near `at_ts`.
+    """Find which mysql-* already shares `node` at `at_ts`.
 
-    Prefer same-timestamp occupancy; else the soonest occupancy after at_ts;
-    else the latest occupancy before at_ts.
+    Same-timestamp occupancy only. Do not attribute a proxy/binlog landing to
+    a mysql pod that moves onto this node later (HAProxy is rescheduled onto
+    empty new nodes before any mysql drain).
     Returns (mysql_short, slug) or None.
     """
     if not node or node == "?":
@@ -1324,34 +1490,18 @@ def _resolve_mysql_on_node(
         return doks == node or doks.endswith(node_short) or _short_node_name(doks) == node_short
 
     at_exact: list[tuple[str, str]] = []
-    after: list[tuple[str, str, str]] = []  # ts, short, slug
-    before: list[tuple[str, str, str]] = []
-
     for row in k8s_rows:
         if "-mysql-" not in row.pod:
             continue
-        if not _VALID_TS_RE.match(row.timestamp):
+        if row.timestamp != at_ts:
             continue
         if not _node_match(row.doks_node or ""):
             continue
         short = row.pod.split("-mysql-")[-1]
-        slug = row.slug or "?"
-        if row.timestamp == at_ts:
-            at_exact.append((short, slug))
-        elif row.timestamp > at_ts:
-            after.append((row.timestamp, short, slug))
-        else:
-            before.append((row.timestamp, short, slug))
+        at_exact.append((short, row.slug or "?"))
 
     if at_exact:
-        # Prefer Running/ready if multiple, else first.
         return at_exact[0]
-    if after:
-        after.sort(key=lambda x: x[0])
-        return after[0][1], after[0][2]
-    if before:
-        before.sort(key=lambda x: x[0])
-        return before[-1][1], before[-1][2]
     return None
 
 
@@ -1360,13 +1510,17 @@ def _format_host_placement(
     node: str,
     at_ts: str,
     known_slugs: set[str] | None = None,
+    new_vcpu: int | None = None,
 ) -> str:
-    """Human placement label: 'mysql-1 (new node)' or node short fallback."""
+    """Human placement label: 'mysql-1 (new node)', or 'new node' if empty."""
     known = known_slugs if known_slugs is not None else _collect_run_slugs(k8s_rows)
     resolved = _resolve_mysql_on_node(k8s_rows, node, at_ts)
     if resolved:
         short, slug = resolved
-        return f"mysql-{short} ({_relative_slug_label(slug, known)})"
+        return f"mysql-{short} ({_relative_slug_label(slug, known, new_vcpu)})"
+    slug = _slug_for_node(k8s_rows, node)
+    if slug:
+        return _relative_slug_label(slug, known, new_vcpu)
     return _short_node_name(node)
 
 
@@ -1536,10 +1690,9 @@ def _drain_failover_summary_rows(
     Companions are only combined onto a MySQL drain/failover row when they share
     the exact same HH:MM:SS timestamp; otherwise they get their own row.
     """
-    # Unfiltered drains — keep companions for failover-overlap rows.
+    # all_drains keeps original kinds for failover companion lookup.
     all_drains = _detect_secondary_drains(k8s_rows, run_dir, failovers=None)
     chart_drains = _detect_secondary_drains(k8s_rows, run_dir, failovers=failovers)
-    chart_keys = {(d["pod"], d["timestamp"]) for d in chart_drains}
 
     rows: list[dict[str, str]] = []
     emitted_proxy: set[tuple[str, str]] = set()  # (name, HH:MM:SS)
@@ -1555,9 +1708,7 @@ def _drain_failover_summary_rows(
             "what": what or f"{name} drained",
         })
 
-    for drain in all_drains:
-        if (drain["pod"], drain["timestamp"]) not in chart_keys:
-            continue
+    for drain in chart_drains:
         drain_hhmmss = _ts_hhmmss(drain["timestamp"])
         companion_events = drain.get("companion_events") or []
         same_ts = [
@@ -1570,7 +1721,12 @@ def _drain_failover_summary_rows(
                 c.strip() for c in drain["companions"].split(",") if c.strip()
             ]
 
-        what = f"mysql-{drain['pod']} drain"
+        kind = (drain.get("kind") or "secondary").lower()
+        what = (
+            f"mysql-{drain['pod']} primary drain"
+            if kind == "primary"
+            else f"mysql-{drain['pod']} drain"
+        )
         if same_ts:
             what += " + " + " + ".join(same_ts)
             for name in same_ts:
@@ -1660,6 +1816,7 @@ def _drain_failover_summary_rows(
                 mentioned[token] = r["sort_ts"]
 
     known_slugs = _collect_run_slugs(k8s_rows)
+    new_vcpu = _target_vcpu_from_run(run_dir)
     for rec in _detect_haproxy_recoveries(run_dir) + _detect_binlog_recoveries(run_dir):
         kill_ts = mentioned.get(rec["name"])
         if not kill_ts:
@@ -1668,6 +1825,7 @@ def _drain_failover_summary_rows(
             continue
         placement = _format_host_placement(
             k8s_rows, rec.get("node") or "", rec["timestamp"], known_slugs,
+            new_vcpu,
         )
         rows.append({
             "sort_ts": rec["timestamp"],
@@ -1870,8 +2028,9 @@ def _overlay_qps_offline_segments(
     return _merge_adjacent_segments(out)
 
 
-# MySQL secondary drains stay blue; standalone HAProxy drains use amber/yellow.
+# MySQL secondary drains stay blue; primary drains orange; HAProxy amber.
 _DRAIN_MYSQL_STYLE = {"color": "#0969da", "bg": "rgba(221,244,255,0.95)"}
+_DRAIN_PRIMARY_STYLE = {"color": "#bc4c00", "bg": "rgba(255,245,232,0.95)"}
 _DRAIN_HAPROXY_STYLE = {"color": "#bf8700", "bg": "rgba(255,248,197,0.95)"}
 _DRAIN_OTHER_PROXY_STYLE = {"color": "#8250df", "bg": "rgba(245,238,255,0.95)"}
 
@@ -1894,6 +2053,8 @@ def _drain_marker_style(drain: dict[str, Any]) -> dict[str, str]:
     if _is_haproxy_drain(drain):
         return dict(_DRAIN_HAPROXY_STYLE)
     label = drain.get("label") or ""
+    if (drain.get("kind") or "").lower() == "primary" or label.startswith("Primary Drain"):
+        return dict(_DRAIN_PRIMARY_STYLE)
     if label.startswith("Binlog Drain") or label.startswith("Router Drain"):
         return dict(_DRAIN_OTHER_PROXY_STYLE)
     return dict(_DRAIN_MYSQL_STYLE)
@@ -3551,10 +3712,11 @@ def render_vertical_scale_timeline(
         event_summary_html = f"""
         <h3 style="margin-top:1.2rem;">Drain &amp; Failover Events</h3>
         <p style="margin:0.35rem 0 0.6rem;font-size:0.88rem;color:#57606a;">
-          Chronological view of secondary drains, separately timed HAProxy / binlog
-          moves, primary failover, and when HAProxy / binlog came back (with the node
-          they landed on). Co-drained components are only combined when they share the
-          exact same timestamp.
+          Chronological view of HAProxy / binlog moves, secondary drains,
+          primary promoted off the old node, then failover. In-place CR
+          restamp rolling is omitted from drain labels. Every GR primary
+          change is still labeled at the monitor timestamp, including
+          elections during restamp.
         </p>
         <table class="kv">
           <thead><tr><th>Time (UTC)</th><th>What happened</th></tr></thead>

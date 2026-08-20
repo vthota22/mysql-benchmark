@@ -92,7 +92,7 @@ export TPCC_PERCENTILE="${TPCC_PERCENTILE:-99}"
 export TPCC_MAX_TIME="${DURATION}"
 export TPCC_IGNORE_ERRORS="${TPCC_IGNORE_ERRORS:-1290,1836,1053,2013,2006,2055,2011,3100,1205,1213,1020}"
 export TPCC_VERBOSITY="${TPCC_VERBOSITY:-}"
-export TPCC_RECONNECT_TIME_SEC="${TPCC_RECONNECT_TIME_SEC:-0}"
+export TPCC_RECONNECT="${TPCC_RECONNECT:-0}"
 
 # Group Replication tuning
 export K8S_KUBECONFIG="${K8S_KUBECONFIG:-}"
@@ -117,8 +117,8 @@ echo "Threads:  ${THREADS}"
 echo "Duration: ${DURATION}s"
 echo "Warmup:   ${TPCC_WARMUP_SEC}s"
 echo "Tables:   ${TPCC_TABLES}  Scale: ${TPCC_SCALE}"
-if [[ "${TPCC_RECONNECT_TIME_SEC}" != "0" ]]; then
-  echo "Reconn:   1 random thread every ${TPCC_RECONNECT_TIME_SEC}s"
+if [[ "${TPCC_RECONNECT}" != "0" ]]; then
+  echo "Reconn:   each thread reconnects every ${TPCC_RECONNECT} events"
 fi
 if [[ -n "${TPCC_VERBOSITY:-}" ]]; then
   echo "Verbosity: ${TPCC_VERBOSITY}"

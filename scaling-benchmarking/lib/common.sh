@@ -1368,9 +1368,12 @@ run_tpcc() {
       # Failover/resize: 1290,1836,1053,2013,2006,2055,2011,3100
       # TPC-C contention (sysbench defaults): 1205,1213,1020
       local ignore_errors="${TPCC_IGNORE_ERRORS:-1290,1836,1053,2013,2006,2055,2011,3100,1205,1213,1020}"
-      local reconn_opts=()
       if [[ -n "${TPCC_RECONNECT_TIME_SEC:-}" && "${TPCC_RECONNECT_TIME_SEC}" != "0" ]]; then
-        reconn_opts+=(--reconnect_time_sec="${TPCC_RECONNECT_TIME_SEC}")
+        echo "WARNING: TPCC_RECONNECT_TIME_SEC is ignored; use TPCC_RECONNECT (events per reconnect)" >&2
+      fi
+      local reconn_opts=()
+      if [[ -n "${TPCC_RECONNECT:-}" && "${TPCC_RECONNECT}" != "0" ]]; then
+        reconn_opts+=(--reconnect="${TPCC_RECONNECT}")
       fi
       local verbosity_opts=()
       if [[ -n "${TPCC_VERBOSITY:-}" ]]; then

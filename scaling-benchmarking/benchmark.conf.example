@@ -46,11 +46,10 @@ TPCC_IGNORE_ERRORS="1290,1836,1053,2013,2006,2055,2011,3100,1205,1213,1020,4094"
 # codes (e.g. "Ignoring error 1213 Deadlock found..."). Debug is very noisy.
 TPCC_VERBOSITY=5
 
-# Periodic reconnect: every N seconds, one randomly chosen thread gracefully closes
-# and re-opens its MySQL connection. Helps rebalance connections across HAProxy pods
-# after drains/reloads. 0 = disabled (default). With 16 threads and 10s interval,
-# all 16 connections cycle within ~160s.
-TPCC_RECONNECT_TIME_SEC=0
+# Reconnect after every N TPC-C events per thread (sysbench --reconnect).
+# 0 = disabled (default). Example: 1000 means each thread closes and re-opens
+# its MySQL connection after every 1000 transactions.
+TPCC_RECONNECT=0
 
 # 1 = skip prepare when TPC-C tables already exist; 0 = drop DB and reload dataset
 # When SKIP_PREPARE=1, phase 1 runs tpcc check with TPCC_CHECK_THREADS (or TPCC_PREP_THREADS);
