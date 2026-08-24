@@ -254,6 +254,9 @@ run_failover_edition() {
         mysqld_kill)
           echo "kubectl_kill_mysqld (signal=${FAILOVER_MYSQLD_KILL_SIGNAL:-9}, container=${ADVANCED_K8S_MYSQL_CONTAINER:-mysql})"
           ;;
+        mysqld_freeze)
+          echo "kubectl_cgroup_freeze_mysqld (hold=${FAILOVER_MYSQLD_FREEZE_SEC:-15}s, UNREACHABLE path)"
+          ;;
         set_as_primary)
           echo "group_replication_set_as_primary (graceful primary replacement)"
           ;;

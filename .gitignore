@@ -29,3 +29,11 @@ kubeconfig-*
 *.pem
 Failover report*.html
 install_sysbench_11.log
+benchmark.conf.mysqld_freeze*
+benchmark.conf.*.merged
+ssl-certs/cacert.pem
+ssl-certs/ca-certificate.crt
+ssl-certs/cluster-tls.crt
+ssl-certs/cluster-tls.key
+kubeconfig-bb78ca19*
+benchmark.conf.mysqld_freeze_failover2*

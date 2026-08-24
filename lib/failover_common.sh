@@ -62,6 +62,11 @@ failover_defaults() {
   : "${FAILOVER_POD_DELETE_FORCE:=1}"
   : "${FAILOVER_POD_DELETE_GRACE_SEC:=0}"
   : "${FAILOVER_MYSQLD_KILL_SIGNAL:=9}"
+  # mysqld_freeze: hold primary mysql cgroup frozen this many seconds (need
+  # ~5s GR detection + member_expel_timeout + small buffer). Default 15.
+  : "${FAILOVER_MYSQLD_FREEZE_SEC:=25}"
+  : "${FAILOVER_MYSQLD_FREEZE_HELPER_IMAGE:=busybox:1.36}"
+  : "${FAILOVER_MYSQLD_FREEZE_THAW:=1}"
   # Unplanned: max seconds after trigger to accept connect_ok=0 as detection.
   : "${FAILOVER_DETECT_WINDOW_SEC:=60}"
   # Planned (set_as_primary): max seconds after trigger to accept write/connect outage start.
@@ -302,7 +307,7 @@ failover_advanced_trigger_method() {
 # Valid advanced trigger methods for FAILOVER_TRIGGER_MATRIX / FAILOVER_ADVANCED_TRIGGER_METHOD.
 failover_is_advanced_trigger_method() {
   case "${1:-}" in
-    pod_delete|mysqld_kill|set_as_primary) return 0 ;;
+    pod_delete|mysqld_kill|mysqld_freeze|set_as_primary) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -316,7 +321,7 @@ failover_trigger_matrix_methods() {
   if [[ -n "${FAILOVER_TRIGGER_MATRIX:-}" ]]; then
     for method in ${FAILOVER_TRIGGER_MATRIX}; do
       if ! failover_is_advanced_trigger_method "${method}"; then
-        echo "ERROR: Unknown FAILOVER_TRIGGER_MATRIX entry '${method}' (use pod_delete, mysqld_kill, set_as_primary)" >&2
+        echo "ERROR: Unknown FAILOVER_TRIGGER_MATRIX entry '${method}' (use pod_delete, mysqld_kill, mysqld_freeze, set_as_primary)" >&2
         return 1
       fi
       echo "${method}"
@@ -325,22 +330,22 @@ failover_trigger_matrix_methods() {
   fi
   method="${FAILOVER_ADVANCED_TRIGGER_METHOD:-pod_delete}"
   if ! failover_is_advanced_trigger_method "${method}"; then
-    echo "ERROR: Unknown FAILOVER_ADVANCED_TRIGGER_METHOD=${method} (use pod_delete, mysqld_kill, set_as_primary)" >&2
+    echo "ERROR: Unknown FAILOVER_ADVANCED_TRIGGER_METHOD=${method} (use pod_delete, mysqld_kill, mysqld_freeze, set_as_primary)" >&2
     return 1
   fi
   echo "${method}"
 }
 
-# Advanced kubectl-based trigger (pod delete, mysqld kill, or graceful GR switchover).
+# Advanced kubectl-based trigger (pod delete, mysqld kill/freeze, or graceful GR switchover).
 failover_advanced_trigger_active() {
   failover_defaults
   failover_trigger_enabled || return 1
   case "$(failover_advanced_trigger_method)" in
     pod_delete) failover_pod_delete_enabled ;;
-    mysqld_kill) return 0 ;;
+    mysqld_kill|mysqld_freeze) return 0 ;;
     set_as_primary) return 0 ;;
     *)
-      echo "ERROR: Unknown FAILOVER_ADVANCED_TRIGGER_METHOD=$(failover_advanced_trigger_method) (use pod_delete, mysqld_kill, or set_as_primary)" >&2
+      echo "ERROR: Unknown FAILOVER_ADVANCED_TRIGGER_METHOD=$(failover_advanced_trigger_method) (use pod_delete, mysqld_kill, mysqld_freeze, or set_as_primary)" >&2
       return 1
       ;;
   esac
@@ -2151,6 +2156,9 @@ out_env = Path(sys.argv[3])
 ts_re = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)")
 writable_re = re.compile(r"This server is working as primary member", re.I)
 elected_re = re.compile(r"A new primary with address (\S+) was elected", re.I)
+unreachable_re = re.compile(r"has become unreachable", re.I)
+removed_re = re.compile(r"Members removed from the group", re.I)
+expelled_re = re.compile(r"Member was expelled from the group", re.I)
 
 
 def pod_hint_from_path(log_path: Path) -> str:
@@ -2167,9 +2175,20 @@ def pod_matches(hint: str, target: str) -> bool:
 election_ts = None
 election_pod = ""
 writable_ts = None
+unreachable_ts = None
+removed_ts = None
+expelled_ts = None
+
+
+def _maybe_earlier(ts: datetime, current):
+    if ts.timestamp() < trigger_epoch:
+        return current
+    if current is None or ts < current:
+        return ts
+    return current
+
 
 for log_path in sorted(results_dir.glob("mysql_gr_election*.log")):
-    hint = pod_hint_from_path(log_path)
     with log_path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
             match = ts_re.match(line)
@@ -2178,6 +2197,12 @@ for log_path in sorted(results_dir.glob("mysql_gr_election*.log")):
             ts = datetime.fromisoformat(match.group(1).replace("Z", "+00:00"))
             if ts.timestamp() < trigger_epoch:
                 continue
+            if unreachable_re.search(line):
+                unreachable_ts = _maybe_earlier(ts, unreachable_ts)
+            if removed_re.search(line):
+                removed_ts = _maybe_earlier(ts, removed_ts)
+            if expelled_re.search(line):
+                expelled_ts = _maybe_earlier(ts, expelled_ts)
             elected = elected_re.search(line)
             if elected:
                 pod = elected.group(1).split(".")[0]
@@ -2218,6 +2243,25 @@ lines = [
     f"GR_ELECTION_POD={election_pod}",
     "GR_ELECTION_SOURCE=mysql_pod_logs",
 ]
+if unreachable_ts is not None:
+    unreachable_rel = unreachable_ts.timestamp() - trigger_epoch
+    lines.extend(
+        [
+            f"GR_UNREACHABLE_FROM_TRIGGER_SEC={unreachable_rel:.3f}",
+            f"GR_UNREACHABLE_UTC={unreachable_ts.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.')}{unreachable_ts.microsecond // 1000:03d}Z",
+        ]
+    )
+gr_removed_ts = removed_ts if removed_ts is not None else expelled_ts
+if gr_removed_ts is not None and (election_ts is None or gr_removed_ts <= election_ts):
+    removed_rel = gr_removed_ts.timestamp() - trigger_epoch
+    removed_label = "removed" if removed_ts is not None else "expelled"
+    lines.extend(
+        [
+            f"GR_MEMBER_REMOVED_FROM_TRIGGER_SEC={removed_rel:.3f}",
+            f"GR_MEMBER_REMOVED_UTC={gr_removed_ts.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.')}{gr_removed_ts.microsecond // 1000:03d}Z",
+            f"GR_MEMBER_REMOVED_SOURCE={removed_label}",
+        ]
+    )
 if writable_ts is not None:
     writable_rel = writable_ts.timestamp() - trigger_epoch
     writable_ms = int(round(writable_rel * 1000))
@@ -2237,6 +2281,10 @@ out_env.write_text("\n".join(lines) + "\n", encoding="utf-8")
 print(
     f"Parsed GR election: {election_rel:.3f}s ({election_ms} ms) on {election_pod or 'unknown'}"
 )
+if unreachable_ts is not None:
+    print(f"Parsed GR unreachable: {unreachable_ts.timestamp() - trigger_epoch:.3f}s")
+if gr_removed_ts is not None:
+    print(f"Parsed GR member removed: {gr_removed_ts.timestamp() - trigger_epoch:.3f}s")
 if writable_ts is not None:
     print(f"Parsed GR writable primary: {writable_rel:.3f}s ({writable_ms} ms)")
 PY
@@ -4194,6 +4242,9 @@ write_failover_promotion_breakdown() {
   local gr_election_source=""
   local gr_writable_override="-1"
   local gr_writable_source=""
+  local gr_unreachable_override="-1"
+  local gr_member_removed_override="-1"
+  local gr_member_removed_source=""
   if [[ -f "${results_dir}/gr_election_internal.env" ]]; then
     # shellcheck disable=SC1090
     source "${results_dir}/gr_election_internal.env" 2>/dev/null || true
@@ -4202,6 +4253,9 @@ write_failover_promotion_breakdown() {
     gr_election_source="${GR_ELECTION_SOURCE:-mysql_pod_logs}"
     gr_writable_override="${GR_WRITABLE_FROM_TRIGGER_SEC:--1}"
     gr_writable_source="${GR_WRITABLE_SOURCE:-}"
+    gr_unreachable_override="${GR_UNREACHABLE_FROM_TRIGGER_SEC:--1}"
+    gr_member_removed_override="${GR_MEMBER_REMOVED_FROM_TRIGGER_SEC:--1}"
+    gr_member_removed_source="${GR_MEMBER_REMOVED_SOURCE:-}"
   fi
 
   _failover_parse_gr_election_from_mysql_logs "${results_dir}" 2>/dev/null || true
@@ -4213,6 +4267,9 @@ write_failover_promotion_breakdown() {
     gr_election_source="${GR_ELECTION_SOURCE:-mysql_pod_logs}"
     gr_writable_override="${GR_WRITABLE_FROM_TRIGGER_SEC:--1}"
     gr_writable_source="${GR_WRITABLE_SOURCE:-}"
+    gr_unreachable_override="${GR_UNREACHABLE_FROM_TRIGGER_SEC:--1}"
+    gr_member_removed_override="${GR_MEMBER_REMOVED_FROM_TRIGGER_SEC:--1}"
+    gr_member_removed_source="${GR_MEMBER_REMOVED_SOURCE:-}"
   fi
 
   _failover_parse_haproxy_stats_primary_up "${results_dir}" "${gr_election_override_pod}" 2>/dev/null || true
@@ -4250,6 +4307,9 @@ write_failover_promotion_breakdown() {
       -v gr_election_source="${gr_election_source}" \
       -v gr_writable_override="${gr_writable_override}" \
       -v gr_writable_source="${gr_writable_source}" \
+      -v gr_unreachable_override="${gr_unreachable_override}" \
+      -v gr_member_removed_override="${gr_member_removed_override}" \
+      -v gr_member_removed_source="${gr_member_removed_source}" \
       -v ha_stats_up_override="${ha_stats_up_override}" \
       -v ha_stats_up_server="${ha_stats_up_server}" \
       -v ha_stats_up_pod="${ha_stats_up_pod}" \
@@ -4437,11 +4497,24 @@ BEGIN {
     apply_lag_internal = gr_writable - gr_elect
 
   promote_gr_wait = -1
+  promote_gr_suspicion_expel = -1
+  promote_gr_election_only = -1
   promote_ha_route = -1
   promote_client_restore = -1
+  gr_unreachable = (gr_unreachable_override >= 0) ? gr_unreachable_override + 0 : -1
+  gr_member_removed = (gr_member_removed_override >= 0) ? gr_member_removed_override + 0 : -1
   if (ttd >= 0 && write_ok >= 0) {
     if (gr_elect >= 0) {
       promote_gr_wait = (gr_elect > ttd) ? gr_elect - ttd : 0
+      if (gr_member_removed >= 0 || gr_unreachable >= 0) {
+        gr_expel_end = gr_member_removed
+        if (gr_expel_end < 0) gr_expel_end = gr_unreachable
+        promote_gr_suspicion_expel = (gr_expel_end > ttd) ? gr_expel_end - ttd : 0
+        promote_gr_election_only = (gr_elect > gr_expel_end) ? gr_elect - gr_expel_end : 0
+      } else {
+        promote_gr_suspicion_expel = 0
+        promote_gr_election_only = promote_gr_wait
+      }
       ha_start = phase_start_after(gr_elect, ttd)
       if (ha_start >= 0 && ha_end >= 0 && ha_end > ha_start)
         promote_ha_route = ha_end - ha_start
@@ -4465,6 +4538,22 @@ BEGIN {
     (ha_stats_up_source != "" ? "mysql-primary backend UP on elected server (" ha_stats_up_source ")" : "haproxy_stats_monitor.tsv not collected"))
   emit_csv_row("promote_gr_election_after_ttd", "ttd", gr_elect, promote_gr_wait,
     "GR election after TTD (mysqld elected log preferred; 0 if elected before client detected failure)")
+  suspicion_desc = "GR suspicion + expel wait (unreachable -> member removed/expelled; mysqld pod logs)"
+  if (gr_member_removed_source != "")
+    suspicion_desc = suspicion_desc " [" gr_member_removed_source "]"
+  if (gr_unreachable >= 0)
+    suspicion_desc = suspicion_desc "; unreachable at " fmt_sec(gr_unreachable) " from trigger"
+  emit_csv_row("promote_gr_suspicion_expel_after_ttd", "ttd", gr_member_removed, promote_gr_suspicion_expel,
+    suspicion_desc)
+  election_only_desc = "GR primary election after member removal (A new primary was elected)"
+  if (gr_election_source != "")
+    election_only_desc = election_only_desc " (" gr_election_source ")"
+  emit_csv_row("promote_gr_election_only_after_ttd", "ttd", gr_elect, promote_gr_election_only,
+    election_only_desc)
+  emit_csv_row("gr_unreachable_internal", "trigger", gr_unreachable, phase_duration(gr_unreachable, ttd),
+    "First GR member unreachable (survivor mysqld logs)")
+  emit_csv_row("gr_member_removed_internal", "trigger", gr_member_removed, phase_duration(gr_member_removed, ttd),
+    (gr_member_removed_source != "" ? "Member removed/expelled from group (" gr_member_removed_source ")" : "Member removed from GR group (mysqld logs)"))
   ha_route_desc = "HAProxy routable after TTD (applier/read_only wait + health check)"
   if (ha_stats_up_source != "" && ha_stats_up >= 0)
     ha_route_desc = ha_route_desc " via stats socket: mysql-primary UP"
@@ -4515,9 +4604,15 @@ BEGIN {
     print "Stale HA routing (old primary still writable):  none detected" >> txt_out
   printf "TTD (first VIP connect failure):               %s\n", fmt_sec(ttd) >> txt_out
   print "" >> txt_out
-  print "--- Promote = GR election + HAProxy routable + client path restore (sum = time to promote) ---" >> txt_out
+  print "--- Promote = GR suspicion/expel + GR election + HAProxy routable + client path restore (sum = time to promote) ---" >> txt_out
   if (gr_elect >= 0 && promote_gr_wait >= 0 && promote_ha_route >= 0 && promote_client_restore >= 0) {
-    printf "  GR election after TTD:                       %s\n", fmt_phase(promote_gr_wait) >> txt_out
+    if (gr_unreachable >= 0 || gr_member_removed >= 0)
+      printf "  GR suspicion & expel after TTD:             %s\n", fmt_phase(promote_gr_suspicion_expel) >> txt_out
+    printf "  GR election after TTD:                       %s\n", fmt_phase(promote_gr_election_only >= 0 ? promote_gr_election_only : promote_gr_wait) >> txt_out
+    if (gr_unreachable >= 0)
+      printf "    (unreachable at %s from trigger)\n", fmt_sec(gr_unreachable) >> txt_out
+    if (gr_member_removed >= 0)
+      printf "    (member removed at %s from trigger)\n", fmt_sec(gr_member_removed) >> txt_out
     if (ha_stats_up >= 0) {
       printf "  HAProxy routable (stats socket UP):          %s\n", fmt_phase(promote_ha_route) >> txt_out
       if (ha_stats_up_server != "")

@@ -396,7 +396,7 @@ def enrich_cluster_metadata(cfg: dict[str, str], edition: str) -> None:
 THREAD_DIR_RE = re.compile(r"^t(\d+)$")
 ITER_DIR_RE = re.compile(r"^iter(\d+)$")
 EDITION_NAMES = {"advanced", "standard"}
-TRIGGER_METHODS = {"pod_delete", "mysqld_kill", "set_as_primary"}
+TRIGGER_METHODS = {"pod_delete", "mysqld_kill", "mysqld_freeze", "set_as_primary"}
 DEFAULT_THREAD_MATRIX = (4, 8, 16, 32)
 DEFAULT_SCENARIOS = ("mixed", "write_only")
 VALID_SCENARIO_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -2326,8 +2326,12 @@ def _failover_mode_info(
             "eyebrow": "Planned failover benchmark",
             "title": "Planned Failover Impact Summary",
         }
-    if method in {"pod_delete", "mysqld_kill"}:
-        method_note = "pod delete" if method == "pod_delete" else "mysqld kill"
+    if method in {"pod_delete", "mysqld_kill", "mysqld_freeze"}:
+        method_note = {
+            "pod_delete": "pod delete",
+            "mysqld_kill": "mysqld kill",
+            "mysqld_freeze": "mysqld freeze (UNREACHABLE)",
+        }.get(method, method)
         return {
             "mode": "unplanned",
             "label": f"Unplanned failover ({method_note})",
@@ -2949,9 +2953,14 @@ HA_CONVERGENCE_DEFINITION = (
 )
 PROMOTE_PHASE_DEFINITIONS: list[tuple[str, str, str]] = [
     (
-        "promote_gr_election_after_ttd",
+        "promote_gr_suspicion_expel_after_ttd",
+        "GR suspicion & expel",
+        "mysqld logs: member unreachable → member_expel_timeout → removed from group (UNREACHABLE path)",
+    ),
+    (
+        "promote_gr_election_only_after_ttd",
         "GR election",
-        "mysqld log: A new primary was elected (fallback: gr_pod_monitor PRIMARY+ONLINE)",
+        "mysqld log: A new primary was elected after member removal (fallback: full GR wait)",
     ),
     (
         "promote_ha_routing_after_ttd",
@@ -2966,7 +2975,7 @@ PROMOTE_PHASE_DEFINITIONS: list[tuple[str, str, str]] = [
     (
         "promote_total",
         "Time to promote (total)",
-        "TTD → write probe OK (sum of three phases above)",
+        "TTD → write probe OK (sum of phases above)",
     ),
 ]
 
@@ -2988,6 +2997,14 @@ def _promote_three_phase_html(scenario_dir: Path) -> str:
         sources.append("GR election: mysqld pod logs (A new primary was elected)")
     elif (scenario_dir / "gr_pod_monitor.tsv").exists():
         sources.append("GR election: gr_pod_monitor.tsv fallback")
+    if env.get("GR_UNREACHABLE_FROM_TRIGGER_SEC"):
+        sources.append("GR suspicion: mysqld unreachable log on survivor pod(s)")
+    if env.get("GR_MEMBER_REMOVED_FROM_TRIGGER_SEC"):
+        sources.append(
+            "GR expel: mysqld member-removed log ("
+            + env.get("GR_MEMBER_REMOVED_SOURCE", "removed")
+            + ")"
+        )
     if env.get("GR_WRITABLE_SOURCE") == "mysql_pod_logs":
         sources.append("Apply lag note: mysqld working-as-primary log on elected pod")
     if ha_env.get("HAPROXY_PRIMARY_UP_SOURCE") == "haproxy_stats_monitor":
@@ -3012,8 +3029,16 @@ def _promote_three_phase_html(scenario_dir: Path) -> str:
     accounted = 0.0
     for phase_key, title, help_text in PROMOTE_PHASE_DEFINITIONS:
         row = by_phase.get(phase_key, {})
+        if not row and phase_key == "promote_gr_election_only_after_ttd":
+            row = by_phase.get("promote_gr_election_after_ttd", {})
         if not row and phase_key == "promote_client_path_restore_after_ttd":
             row = by_phase.get("promote_replication_lag_after_ttd", {})
+        if phase_key == "promote_gr_suspicion_expel_after_ttd":
+            dur_raw = row.get("duration_from_ttd_sec", "N/A")
+            if dur_raw in {"", "NOT_REACHED", "NOT_DETECTED", "0", "0.000"} and not env.get(
+                "GR_UNREACHABLE_FROM_TRIGGER_SEC"
+            ):
+                continue
         dur_raw = row.get("duration_from_ttd_sec", "N/A")
         dur = _breakdown_cell_duration(dur_raw)
         at_trig = _breakdown_cell_time(row.get("time_from_trigger_sec", "N/A"))
@@ -3032,7 +3057,8 @@ def _promote_three_phase_html(scenario_dir: Path) -> str:
     return f"""
       <h3 style="font-size:0.92rem;color:var(--accent);margin:1rem 0 0.5rem">Time to promote and accept writes</h3>
       <p class="muted" style="margin:0 0 0.75rem;font-size:0.85rem">
-        Three phases from first connect failure (TTD) to write probe OK on the client VIP.
+        Phases from first connect failure (TTD) to write probe OK on the client VIP.
+        UNREACHABLE-path runs (e.g. <code>mysqld_freeze</code>) split GR suspicion/expel from election.
       </p>
       <table class="metrics promotion-breakdown" style="margin-bottom:0.75rem">
         <thead><tr><th>Phase</th><th>Duration (from TTD)</th><th>At (from trigger)</th></tr></thead>
@@ -3043,7 +3069,16 @@ def _promote_three_phase_html(scenario_dir: Path) -> str:
     """
 
 
-PHASE_STRIP_COLORS = ("#22c55e", "#38bdf8", "#a78bfa")
+PHASE_STRIP_COLORS = ("#f59e0b", "#22c55e", "#38bdf8", "#a78bfa")
+
+
+def _promote_phase_strip_titles() -> list[tuple[str, str]]:
+    return [
+        ("promote_gr_suspicion_expel_after_ttd", "GR suspicion & expel"),
+        ("promote_gr_election_only_after_ttd", "GR election"),
+        ("promote_ha_routing_after_ttd", "HAProxy routable"),
+        ("promote_client_path_restore_after_ttd", "Client path restore"),
+    ]
 
 
 def _failover_run_id(scenario_dir: Path) -> str:
@@ -3147,15 +3182,16 @@ def _promoted_apply_context(scenario_dir: Path, primary: dict[str, str], trigger
 
 def _phase_strip_html(by_phase: dict[str, dict[str, str]]) -> str:
     segments: list[tuple[str, float, str]] = []
-    titles = (
-        ("promote_gr_election_after_ttd", "GR election"),
-        ("promote_ha_routing_after_ttd", "HAProxy routable"),
-        ("promote_client_path_restore_after_ttd", "Client path restore"),
-    )
-    for idx, (key, title) in enumerate(titles):
+    for idx, (key, title) in enumerate(_promote_phase_strip_titles()):
         row = by_phase.get(key, {})
+        if not row and key == "promote_gr_election_only_after_ttd":
+            row = by_phase.get("promote_gr_election_after_ttd", {})
         if not row and key == "promote_client_path_restore_after_ttd":
             row = by_phase.get("promote_replication_lag_after_ttd", {})
+        if key == "promote_gr_suspicion_expel_after_ttd":
+            dur_raw = row.get("duration_from_ttd_sec")
+            if dur_raw in {None, "", "NOT_REACHED", "NOT_DETECTED", "0", "0.000"}:
+                continue
         dur = _parse_metric_sec(row.get("duration_from_ttd_sec"))
         if dur is not None and dur >= 0:
             segments.append((title, dur, PHASE_STRIP_COLORS[idx % len(PHASE_STRIP_COLORS)]))
@@ -3198,8 +3234,14 @@ def _summary_phase_details_html(by_phase: dict[str, dict[str, str]]) -> str:
     rows: list[str] = []
     for phase_key, title, _help in PROMOTE_PHASE_DEFINITIONS:
         row = by_phase.get(phase_key, {})
+        if not row and phase_key == "promote_gr_election_only_after_ttd":
+            row = by_phase.get("promote_gr_election_after_ttd", {})
         if not row and phase_key == "promote_client_path_restore_after_ttd":
             row = by_phase.get("promote_replication_lag_after_ttd", {})
+        if phase_key == "promote_gr_suspicion_expel_after_ttd":
+            dur_check = row.get("duration_from_ttd_sec", "N/A")
+            if dur_check in {"", "NOT_REACHED", "NOT_DETECTED", "0", "0.000"}:
+                continue
         dur = _breakdown_cell_duration(row.get("duration_from_ttd_sec", "N/A"))
         at_trig = _breakdown_cell_time(row.get("time_from_trigger_sec", "N/A"))
         weight = ' style="font-weight:600"' if phase_key == "promote_total" else ""
@@ -3796,14 +3838,19 @@ PROMOTION_BREAKDOWN_PHASES: list[tuple[str, str, str]] = [
 
 
 def _promotion_split_summary_html(by_phase: dict[str, str]) -> str:
-    """Two-part promote split: GR election (after TTD) + HA routing = total promote."""
-    gr_row = by_phase.get("promote_gr_election_after_ttd", {})
+    """Promote split: GR suspicion/expel + election + HA routing = total promote."""
+    gr_susp_row = by_phase.get("promote_gr_suspicion_expel_after_ttd", {})
+    gr_row = by_phase.get("promote_gr_election_only_after_ttd", {}) or by_phase.get(
+        "promote_gr_election_after_ttd", {}
+    )
     ha_row = by_phase.get("promote_ha_routing_to_primary", {})
     total_row = by_phase.get("promote_total", {})
+    gr_susp_dur = gr_susp_row.get("duration_from_ttd_sec", "")
     gr_dur = gr_row.get("duration_from_ttd_sec", "")
     ha_dur = ha_row.get("duration_from_ttd_sec", "")
     total_dur = total_row.get("duration_from_ttd_sec", "")
     gr_internal = by_phase.get("gr_election_internal", {}).get("time_from_trigger_sec", "")
+    gr_removed = by_phase.get("gr_member_removed_internal", {}).get("time_from_trigger_sec", "")
 
     if gr_dur in {"", "NOT_REACHED", "NOT_DETECTED"} or ha_dur in {"", "NOT_REACHED", "NOT_DETECTED"}:
         vip_dur = by_phase.get("vip_outage", {}).get("duration_from_ttd_sec", total_dur)
@@ -3824,27 +3871,38 @@ def _promotion_split_summary_html(by_phase: dict[str, str]) -> str:
         """
 
     gr_at = _breakdown_cell_time(gr_internal)
-    rows = [
-        (
-            "GR election (internal)",
-            "Wait for GR PRIMARY+ONLINE on a mysql pod (direct pod poll). "
-            "0 s if GR finished before TTD.",
-            _breakdown_cell_duration(gr_dur),
-            gr_at,
-        ),
-        (
-            "HA routing to writable primary",
-            "Operator + HAProxy: GR ready → client VIP sees PRIMARY + write probe OK.",
-            _breakdown_cell_duration(ha_dur),
-            "—",
-        ),
-        (
-            "Time to promote (total)",
-            "Sum of above (= KPI primary_election_sec).",
-            _breakdown_cell_duration(total_dur),
-            _breakdown_cell_time(total_row.get("time_from_trigger_sec", "N/A")),
-        ),
-    ]
+    rows: list[tuple[str, str, str, str]] = []
+    if gr_susp_dur not in {"", "NOT_REACHED", "NOT_DETECTED", "0", "0.000"}:
+        rows.append(
+            (
+                "GR suspicion & expel",
+                "Member unreachable → member_expel_timeout → removed from group (mysqld survivor logs).",
+                _breakdown_cell_duration(gr_susp_dur),
+                _breakdown_cell_time(gr_removed or gr_internal),
+            )
+        )
+    rows.extend(
+        [
+            (
+                "GR election",
+                "New primary elected after member removal (mysqld log). 0 s if concurrent with removal.",
+                _breakdown_cell_duration(gr_dur),
+                gr_at,
+            ),
+            (
+                "HA routing to writable primary",
+                "Operator + HAProxy: GR ready → client VIP sees PRIMARY + write probe OK.",
+                _breakdown_cell_duration(ha_dur),
+                "—",
+            ),
+            (
+                "Time to promote (total)",
+                "Sum of GR + HA phases (= KPI primary_election_sec).",
+                _breakdown_cell_duration(total_dur),
+                _breakdown_cell_time(total_row.get("time_from_trigger_sec", "N/A")),
+            ),
+        ]
+    )
     body = []
     for i, (title, help_text, dur, at_trig) in enumerate(rows):
         cls = ' class="row-total"' if i == len(rows) - 1 else ""
@@ -3864,7 +3922,7 @@ def _promotion_split_summary_html(by_phase: dict[str, str]) -> str:
             )
     return f"""
       <p class="muted" style="margin:0 0 0.5rem">
-        <strong>Promote (from TTD)</strong> = GR election (internal) + HA routing to writable primary on VIP.
+        <strong>Promote (from TTD)</strong> = GR suspicion/expel (when logged) + GR election + HA routing to writable primary on VIP.
       </p>
       <table class="metrics promotion-breakdown" style="margin-bottom:1.25rem">
         <thead><tr><th>Component</th><th>Duration (from TTD)</th><th>GR at (from trigger)</th></tr></thead>

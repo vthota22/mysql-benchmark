@@ -210,9 +210,10 @@ STANDARD_CLUSTER_UUID=
 # STANDARD_CLUSTER_NUM_NODES=3   # see NUM_NODES / STANDARD_CLUSTER_NUM_NODES at top of file
 
 # --- Advanced Edition failover trigger ---
-# Method: pod_delete | mysqld_kill | set_as_primary
+# Method: pod_delete | mysqld_kill | mysqld_freeze | set_as_primary
 #   pod_delete      — kubectl delete primary pod (default; unplanned)
 #   mysqld_kill     — kubectl exec kill mysqld inside primary pod (process crash)
+#   mysqld_freeze   — node cgroup freeze of mysql container (GR UNREACHABLE / expel path)
 #   set_as_primary  — graceful planned primary replacement via group_replication_set_as_primary
 FAILOVER_ADVANCED_TRIGGER_METHOD=pod_delete
 # Optional 2nd arg to group_replication_set_as_primary(uuid[, timeout]): seconds to wait for
@@ -233,6 +234,11 @@ FAILOVER_POD_DELETE_GRACE_SEC=0
 # pod_delete graceful delete instead: FAILOVER_POD_DELETE_FORCE=0 FAILOVER_POD_DELETE_GRACE_SEC=30
 # mysqld_kill: SIGKILL mysqld in mysql container (default signal 9)
 # FAILOVER_MYSQLD_KILL_SIGNAL=9
+# mysqld_freeze: hold primary mysql cgroup frozen long enough for
+#   ~5s GR detection + member_expel_timeout (+ buffer). Default 15s.
+# FAILOVER_MYSQLD_FREEZE_SEC=25
+# FAILOVER_MYSQLD_FREEZE_THAW=1
+# FAILOVER_MYSQLD_FREEZE_HELPER_IMAGE=busybox:1.36
 # ADVANCED_K8S_MYSQL_CONTAINER=mysql
 ADVANCED_CLUSTER_UUID=
 

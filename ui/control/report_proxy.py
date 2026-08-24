@@ -116,6 +116,7 @@ def report_view_url(rel_path: str) -> str:
 _TRIGGER_METHOD_LABELS = {
     "pod_delete": ("unplanned", "Unplanned (pod_delete)"),
     "mysqld_kill": ("unplanned", "Unplanned (mysqld_kill)"),
+    "mysqld_freeze": ("unplanned", "Unplanned (mysqld_freeze)"),
     "set_as_primary": ("planned", "Planned (set_as_primary)"),
 }
 _SCENARIO_NAMES = frozenset({"mixed", "write_only"})
@@ -254,6 +255,7 @@ def pick_primary_report(reports: list[dict], feature: FeatureProfile | None = No
             "/pod_delete/mixed/graphs/failover_report.html",
             "/set_as_primary/mixed/graphs/failover_report.html",
             "/mysqld_kill/mixed/graphs/failover_report.html",
+            "/mysqld_freeze/mixed/graphs/failover_report.html",
             "/mixed/graphs/failover_report.html",
             "/write_only/graphs/failover_report.html",
             "/advanced/graphs/failover_report.html",

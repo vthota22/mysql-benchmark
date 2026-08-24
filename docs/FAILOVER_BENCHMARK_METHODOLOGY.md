@@ -133,6 +133,7 @@ So “after trigger” means after this fire timestamp, not the planned integer 
 |--------|--------|
 | `pod_delete` | Force/grace delete current primary pod (unplanned) |
 | `mysqld_kill` | `kill` mysqld in primary container (unplanned) |
+| `mysqld_freeze` | Node cgroup freeze of mysql container — GR UNREACHABLE/expel path (unplanned) |
 | `set_as_primary` | Planned: `group_replication_set_as_primary` on a SECONDARY |
 
 Matrix runs (`FAILOVER_TRIGGER_MATRIX`) export the method per subdirectory; `trigger_failover.sh` preserves that override across `benchmark.conf` load.
@@ -148,7 +149,7 @@ Matrix runs (`FAILOVER_TRIGGER_MATRIX`) export the method per subdirectory; `tri
 
 Stored in `failover_kpi.csv` / HTML report. Times in **seconds from trigger** unless noted.
 
-### 5.1 Unplanned (`pod_delete` / `mysqld_kill`)
+### 5.1 Unplanned (`pod_delete` / `mysqld_kill` / `mysqld_freeze`)
 
 | KPI | Column | Definition |
 |-----|--------|------------|

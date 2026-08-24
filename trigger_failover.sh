@@ -7,7 +7,7 @@
 # Actions (Advanced; harness uses prepare → refresh → fire):
 #   prepare  — fetch kubeconfig, validate kubectl, resolve primary (+ promote target) pod
 #   refresh  — re-resolve primary / promote target shortly before trigger second
-#   fire     — pod_delete | mysqld_kill | set_as_primary using prepared env (no re-resolve)
+#   fire     — pod_delete | mysqld_kill | mysqld_freeze | set_as_primary using prepared env (no re-resolve)
 #   (omit)   — one-shot: prepare + fire immediately (manual / legacy)
 #
 # Requires benchmark.conf (via BENCHMARK_CONF) and edition-specific settings.
@@ -380,6 +380,191 @@ _advanced_failover_kill_mysqld() {
   log_failover_do_events "${RESULTS_DIR}" "advanced" "post_mysqld_kill"
 }
 
+# Freeze primary mysqld via node cgroup.freeze (UNREACHABLE / expel path).
+# In-pod SIGSTOP/SIGKILL is unreliable when mysqld is container PID 1.
+_advanced_failover_freeze_mysqld() {
+  local kubeconfig="${1:?kubeconfig required}"
+  local pod="${2:?pod required}"
+  local ns="${3:?namespace required}"
+  local container="${ADVANCED_K8S_MYSQL_CONTAINER:-mysql}"
+  local freeze_sec="${FAILOVER_MYSQLD_FREEZE_SEC:-15}"
+  local helper_image="${FAILOVER_MYSQLD_FREEZE_HELPER_IMAGE:-busybox:1.36}"
+  local do_thaw="${FAILOVER_MYSQLD_FREEZE_THAW:-1}"
+  local helper="failover-mysqld-freeze-${pod##*-}-$$"
+  local node="" task_id="" host_pid="" cgroup_path=""
+  local kubectl=(kubectl --kubeconfig="${kubeconfig}")
+  if [[ -n "${ADVANCED_K8S_CONTEXT:-}" ]]; then
+    kubectl+=(--context="${ADVANCED_K8S_CONTEXT}")
+  fi
+
+  failover_defaults
+
+  echo "FAILOVER_METHOD=kubectl_cgroup_freeze_mysqld" >> "${EVENT_FILE}"
+  echo "FAILOVER_ADVANCED_TRIGGER_METHOD=mysqld_freeze" >> "${EVENT_FILE}"
+  echo "FAILOVER_MYSQLD_FREEZE_SEC=${freeze_sec}" >> "${EVENT_FILE}"
+  echo "FAILOVER_MYSQLD_FREEZE_CONTAINER=${container}" >> "${EVENT_FILE}"
+  echo "FAILOVER_MYSQLD_FREEZE_THAW=${do_thaw}" >> "${EVENT_FILE}"
+  echo "FAILOVER_TARGET_POD=${pod}" >> "${EVENT_FILE}"
+
+  node="$("${kubectl[@]}" -n "${ns}" get pod "${pod}" -o jsonpath='{.spec.nodeName}')"
+  if [[ -z "${node}" ]]; then
+    echo "ERROR: could not resolve node for pod ${pod}" | tee -a "${TRIGGER_LOG}" >&2
+    return 1
+  fi
+  echo "FAILOVER_MYSQLD_FREEZE_NODE=${node}" >> "${EVENT_FILE}"
+
+  echo "Freezing mysqld in ${pod} via node cgroup (node=${node}, hold=${freeze_sec}s)..." \
+    | tee -a "${TRIGGER_LOG}"
+  echo "Helper pod: ${helper} image=${helper_image}" | tee -a "${TRIGGER_LOG}"
+
+  # Best-effort cleanup of a prior helper with the same name.
+  "${kubectl[@]}" -n "${ns}" delete pod "${helper}" --ignore-not-found --wait=false \
+    >/dev/null 2>&1 || true
+
+  cat <<EOF | "${kubectl[@]}" apply -f - 2>&1 | tee -a "${TRIGGER_LOG}"
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${helper}
+  namespace: ${ns}
+  labels:
+    app.kubernetes.io/name: failover-mysqld-freeze
+    app.kubernetes.io/part-of: mysql-benchmark
+spec:
+  hostNetwork: true
+  hostPID: true
+  nodeName: ${node}
+  restartPolicy: Never
+  tolerations:
+  - operator: Exists
+  containers:
+  - name: host
+    image: ${helper_image}
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: host
+      mountPath: /host
+    command: ["sleep", "600"]
+  volumes:
+  - name: host
+    hostPath:
+      path: /
+EOF
+
+  if ! "${kubectl[@]}" -n "${ns}" wait --for=condition=Ready "pod/${helper}" --timeout=120s \
+    2>&1 | tee -a "${TRIGGER_LOG}"; then
+    echo "ERROR: freeze helper pod not Ready" | tee -a "${TRIGGER_LOG}" >&2
+    "${kubectl[@]}" -n "${ns}" delete pod "${helper}" --ignore-not-found --wait=false \
+      >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  # Resolve running containerd task for this pod's mysql container.
+  task_id="$("${kubectl[@]}" -n "${ns}" exec -i "${helper}" -- chroot /host /bin/bash -s -- "${pod}" "${container}" <<'FINDTASK'
+set -euo pipefail
+pod="$1"
+cname="$2"
+while read -r id; do
+  [[ -n "${id}" ]] || continue
+  meta="$(ctr -n k8s.io containers info "${id}" 2>/dev/null || true)"
+  echo "${meta}" | grep -Fq "\"io.kubernetes.pod.name\": \"${pod}\"" || continue
+  echo "${meta}" | grep -Fq "\"io.kubernetes.container.name\": \"${cname}\"" || continue
+  ctr -n k8s.io tasks ls 2>/dev/null | awk -v id="${id}" '$1==id && $3=="RUNNING" {found=1; exit} END{exit !found}' || continue
+  echo "${id}"
+  exit 0
+done < <(ctr -n k8s.io containers ls -q 2>/dev/null)
+exit 1
+FINDTASK
+)"
+
+  if [[ -z "${task_id}" ]]; then
+    echo "ERROR: could not find running containerd task for ${pod}/${container}" \
+      | tee -a "${TRIGGER_LOG}" >&2
+    "${kubectl[@]}" -n "${ns}" delete pod "${helper}" --ignore-not-found --wait=false \
+      >/dev/null 2>&1 || true
+    return 1
+  fi
+  echo "FAILOVER_MYSQLD_FREEZE_TASK_ID=${task_id}" >> "${EVENT_FILE}"
+  echo "Resolved containerd task ${task_id}" | tee -a "${TRIGGER_LOG}"
+
+  echo "FAILOVER_TRIGGER_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
+  echo "FAILOVER_TRIGGER_EPOCH=$(python3 -c 'import time; print("%.3f" % time.time())')" >> "${EVENT_FILE}"
+  echo "FAILOVER_MYSQLD_FREEZE_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
+
+  # Freeze via cgroup v2 freeze (preferred), else host SIGSTOP on the task PID.
+  if ! "${kubectl[@]}" -n "${ns}" exec "${helper}" -- chroot /host /bin/bash -lc "
+set -euo pipefail
+ID='${task_id}'
+PID=\$(ctr -n k8s.io tasks ls | awk -v id=\"\${ID}\" '\$1==id {print \$2; exit}')
+[[ -n \"\${PID}\" ]] || { echo \"ERROR: no host pid for task \${ID}\" >&2; exit 1; }
+echo \"HOST_PID=\${PID}\"
+CG=\$(awk -F: 'NR==1 {print \$3}' /proc/\${PID}/cgroup)
+echo \"CGROUP=\${CG}\"
+if [[ -f /sys/fs/cgroup/\${CG}/cgroup.freeze ]]; then
+  echo 1 > /sys/fs/cgroup/\${CG}/cgroup.freeze
+  echo FREEZE_METHOD=cgroup.freeze
+elif [[ -f /sys/fs/cgroup/freezer\${CG}/freezer.state ]]; then
+  echo FROZEN > /sys/fs/cgroup/freezer\${CG}/freezer.state
+  echo FREEZE_METHOD=cgroup.freezer
+else
+  kill -STOP \"\${PID}\"
+  echo FREEZE_METHOD=SIGSTOP_hostpid
+fi
+ps -o pid,stat,cmd -p \"\${PID}\" | head -5
+" 2>&1 | tee -a "${TRIGGER_LOG}"; then
+    echo "ERROR: failed to freeze mysqld cgroup/task" | tee -a "${TRIGGER_LOG}" >&2
+    "${kubectl[@]}" -n "${ns}" delete pod "${helper}" --ignore-not-found --wait=false \
+      >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  host_pid="$(awk -F= '/^HOST_PID=/{print $2}' "${TRIGGER_LOG}" | tail -1)"
+  cgroup_path="$(awk -F= '/^CGROUP=/{print $2}' "${TRIGGER_LOG}" | tail -1)"
+  [[ -n "${host_pid}" ]] && echo "FAILOVER_MYSQLD_FREEZE_HOST_PID=${host_pid}" >> "${EVENT_FILE}"
+  [[ -n "${cgroup_path}" ]] && echo "FAILOVER_MYSQLD_FREEZE_CGROUP=${cgroup_path}" >> "${EVENT_FILE}"
+  freeze_method="$(awk -F= '/^FREEZE_METHOD=/{print $2}' "${TRIGGER_LOG}" | tail -1)"
+  [[ -n "${freeze_method}" ]] && echo "FAILOVER_MYSQLD_FREEZE_METHOD=${freeze_method}" >> "${EVENT_FILE}"
+
+  echo "mysqld frozen at $(date -u +%Y-%m-%dT%H:%M:%SZ); holding ${freeze_sec}s for UNREACHABLE+expel..." \
+    | tee -a "${TRIGGER_LOG}"
+  sleep "${freeze_sec}"
+
+  if [[ "${do_thaw}" == "1" ]]; then
+    echo "Thawing mysqld..." | tee -a "${TRIGGER_LOG}"
+    "${kubectl[@]}" -n "${ns}" exec "${helper}" -- chroot /host /bin/bash -lc "
+set -euo pipefail
+ID='${task_id}'
+PID=\$(ctr -n k8s.io tasks ls | awk -v id=\"\${ID}\" '\$1==id {print \$2; exit}')
+if [[ -z \"\${PID}\" ]]; then
+  echo 'WARN: task gone at thaw (already restarted?)'
+  exit 0
+fi
+CG=\$(awk -F: 'NR==1 {print \$3}' /proc/\${PID}/cgroup)
+if [[ -f /sys/fs/cgroup/\${CG}/cgroup.freeze ]]; then
+  echo 0 > /sys/fs/cgroup/\${CG}/cgroup.freeze
+elif [[ -f /sys/fs/cgroup/freezer\${CG}/freezer.state ]]; then
+  echo THAWED > /sys/fs/cgroup/freezer\${CG}/freezer.state
+else
+  kill -CONT \"\${PID}\" || true
+fi
+echo THAW_UTC=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
+ps -o pid,stat,cmd -p \"\${PID}\" | head -3
+" 2>&1 | tee -a "${TRIGGER_LOG}" || true
+    echo "FAILOVER_MYSQLD_THAW_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "${EVENT_FILE}"
+  else
+    echo "FAILOVER_MYSQLD_FREEZE_THAW=0 — leaving frozen (manual thaw required)" \
+      | tee -a "${TRIGGER_LOG}"
+  fi
+
+  "${kubectl[@]}" -n "${ns}" delete pod "${helper}" --ignore-not-found --wait=false \
+    2>&1 | tee -a "${TRIGGER_LOG}" || true
+
+  echo "mysqld_freeze trigger complete at $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "${TRIGGER_LOG}"
+  _failover_snapshot_k8s_events "${RESULTS_DIR}" "post_mysqld_freeze"
+  log_failover_do_events "${RESULTS_DIR}" "advanced" "post_mysqld_freeze"
+}
+
 # Pick a SECONDARY mysql pod to promote (graceful planned primary replacement).
 find_advanced_promote_pod() {
   local kubeconfig="${1:?kubeconfig required}"
@@ -547,6 +732,9 @@ fire_advanced_failover_trigger() {
       ;;
     mysqld_kill)
       _advanced_failover_kill_mysqld "${FAILOVER_KUBECONFIG}" "${pod}" "${FAILOVER_K8S_NAMESPACE}"
+      ;;
+    mysqld_freeze)
+      _advanced_failover_freeze_mysqld "${FAILOVER_KUBECONFIG}" "${pod}" "${FAILOVER_K8S_NAMESPACE}"
       ;;
     set_as_primary)
       : "${promote_pod:?FAILOVER_PROMOTE_POD missing in prepared env — run refresh first}"
