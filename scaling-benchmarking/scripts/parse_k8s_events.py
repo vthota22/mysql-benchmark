@@ -2,7 +2,8 @@
 """Parse k8s_scaling_monitor.sh TSV output into a human-readable analysis.
 
 Reads:
-  - k8s_monitor.tsv          (per-poll pod state with GR role, node, slug)
+  - k8s_monitor.tsv          (per-poll pod state with role, node, slug)
+  - replication_mode.txt     (gr | async | galera | unknown; optional)
   - haproxy_monitor.tsv      (HAProxy/router pod state)
   - endpoints_monitor.tsv    (service endpoint changes)
   - k8s_events.tsv           (namespace K8s events)
@@ -190,12 +191,21 @@ def load_log(path: Path) -> list[str]:
     return path.read_text(encoding="utf-8", errors="replace").splitlines()
 
 
+def load_replication_mode(monitor_dir: Path) -> str:
+    """Read replication_mode.txt written by k8s_scaling_monitor.sh."""
+    path = monitor_dir / "replication_mode.txt"
+    if not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8", errors="replace").strip().lower()
+
+
 def generate_summary(
     rows: list[Row],
     log_lines: list[str],
     haproxy_rows: list[HaproxyRow] | None = None,
     endpoint_rows: list[EndpointRow] | None = None,
     event_rows: list[EventRow] | None = None,
+    replication_mode: str = "",
 ) -> str:
     lines: list[str] = []
     lines.append("=" * 72)
@@ -206,9 +216,18 @@ def generate_summary(
         lines.append("\nNo monitoring data found.")
         return "\n".join(lines)
 
+    mode = replication_mode or "unknown"
+    is_async = mode == "async"
+    repl_label = {
+        "async": "Async Replication",
+        "galera": "Galera",
+        "gr": "Group Replication",
+    }.get(mode, "Replication")
+
     timestamps = sorted(set(r.timestamp for r in rows))
     lines.append(f"\nMonitoring period: {timestamps[0]} → {timestamps[-1]}")
     lines.append(f"Poll cycles: {len(timestamps)}")
+    lines.append(f"Replication mode: {mode}")
 
     pods = sorted(set(r.pod for r in rows))
     lines.append(f"Pods observed: {len(pods)} — {', '.join(pods)}")
@@ -229,8 +248,8 @@ def generate_summary(
             prev_primary = primary
     lines.append(f"  Total failovers: {failover_count}")
 
-    # --- GR state transitions per pod ---
-    lines.append("\n--- GR Member State Transitions ---")
+    # --- Member state transitions per pod ---
+    lines.append(f"\n--- {repl_label} Member State Transitions ---")
     for pod in pods:
         pod_rows = [r for r in rows if r.pod == pod]
         prev_state = ""
@@ -246,10 +265,10 @@ def generate_summary(
         for t in transitions:
             lines.append(f"    {t}")
 
-    # --- GR errors / non-ONLINE states ---
+    # --- Non-healthy states ---
     error_rows = [r for r in rows if r.gr_state not in ("ONLINE", "Synced", "?", "")]
     if error_rows:
-        lines.append(f"\n--- Non-ONLINE GR States: {len(error_rows)} occurrence(s) ---")
+        lines.append(f"\n--- Non-ONLINE {repl_label} States: {len(error_rows)} occurrence(s) ---")
         seen: set[str] = set()
         for r in error_rows:
             key = f"{r.pod}:{r.gr_state}:{r.gr_detail}"
@@ -304,8 +323,8 @@ def generate_summary(
     for slug in sorted(slug_first.keys()):
         lines.append(f"  {slug}: first seen {slug_first[slug]}, last seen {slug_last[slug]}")
 
-    # --- GR group size (horizontal scaling) ---
-    lines.append("\n--- GR Group Size (Horizontal Scaling) ---")
+    # --- Replication group / topology size (horizontal scaling) ---
+    lines.append(f"\n--- {repl_label} Size (Horizontal Scaling) ---")
     prev_members = ""
     member_changes: list[str] = []
     for ts in timestamps:
@@ -387,38 +406,65 @@ def generate_summary(
                     lines.append(f"    ... ({len(ro_primary_periods) - 20} more)")
                     break
 
-    # --- GR Apply Queue (replication lag) ---
-    lines.append("\n--- GR Replication Queue (Transaction Lag) ---")
-    for pod in pods:
-        pod_rows = [r for r in rows if r.pod == pod]
-        queue_vals = []
-        applier_vals = []
-        for r in pod_rows:
-            try:
-                queue_vals.append(int(r.gr_queue))
-            except (ValueError, TypeError):
-                pass
-            try:
-                applier_vals.append(int(r.gr_applier_queue))
-            except (ValueError, TypeError):
-                pass
-        if queue_vals:
-            max_q = max(queue_vals)
-            max_a = max(applier_vals) if applier_vals else 0
-            lines.append(
-                f"  {pod}: cert_queue max={max_q} avg={sum(queue_vals)/len(queue_vals):.1f}"
-                f" | applier_queue max={max_a} avg={sum(applier_vals)/len(applier_vals):.1f}" if applier_vals else
-                f"  {pod}: cert_queue max={max_q} avg={sum(queue_vals)/len(queue_vals):.1f}"
-            )
-            # Flag high queue (potential lag during failover)
-            high_queue = [(r.timestamp, r.gr_queue) for r in pod_rows
-                          if r.gr_queue not in ("?", "") and r.gr_queue.isdigit() and int(r.gr_queue) > 100]
-            if high_queue:
-                lines.append(f"    HIGH QUEUE (>100 txns): {len(high_queue)} occurrence(s)")
-                for ts, q in high_queue[:5]:
-                    lines.append(f"      [{ts}] queue={q}")
-        else:
-            lines.append(f"  {pod}: no queue data")
+    # --- Replication lag ---
+    if is_async:
+        lines.append("\n--- Async Replication Lag (Seconds_Behind_Source) ---")
+        for pod in pods:
+            pod_rows = [r for r in rows if r.pod == pod]
+            lag_vals = []
+            for r in pod_rows:
+                try:
+                    lag_vals.append(int(r.gr_queue))
+                except (ValueError, TypeError):
+                    pass
+            if lag_vals:
+                max_lag = max(lag_vals)
+                lines.append(
+                    f"  {pod}: lag_s max={max_lag} avg={sum(lag_vals)/len(lag_vals):.1f}"
+                )
+                high_lag = [
+                    (r.timestamp, r.gr_queue) for r in pod_rows
+                    if r.gr_queue not in ("?", "") and str(r.gr_queue).isdigit()
+                    and int(r.gr_queue) > 10
+                ]
+                if high_lag:
+                    lines.append(f"    HIGH LAG (>10s): {len(high_lag)} occurrence(s)")
+                    for ts, q in high_lag[:5]:
+                        lines.append(f"      [{ts}] behind={q}s")
+            else:
+                lines.append(f"  {pod}: no lag data")
+    else:
+        lines.append("\n--- GR Replication Queue (Transaction Lag) ---")
+        for pod in pods:
+            pod_rows = [r for r in rows if r.pod == pod]
+            queue_vals = []
+            applier_vals = []
+            for r in pod_rows:
+                try:
+                    queue_vals.append(int(r.gr_queue))
+                except (ValueError, TypeError):
+                    pass
+                try:
+                    applier_vals.append(int(r.gr_applier_queue))
+                except (ValueError, TypeError):
+                    pass
+            if queue_vals:
+                max_q = max(queue_vals)
+                max_a = max(applier_vals) if applier_vals else 0
+                lines.append(
+                    f"  {pod}: cert_queue max={max_q} avg={sum(queue_vals)/len(queue_vals):.1f}"
+                    f" | applier_queue max={max_a} avg={sum(applier_vals)/len(applier_vals):.1f}" if applier_vals else
+                    f"  {pod}: cert_queue max={max_q} avg={sum(queue_vals)/len(queue_vals):.1f}"
+                )
+                # Flag high queue (potential lag during failover)
+                high_queue = [(r.timestamp, r.gr_queue) for r in pod_rows
+                              if r.gr_queue not in ("?", "") and r.gr_queue.isdigit() and int(r.gr_queue) > 100]
+                if high_queue:
+                    lines.append(f"    HIGH QUEUE (>100 txns): {len(high_queue)} occurrence(s)")
+                    for ts, q in high_queue[:5]:
+                        lines.append(f"      [{ts}] queue={q}")
+            else:
+                lines.append(f"  {pod}: no queue data")
 
     # --- HAProxy / Router Pod State ---
     if haproxy_rows:
@@ -510,7 +556,8 @@ def generate_summary(
     # --- Monitor log highlights ---
     highlights = [l for l in log_lines if any(kw in l for kw in
                   ("FAILOVER", "NODE CHANGE", "ERROR", "Initial primary",
-                   "ENDPOINT CHANGE", "READ_ONLY on PRIMARY", "K8S_EVENT"))]
+                   "ENDPOINT CHANGE", "READ_ONLY on PRIMARY", "K8S_EVENT",
+                   "replication mode"))]
     if highlights:
         lines.append("\n--- Key Log Messages ---")
         for h in highlights:
@@ -536,12 +583,14 @@ def main() -> int:
     haproxy_rows = load_haproxy_tsv(src / "haproxy_monitor.tsv")
     endpoint_rows = load_endpoints_tsv(src / "endpoints_monitor.tsv")
     event_rows = load_events_tsv(src / "k8s_events.tsv")
+    replication_mode = load_replication_mode(src)
 
     summary = generate_summary(
         rows, log_lines,
         haproxy_rows=haproxy_rows or None,
         endpoint_rows=endpoint_rows or None,
         event_rows=event_rows or None,
+        replication_mode=replication_mode,
     )
     (out / "k8s_analysis_summary.txt").write_text(summary, encoding="utf-8")
     print(summary)

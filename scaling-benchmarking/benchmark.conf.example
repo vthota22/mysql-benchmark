@@ -95,8 +95,10 @@ SCALE_POLL_TIMEOUT_SEC=1800
 # ===========================================================================
 # --- K8s pod monitoring (optional, observation only) ---
 # When K8S_KUBECONFIG is set, a background monitor tracks MySQL pod state,
-# replication status (Group Replication or Galera), primary failover,
-# K8s events, and node changes throughout the entire TPC-C run.
+# replication status (Group Replication, async source/replica, or Galera),
+# primary failover, K8s events, and node changes throughout the entire TPC-C run.
+# Mode is detected dynamically per cluster (see replication_mode.txt in the
+# monitor output). Async-specific queries only run for async topologies.
 # Supports both Percona Server for MySQL (ps) and Percona XtraDB Cluster (pxc).
 # The CRD type is auto-detected. Scaling is still triggered via doctl above.
 # Leave K8S_KUBECONFIG empty to disable pod monitoring.

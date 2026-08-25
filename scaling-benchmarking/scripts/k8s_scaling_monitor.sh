@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # Background Kubernetes monitor for Percona MySQL scaling events.
 #
+# Replication mode is detected dynamically (written to replication_mode.txt):
+#   gr      — Group Replication (performance_schema.replication_group_members)
+#   async   — classic/async source→replica (SHOW REPLICA STATUS / PFS channels)
+#   galera  — PXC / wsrep
+#   unknown — single-node or not yet classified (uses read_only role fallback)
+# Async-specific SQL only runs when mode is async/unknown; GR clusters unchanged.
+#
 # Tracks per poll cycle:
-#   1. GR role: which pod is PRIMARY, which are SECONDARY
-#   2. Pod state: phase, ready, GR member state (ONLINE/RECOVERING/ERROR)
+#   1. Role: which pod is PRIMARY, which are SECONDARY (GR / async / Galera)
+#   2. Pod state: phase, ready, member state (ONLINE/RECOVERING/ERROR[/Synced])
 #   3. DOKS node binding: which K8s worker node + slug each pod runs on
-#   4. gr_detail: error reason when GR state is not ONLINE
+#   4. gr_detail: error / lag reason when state is not ONLINE
 #   5. read_only / super_read_only per pod (failover detection)
-#   6. GR apply queue and transactions behind (replication lag)
+#   6. Replication lag (GR apply queue, or async Seconds_Behind_Source)
 #   7. replica_parallel_workers (configured) and active applier workers per pod
 #   8. HAProxy/router pod state (phase, ready, backend routing)
 #   9. K8s service endpoint changes (when HAProxy detects new primary)
@@ -21,6 +28,7 @@
 #   k8s_events.tsv         — namespace events log
 #   pods_watch.log         — live kubectl get pods -o wide -w stream (timestamped)
 #   k8s_monitor.log        — key events (failovers, changes)
+#   replication_mode.txt   — detected mode: gr | async | galera | unknown
 #
 # Usage (standalone):
 #   export KUBECONFIG=/path/to/kubeconfig
@@ -43,6 +51,8 @@ MYSQL_ROOT_USER="${PXC_MYSQL_ROOT_USER:-root}"
 CR_TYPE=""
 MYSQL_CONTAINER=""
 MYSQL_COMPONENT_LABEL=""
+# Detected at runtime: gr | async | galera | unknown
+REPL_MODE=""
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -189,6 +199,99 @@ mysql_in_pod() {
     mysql -u"${MYSQL_ROOT_USER}" -p"${password}" --skip-column-names "$@" 2>/dev/null
 }
 
+list_running_mysql_pods() {
+  kubectl_ns get pods \
+    -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=${MYSQL_COMPONENT_LABEL}" \
+    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true
+}
+
+# Persist + log replication mode (idempotent when unchanged).
+set_replication_mode() {
+  local mode="${1:?mode required}"
+  local prev="${REPL_MODE}"
+  REPL_MODE="${mode}"
+  echo "${REPL_MODE}" > "${OUTPUT_DIR}/replication_mode.txt"
+  if [[ "${prev}" != "${REPL_MODE}" ]]; then
+    log "replication mode: ${REPL_MODE}${prev:+ (was ${prev})}"
+  fi
+}
+
+# True when we should use async source/replica queries (not GR/Galera).
+use_async_repl_queries() {
+  [[ "${REPL_MODE}" == "async" || "${REPL_MODE}" == "unknown" ]]
+}
+
+# Detect GR vs async vs Galera. Sticky once GR/galera is confirmed so a
+# transient empty GR membership during recovery does not flip to async.
+detect_replication_mode() {
+  if [[ "${REPL_MODE}" == "gr" || "${REPL_MODE}" == "galera" ]]; then
+    return 0
+  fi
+
+  if [[ "${CR_TYPE}" == "pxc" ]]; then
+    set_replication_mode "galera"
+    return 0
+  fi
+
+  local password
+  password="$(get_mysql_password)"
+  if [[ -z "${password}" ]]; then
+    [[ -z "${REPL_MODE}" ]] && set_replication_mode "unknown"
+    return 0
+  fi
+
+  local running_pods
+  running_pods="$(list_running_mysql_pods)"
+  if [[ -z "${running_pods}" ]]; then
+    [[ -z "${REPL_MODE}" ]] && set_replication_mode "unknown"
+    return 0
+  fi
+
+  local saw_gr=0 saw_async=0 pod_count=0
+  local pod_name gr_n async_n
+
+  while IFS= read -r pod_name; do
+    [[ -z "${pod_name}" ]] && continue
+    pod_count=$((pod_count + 1))
+
+    gr_n="$(mysql_in_pod "${pod_name}" "${password}" -e "
+      SELECT COUNT(*)
+        FROM performance_schema.replication_group_members
+       WHERE MEMBER_ID <> ''
+         AND MEMBER_STATE NOT IN ('', 'OFFLINE');
+    " 2>/dev/null | tr -d '[:space:]')" || gr_n="0"
+
+    if [[ "${gr_n}" =~ ^[1-9][0-9]*$ ]]; then
+      saw_gr=1
+      break
+    fi
+
+    async_n="$(mysql_in_pod "${pod_name}" "${password}" -e "
+      SELECT COUNT(*)
+        FROM performance_schema.replication_connection_status
+       WHERE CHANNEL_NAME NOT LIKE 'group_replication%';
+    " 2>/dev/null | tr -d '[:space:]')" || async_n="0"
+
+    if [[ "${async_n}" =~ ^[1-9][0-9]*$ ]]; then
+      saw_async=1
+    fi
+  done <<< "${running_pods}"
+
+  if [[ "${saw_gr}" -eq 1 ]]; then
+    set_replication_mode "gr"
+  elif [[ "${saw_async}" -eq 1 ]]; then
+    set_replication_mode "async"
+  elif [[ "${REPL_MODE}" == "async" ]]; then
+    # Keep async once observed (replica channel can flap during scale).
+    return 0
+  elif [[ "${pod_count}" -gt 1 ]]; then
+    # Multi-pod PS without GR membership → treat as async topology.
+    set_replication_mode "async"
+  else
+    set_replication_mode "unknown"
+  fi
+}
+
 # ── Node info cache ────────────────────────────────────────────────────────
 # Writes TSV to NODE_TMP: node_name \t slug \t cpu \t mem_gib
 # Refreshed every 6 cycles (~30s); new nodes trigger an immediate refresh.
@@ -278,20 +381,23 @@ pvc_lookup() {
   fi
 }
 
-# ── GR member info via a single query from one reachable pod ───────────────
+# ── Member info (GR / async / Galera) ──────────────────────────────────────
 # Writes TSV to GR_TMP: short_hostname \t role \t state \t detail
-# One kubectl-exec instead of N.
 refresh_gr_info() {
   : > "${GR_TMP}"
+  : > "${GR_COUNTS_TMP}"
 
   local password
   password="$(get_mysql_password)"
   [[ -z "${password}" ]] && return
 
+  if use_async_repl_queries; then
+    refresh_async_member_info "${password}"
+    return
+  fi
+
   local running_pods
-  running_pods="$(kubectl_ns get pods \
-    -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=${MYSQL_COMPONENT_LABEL}" \
-    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)" || {
+  running_pods="$(list_running_mysql_pods)" || {
     log "WARN: refresh_gr_info: failed to list running pods"
     return 0
   }
@@ -338,7 +444,12 @@ refresh_gr_info() {
   done <<< "${running_pods}"
 
   if [[ -z "${gr_raw}" ]]; then
-    log "WARN: could not query GR from any pod"
+    # GR path empty — re-detect; may flip multi-pod PS to async next poll.
+    if [[ "${REPL_MODE}" == "gr" ]]; then
+      log "WARN: could not query GR from any pod"
+    else
+      log "WARN: could not query replication membership from any pod (mode=${REPL_MODE:-unset})"
+    fi
     return
   fi
 
@@ -350,11 +461,100 @@ refresh_gr_info() {
     printf '%s\t%s\t%s\t%s\n' "${host}" "${role}" "${state}" "${detail}"
   done > "${GR_TMP}"
 
-  # Count members and online members from GR_TMP
   if [[ -s "${GR_TMP}" ]]; then
     total="$(wc -l < "${GR_TMP}" | tr -d ' ')"
     online="$(grep -c '	ONLINE	\|	Synced	' "${GR_TMP}" 2>/dev/null || echo 0)"
   fi
+  echo "${total}	${online}" > "${GR_COUNTS_TMP}"
+}
+
+# Async / unknown: per-pod role from read_only + SHOW REPLICA STATUS.
+# Only used when use_async_repl_queries is true.
+refresh_async_member_info() {
+  local password="${1:?password required}"
+  local running_pods
+  running_pods="$(list_running_mysql_pods)" || {
+    log "WARN: refresh_async_member_info: failed to list running pods"
+    return 0
+  }
+
+  local total=0 online=0
+  : > "${GR_TMP}"
+
+  while IFS= read -r pod_name; do
+    [[ -z "${pod_name}" ]] && continue
+
+    local base_raw
+    base_raw="$(mysql_in_pod "${pod_name}" "${password}" -e "
+      SELECT SUBSTRING_INDEX(@@hostname, '.', 1), @@read_only, @@super_read_only;
+    " 2>/dev/null)" || continue
+
+    local host ro sro
+    IFS=$'\t' read -r host ro sro <<< "${base_raw}"
+    [[ -z "${host}" ]] && host="${pod_name}"
+
+    local role="SECONDARY" state="ONLINE" detail="-" behind=""
+    if [[ "${ro}" == "0" && "${sro}" == "0" ]]; then
+      role="PRIMARY"
+      state="ONLINE"
+      detail="-"
+    else
+      role="SECONDARY"
+      local replica_raw
+      # SHOW REPLICA STATUS\G — empty on source; populated on replicas.
+      replica_raw="$(mysql_in_pod "${pod_name}" "${password}" -e "SHOW REPLICA STATUS\G" 2>/dev/null)" || replica_raw=""
+
+      if [[ -z "${replica_raw}" ]]; then
+        state="RECOVERING"
+        detail="no_replica_status"
+      else
+        local io_running sql_running last_io_err last_sql_err
+        io_running="$(echo "${replica_raw}" | awk -F': ' '/^[[:space:]]*Replica_IO_Running:/{print $2; exit}')"
+        sql_running="$(echo "${replica_raw}" | awk -F': ' '/^[[:space:]]*Replica_SQL_Running:/{print $2; exit}')"
+        behind="$(echo "${replica_raw}" | awk -F': ' '/^[[:space:]]*Seconds_Behind_Source:/{print $2; exit}')"
+        last_io_err="$(echo "${replica_raw}" | awk -F': ' '/^[[:space:]]*Last_IO_Error:/{print $2; exit}')"
+        last_sql_err="$(echo "${replica_raw}" | awk -F': ' '/^[[:space:]]*Last_SQL_Error:/{print $2; exit}')"
+
+        # Compatibility with older "Slave_*" field names if present.
+        [[ -z "${io_running}" ]] && io_running="$(echo "${replica_raw}" | awk -F': ' '/^[[:space:]]*Slave_IO_Running:/{print $2; exit}')"
+        [[ -z "${sql_running}" ]] && sql_running="$(echo "${replica_raw}" | awk -F': ' '/^[[:space:]]*Slave_SQL_Running:/{print $2; exit}')"
+        [[ -z "${behind}" ]] && behind="$(echo "${replica_raw}" | awk -F': ' '/^[[:space:]]*Seconds_Behind_Master:/{print $2; exit}')"
+
+        behind="${behind//[[:space:]]/}"
+        [[ "${behind}" == "NULL" || -z "${behind}" ]] && behind=""
+
+        local err_bits=""
+        [[ -n "${last_io_err}" ]] && err_bits="${err_bits} io_err:${last_io_err}"
+        [[ -n "${last_sql_err}" ]] && err_bits="${err_bits} sql_err:${last_sql_err}"
+        err_bits="$(echo "${err_bits}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '\t\n\r' '___')"
+
+        if [[ "${io_running}" == "Yes" && "${sql_running}" == "Yes" ]]; then
+          state="ONLINE"
+          if [[ -n "${behind}" && "${behind}" != "0" ]]; then
+            detail="behind=${behind}s"
+          else
+            detail="-"
+          fi
+        elif [[ -n "${err_bits}" ]]; then
+          state="ERROR"
+          detail="${err_bits}"
+        elif [[ "${io_running}" == "Connecting" || "${sql_running}" == "Connecting" ]]; then
+          state="RECOVERING"
+          detail="io=${io_running:-?} sql=${sql_running:-?}"
+        else
+          state="RECOVERING"
+          detail="io=${io_running:-?} sql=${sql_running:-?}${behind:+ behind=${behind}s}"
+        fi
+      fi
+    fi
+
+    detail="$(echo "${detail}" | tr '\t\n\r' '___' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -z "${detail}" ]] && detail="-"
+    printf '%s\t%s\t%s\t%s\n' "${host}" "${role}" "${state}" "${detail}" >> "${GR_TMP}"
+    total=$((total + 1))
+    [[ "${state}" == "ONLINE" ]] && online=$((online + 1))
+  done <<< "${running_pods}"
+
   echo "${total}	${online}" > "${GR_COUNTS_TMP}"
 }
 
@@ -377,8 +577,9 @@ gr_lookup() {
 #   replica_parallel_workers \t replica_parallel_active
 #
 # replica_parallel_workers = @@GLOBAL.replica_parallel_workers (configured)
-# replica_parallel_active  = GR applier workers currently applying
-#   (APPLYING_TRANSACTION <> '', applier channel only)
+# replica_parallel_active  = applier workers currently applying
+#   GR: group_replication_applier channel
+#   async: non-GR channels only
 refresh_readonly_status() {
   : > "${READONLY_TMP}"
 
@@ -387,12 +588,23 @@ refresh_readonly_status() {
   [[ -z "${password}" ]] && return
 
   local running_pods
-  running_pods="$(kubectl_ns get pods \
-    -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=${MYSQL_COMPONENT_LABEL}" \
-    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)" || {
+  running_pods="$(list_running_mysql_pods)" || {
     log "WARN: refresh_readonly_status: failed to list running pods"
     return 0
   }
+
+  local active_sql
+  if use_async_repl_queries; then
+    active_sql="(SELECT COUNT(*)
+                FROM performance_schema.replication_applier_status_by_worker
+               WHERE CHANNEL_NAME NOT LIKE 'group_replication%'
+                 AND APPLYING_TRANSACTION <> '')"
+  else
+    active_sql="(SELECT COUNT(*)
+                FROM performance_schema.replication_applier_status_by_worker
+               WHERE CHANNEL_NAME = 'group_replication_applier'
+                 AND APPLYING_TRANSACTION <> '')"
+  fi
 
   while IFS= read -r pod_name; do
     [[ -z "${pod_name}" ]] && continue
@@ -402,10 +614,7 @@ refresh_readonly_status() {
              @@read_only,
              @@super_read_only,
              @@GLOBAL.replica_parallel_workers,
-             (SELECT COUNT(*)
-                FROM performance_schema.replication_applier_status_by_worker
-               WHERE CHANNEL_NAME = 'group_replication_applier'
-                 AND APPLYING_TRANSACTION <> '');
+             ${active_sql};
     " 2>/dev/null)" || continue
     echo "${ro_raw}" | while IFS=$'\t' read -r host ro sro rpw_cfg rpw_active; do
       [[ -z "${host}" ]] && continue
@@ -440,9 +649,10 @@ parallel_workers_lookup() {
   fi
 }
 
-# ── GR member stats (apply queue / transactions behind) ───────────────────
-# Writes TSV to GR_STATS_TMP: short_hostname \t count_transactions_in_queue \t
-#   count_transactions_remote_in_applier_queue \t count_transactions_checked
+# ── Replication lag stats ─────────────────────────────────────────────────
+# Writes TSV to GR_STATS_TMP: short_hostname \t queue \t applier_queue
+#   GR: COUNT_TRANSACTIONS_IN_QUEUE / REMOTE_IN_APPLIER_QUEUE
+#   async: Seconds_Behind_Source in queue column; applier_queue unused (0)
 refresh_gr_stats() {
   : > "${GR_STATS_TMP}"
 
@@ -450,10 +660,13 @@ refresh_gr_stats() {
   password="$(get_mysql_password)"
   [[ -z "${password}" ]] && return
 
+  if use_async_repl_queries; then
+    refresh_async_lag_stats "${password}"
+    return
+  fi
+
   local running_pods
-  running_pods="$(kubectl_ns get pods \
-    -l "app.kubernetes.io/instance=${CLUSTER_NAME},app.kubernetes.io/component=${MYSQL_COMPONENT_LABEL}" \
-    -o jsonpath='{range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\n"}{end}' 2>/dev/null)" || {
+  running_pods="$(list_running_mysql_pods)" || {
     log "WARN: refresh_gr_stats: failed to list running pods"
     return 0
   }
@@ -497,6 +710,37 @@ refresh_gr_stats() {
       printf '%s\t%s\t%s\n' "${host}" "${queue}" "${applier_queue}"
     done > "${GR_STATS_TMP}"
   fi
+}
+
+refresh_async_lag_stats() {
+  local password="${1:?password required}"
+  local running_pods
+  running_pods="$(list_running_mysql_pods)" || return 0
+
+  : > "${GR_STATS_TMP}"
+  while IFS= read -r pod_name; do
+    [[ -z "${pod_name}" ]] && continue
+
+    local host
+    host="$(mysql_in_pod "${pod_name}" "${password}" -e "
+      SELECT SUBSTRING_INDEX(@@hostname, '.', 1);
+    " 2>/dev/null | tr -d '[:space:]')" || continue
+    [[ -z "${host}" ]] && host="${pod_name}"
+
+    local replica_raw behind="0"
+    replica_raw="$(mysql_in_pod "${pod_name}" "${password}" -e "SHOW REPLICA STATUS\G" 2>/dev/null)" || replica_raw=""
+    if [[ -n "${replica_raw}" ]]; then
+      behind="$(echo "${replica_raw}" | awk -F': ' '/^[[:space:]]*Seconds_Behind_Source:/{print $2; exit}')"
+      [[ -z "${behind}" ]] && behind="$(echo "${replica_raw}" | awk -F': ' '/^[[:space:]]*Seconds_Behind_Master:/{print $2; exit}')"
+      behind="${behind//[[:space:]]/}"
+      if [[ -z "${behind}" || "${behind}" == "NULL" ]]; then
+        behind="0"
+      fi
+    fi
+
+    # queue = Seconds_Behind_Source; applier_queue unused for async (0)
+    printf '%s\t%s\t%s\n' "${host}" "${behind}" "0" >> "${GR_STATS_TMP}"
+  done <<< "${running_pods}"
 }
 
 # Lookup from GR_STATS_TMP: given a pod name, return "queue \t applier_queue"
@@ -759,6 +1003,8 @@ poll_once() {
   ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   maybe_refresh_nodes || true
+  # Re-detect until sticky GR/galera; allows unknown→async and async→gr.
+  detect_replication_mode || true
   refresh_gr_info || true
   refresh_readonly_status || true
   refresh_gr_stats || true
@@ -980,7 +1226,7 @@ shutdown() {
   kubectl_ns get endpoints -l "app.kubernetes.io/instance=${CLUSTER_NAME}" -o wide \
     > "${OUTPUT_DIR}/endpoints_final.txt" 2>/dev/null || true
   rm -f "${GR_TMP}" "${GR_STATS_TMP}" "${READONLY_TMP}" "${NODE_TMP}" "${PVC_TMP}" "${GR_COUNTS_TMP}" "${LAST_EVENT_TS_FILE:-}"
-  log "final state saved — exiting"
+  log "final state saved — exiting (replication_mode=${REPL_MODE:-unset})"
   exit 0
 }
 trap shutdown SIGTERM SIGINT
@@ -1003,6 +1249,9 @@ main() {
     ensure_cluster_connected
   done
   log "CLUSTER=${CLUSTER_NAME} CR_TYPE=${CR_TYPE} CONTAINER=${MYSQL_CONTAINER}"
+
+  detect_replication_mode || true
+  log "REPL_MODE=${REPL_MODE:-unset}"
 
   capture_baseline
 
