@@ -15,13 +15,13 @@
 #
 # Each droplet uses its own gitignored benchmark.conf (same as the control UI).
 
-name: Failover Benchmark (every 3h)
+name: Failover Benchmark (daily)
 
 on:
   schedule:
-    # Every 3 hours (UTC). A full failover run can approach the 180m job timeout;
+    # Once per day (06:00 UTC). A full failover run can approach the 180m job timeout;
     # per-droplet concurrency waits rather than cancelling in-progress jobs.
-    - cron: "0 */3 * * *"
+    - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       git_branch:

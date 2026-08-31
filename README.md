@@ -64,7 +64,7 @@ GitHub Actions (cron / workflow_dispatch)
 
 | Workflow | File | Schedule | CI script | Notes |
 |----------|------|----------|-----------|--------|
-| Failover Benchmark (every 3h) | `.github/workflows/failover-benchmark-daily.yml` | `0 */3 * * *` (+ manual) | `scripts/ci_failover_benchmark.sh` | Live |
+| Failover Benchmark (daily) | `.github/workflows/failover-benchmark-daily.yml` | `0 6 * * *` (+ manual) | `scripts/ci_failover_benchmark.sh` | Live |
 | Backup Benchmark (every 3h) | `.github/workflows/backup-benchmark-daily.yml` | `0 */3 * * *` (+ manual) | `scripts/ci_backup_benchmark.sh` | Stub (exits 0) |
 | Scaling Benchmark (every 3h) | `.github/workflows/scaling-benchmark-daily.yml` | `0 */3 * * *` (+ manual) | `scripts/ci_scaling_benchmark.sh` | Stub (exits 0) |
 
