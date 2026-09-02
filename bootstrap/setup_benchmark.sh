@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-time setup for MySQL benchmarking on Ubuntu DO droplet
-# Installs: sysbench 1.1+, sysbench-tpcc, mysql client, build deps
+# Installs: sysbench 1.1+, sysbench-tpcc, mysql client, doctl, kubectl, build deps
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -8,6 +8,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PREFIX="${SYSBENCH_PREFIX:-${REPO_ROOT}/sysbench-1.1}"
 TPCC_DIR="${TPCC_DIR:-${REPO_ROOT}/TPCC/sysbench-tpcc}"
 JOBS="${JOBS:-$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
+DOCTL_VERSION="${DOCTL_VERSION:-1.118.0}"
 
 echo "=== MySQL Benchmark Setup ==="
 echo "Repo root:  ${REPO_ROOT}"
@@ -34,7 +35,7 @@ install_deps_linux() {
   echo "--- Installing build dependencies (apt) ---"
   sudo apt-get update -qq
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    git build-essential autoconf automake libtool pkg-config \
+    git curl build-essential autoconf automake libtool pkg-config \
     libmysqlclient-dev libssl-dev luajit libluajit-5.1-dev \
     mysql-client openssl ca-certificates
 }
@@ -48,6 +49,74 @@ install_deps_macos() {
   if [[ ${#missing[@]} -gt 0 ]]; then
     brew install automake libtool pkgconf autoconf luajit openssl mysql-client
   fi
+}
+
+doctl_arch_suffix() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *)
+      echo "ERROR: unsupported architecture for doctl: $(uname -m)" >&2
+      return 1
+      ;;
+  esac
+}
+
+install_doctl() {
+  if command -v doctl >/dev/null 2>&1; then
+    echo "--- doctl already installed: $(doctl version) ---"
+    return 0
+  fi
+
+  echo "--- Installing doctl ${DOCTL_VERSION} ---"
+  case "${OS}" in
+    ubuntu|debian|linux)
+      local arch suffix tmpdir
+      arch="$(doctl_arch_suffix)"
+      suffix="linux-${arch}"
+      tmpdir="$(mktemp -d)"
+      curl -fsSL \
+        "https://github.com/digitalocean/doctl/releases/download/v${DOCTL_VERSION}/doctl-${DOCTL_VERSION}-${suffix}.tar.gz" \
+        -o "${tmpdir}/doctl.tar.gz"
+      tar -xzf "${tmpdir}/doctl.tar.gz" -C "${tmpdir}"
+      sudo install -m 755 "${tmpdir}/doctl" /usr/local/bin/doctl
+      rm -rf "${tmpdir}"
+      ;;
+    macos)
+      brew install doctl
+      ;;
+    *)
+      echo "WARNING: skipping doctl install on unknown OS '${OS}'"
+      return 0
+      ;;
+  esac
+
+  doctl version
+}
+
+install_kubectl() {
+  echo "--- Installing kubectl (for K8s pod monitoring) ---"
+  if command -v kubectl >/dev/null 2>&1; then
+    echo "kubectl already installed: $(kubectl version --client --short 2>/dev/null || kubectl version --client 2>&1 | head -1)"
+    return 0
+  fi
+  case "${OS}" in
+    ubuntu|debian|linux)
+      local kube_arch
+      kube_arch="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
+      curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${kube_arch}/kubectl"
+      sudo install -m 755 /tmp/kubectl /usr/local/bin/kubectl
+      rm -f /tmp/kubectl
+      ;;
+    macos)
+      brew install kubectl
+      ;;
+    *)
+      echo "WARNING: skipping kubectl install on unknown OS '${OS}'"
+      return 0
+      ;;
+  esac
+  command -v kubectl >/dev/null 2>&1 && echo "kubectl installed: $(kubectl version --client 2>&1 | head -1)" || echo "WARNING: kubectl install failed (K8s monitoring will be disabled)"
 }
 
 case "${OS}" in
@@ -97,12 +166,38 @@ echo "--- Patching sysbench-tpcc skip-warehouse sampling ---"
 "${SCRIPT_DIR}/patch_tpcc_read_heavy.sh" "${TPCC_DIR}"
 "${SCRIPT_DIR}/patch_tpcc_read_heavy_fat.sh" "${TPCC_DIR}"
 
+# Scaling-branch patches (also under scripts/ after merge)
+if [[ -x "${REPO_ROOT}/scripts/patch_tpcc_failover.sh" ]]; then
+  echo ""
+  echo "--- Patching sysbench-tpcc for failover (scripts/patch_tpcc_failover.sh) ---"
+  "${REPO_ROOT}/scripts/patch_tpcc_failover.sh" "${TPCC_DIR}"
+fi
+if [[ -x "${REPO_ROOT}/scripts/patch_tpcc_prepare_commit.sh" ]]; then
+  echo ""
+  echo "--- Patching sysbench-tpcc prepare COMMIT ---"
+  "${REPO_ROOT}/scripts/patch_tpcc_prepare_commit.sh" "${TPCC_DIR}"
+fi
+if [[ -x "${REPO_ROOT}/scripts/patch_tpcc_reconnect.sh" ]]; then
+  echo ""
+  echo "--- Patching sysbench-tpcc for --reconnect ---"
+  "${REPO_ROOT}/scripts/patch_tpcc_reconnect.sh" "${TPCC_DIR}"
+fi
+
+echo ""
+install_doctl
+
+echo ""
+install_kubectl
+
 echo ""
 echo "--- Verification ---"
 export PATH="${PREFIX}/bin:${PATH}"
 sysbench --version
 echo ""
 sysbench --help 2>&1 | grep -E 'mysql-ssl|mysql-host' | head -5 || true
+echo ""
+command -v doctl >/dev/null 2>&1 && doctl version || echo "doctl: not installed"
+command -v kubectl >/dev/null 2>&1 && echo "kubectl: $(kubectl version --client 2>&1 | head -1)" || echo "kubectl: not installed (K8s monitoring disabled)"
 echo ""
 ls -la "${TPCC_DIR}/tpcc.lua"
 
@@ -113,5 +208,7 @@ echo "Next steps:"
 echo "  1. cp ${REPO_ROOT}/benchmark.conf.example ${REPO_ROOT}/benchmark.conf"
 echo "  2. Edit benchmark.conf with DB credentials"
 echo "  3. export PATH=\"${PREFIX}/bin:\$PATH\""
-echo "  4. ${REPO_ROOT}/run_failover_benchmark.sh"
+echo "  4. Failover: ${REPO_ROOT}/run_failover_benchmark.sh"
+echo "  5. Scaling:  cp ${REPO_ROOT}/scaling-benchmarking/benchmark.conf.example ${REPO_ROOT}/scaling-benchmarking/benchmark.conf"
+echo "     then: cd ${REPO_ROOT}/scaling-benchmarking && ./run_benchmark.sh"
 echo ""

@@ -1,0 +1,165 @@
+# scaling-benchmarking — sysbench TPC-C under load while scaling
+# Copy and edit:
+#   cp benchmark.conf.example benchmark.conf
+
+# MySQL engine edition for this run (standard or advanced).
+ENGINE="advanced"
+
+# --- Cluster ID ---
+# Required. Used for scaling trigger and to auto-fetch connection details + initial state.
+CLUSTER_ID="your-cluster-uuid"
+
+# --- MySQL connection ---
+# Port/user/password are auto-fetched from doctl when CLUSTER_ID + DO_API_TOKEN are set.
+# MYSQL_HOST is also fetched from doctl unless OVERRIDE_MYSQL_HOST is set.
+MYSQL_HOST=""
+MYSQL_PORT=""
+MYSQL_USER=""
+MYSQL_PASSWORD=""
+MYSQL_DB="sbtest_tpcc"
+
+# Optional: force a specific MySQL host (e.g. HAProxy VIP or primary pod IP).
+# When non-empty, wins over MYSQL_HOST and the doctl host; written to MYSQL_HOST.
+OVERRIDE_MYSQL_HOST=""
+
+# --- Sysbench TPC-C ---
+TPCC_SCALE=10
+TPCC_TABLES=10
+TPCC_THREADS=16
+# Parallelism for prepare/cleanup (default 16, independent of TPCC_THREADS).
+TPCC_PREP_THREADS=16
+# Parallelism for tpcc check when SKIP_PREPARE=1 (defaults to TPCC_PREP_THREADS).
+TPCC_CHECK_THREADS=
+TPCC_WARMUP_SEC=30
+TPCC_REPORT_INTERVAL=1
+TPCC_FORCE_PK=1
+TPCC_TRX_LEVEL=RR
+# Latency percentile reported by sysbench (default 99 = p99). Set to 95 for p95.
+TPCC_PERCENTILE=99
+
+# Survive resize/failover and TPC-C lock contention without FATAL thread exit (run phase only).
+# Resize/failover: 1290/1836=read-only, 1053=shutdown, 2006/2013/2055/2011=connection loss, 3100=repl hook
+# TPC-C contention (sysbench defaults): 1205=lock wait, 1213=deadlock, 1020=record changed
+TPCC_IGNORE_ERRORS="1290,1836,1053,2013,2006,2055,2011,3100,1205,1213,1020,4094"
+# Sysbench --verbosity {0=critical only, 3=notice (sysbench default), 5=debug}.
+# Empty = do not pass --verbosity. Set to 5 to log ignored TPCC_IGNORE_ERRORS
+# codes (e.g. "Ignoring error 1213 Deadlock found..."). Debug is very noisy.
+TPCC_VERBOSITY=5
+
+# Reconnect after every N TPC-C events per thread (sysbench --reconnect).
+# 0 = disabled (default). Example: 1000 means each thread closes and re-opens
+# its MySQL connection after every 1000 transactions.
+TPCC_RECONNECT=0
+
+# 1 = skip prepare when TPC-C tables already exist; 0 = drop DB and reload dataset
+# When SKIP_PREPARE=1, phase 1 runs tpcc check with TPCC_CHECK_THREADS (or TPCC_PREP_THREADS);
+# the run phase still uses TPCC_THREADS below.
+SKIP_PREPARE=0
+# 1 = with SKIP_PREPARE=1, only verify table names exist (skip slow per-warehouse consistency check)
+SKIP_TPCC_CHECK=0
+
+# Total TPC-C run duration (seconds, including warmup). Workload is independent of scaling.
+TPCC_MAX_TIME=3600
+
+# 1 = run TPC-C only (no cluster resize, no DO API auth); 0 = trigger scaling mid-run
+SKIP_SCALING=0
+
+# --- Initial cluster state (pre-scaling baseline) ---
+# Recorded in logs/CSVs for before-vs-after comparison.
+# Leave empty to auto-fetch from doctl using CLUSTER_ID + DO_API_TOKEN.
+INITIAL_SIZE=""
+INITIAL_NUM_NODES=""
+INITIAL_STORAGE_SIZE_GIB=""
+
+# --- DO API ---
+# Create DO_API_TOKEN at https://cloud.digitalocean.com/account/api/tokens (read+write).
+# Verify: doctl -u https://api.digitalocean.com -t "$DO_API_TOKEN" databases get "$CLUSTER_ID"
+DO_API_TOKEN=""
+DO_API_URL="https://api.digitalocean.com"
+
+# --- Scaling trigger ---
+# Ignored when SKIP_SCALING=1 (SCALE_TARGET_SIZE, DO_API_TOKEN not required).
+# Seconds after TPC-C run starts (including warmup) before cluster resize fires.
+SCALE_TRIGGER_DELAY=180
+
+# SCALE_TARGET_SIZE must be a valid slug (e.g. gd-8vcpu-32gb for MySQL).
+# Validate slugs: doctl -u "$DO_API_URL" -t "$DO_API_TOKEN" databases options slugs --engine mysql
+# Leave SCALE_NUM_NODES empty to keep current node count.
+# Leave SCALE_STORAGE_SIZE_GIB empty to skip storage resize.
+SCALE_TARGET_SIZE="gd-8vcpu-32gb"
+SCALE_NUM_NODES=""
+SCALE_STORAGE_SIZE_GIB=""
+SCALE_POLL_INTERVAL_SEC=10
+SCALE_POLL_TIMEOUT_SEC=1800
+
+# ===========================================================================
+# --- K8s pod monitoring (optional, observation only) ---
+# When K8S_KUBECONFIG is set, a background monitor tracks MySQL pod state,
+# replication status (Group Replication, async source/replica, or Galera),
+# primary failover, K8s events, and node changes throughout the entire TPC-C run.
+# Mode is detected dynamically per cluster (see replication_mode.txt in the
+# monitor output). Async-specific queries only run for async topologies.
+# Supports both Percona Server for MySQL (ps) and Percona XtraDB Cluster (pxc).
+# The CRD type is auto-detected. Scaling is still triggered via doctl above.
+# Leave K8S_KUBECONFIG empty to disable pod monitoring.
+# ===========================================================================
+
+# Path to kubeconfig for the Percona MySQL cluster.
+# /root/mysql-benchmark/scaling-benchmarking/kubeconfig/{FILE_NAME}
+K8S_KUBECONFIG=""
+
+# Kubernetes namespace where the MySQL cluster runs.
+K8S_NAMESPACE="percona"
+
+# Cluster CR name (auto-detected from namespace if empty).
+# Works with both PerconaServerMySQL (ps) and PerconaXtraDBCluster (pxc).
+PXC_CLUSTER_NAME=""
+
+# MySQL root credentials inside the MySQL pods (for replication status queries).
+# If empty, the monitor reads from the cluster secrets (<cluster>-secrets).
+PXC_MYSQL_ROOT_USER="root"
+PXC_MYSQL_ROOT_PASSWORD=""
+PXC_MYSQL_ROOT_SECRET=""
+
+# Monitor poll interval (seconds).
+K8S_MONITOR_POLL_SEC=5
+
+# --- Group Replication tuning (optional, requires K8S_KUBECONFIG) ---
+# Applied via kubectl exec on every MySQL pod. Leave empty to skip.
+#
+# WITHOUT_SCALING_* — applied before the TPC-C workload starts (always).
+# DURING_SCALING_*  — applied just before the scaling trigger fires,
+#                     then restored to WITHOUT_SCALING_* values after scaling completes.
+# Only non-empty values are applied; if all are empty, the step is skipped entirely.
+
+# --- Before workload (without scaling) ---
+WITHOUT_SCALING_GR_EXIT_STATE_ACTION=""
+WITHOUT_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD=""
+WITHOUT_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD=""
+WITHOUT_SCALING_GR_FLOW_CONTROL_HOLD_PERCENT=""
+
+# --- During scaling ---
+DURING_SCALING_GR_EXIT_STATE_ACTION=""
+DURING_SCALING_GR_FLOW_CONTROL_APPLIER_THRESHOLD=""
+DURING_SCALING_GR_FLOW_CONTROL_CERTIFIER_THRESHOLD=""
+DURING_SCALING_GR_FLOW_CONTROL_HOLD_PERCENT=""
+
+# Applied once before workload on all pods (not tied to scaling phase). Leave empty to skip.
+GR_REPLICA_PARALLEL_WORKERS=""
+
+# --- Write-loss / write-latency canary ---
+# Background INSERT into test_writes every WRITE_PROBE_INTERVAL_SEC while TPC-C runs.
+# seq = 1,2,3...; sent_at = client clock when the INSERT was fired;
+# created_at = MySQL CURRENT_TIMESTAMP(6) when the row was written.
+# After the run, compare write_probe/test_writes_attempts.csv (what was sent)
+# against write_probe/test_writes.csv (what committed).
+# 1 = enabled (default); 0 = skip.
+WRITE_PROBE_ENABLED=1
+WRITE_PROBE_INTERVAL_SEC=0.25
+# Seconds to wait for one INSERT before recording a timeout and moving on.
+# Keep this short so a blocked primary-switch (errno 4094) does not stall the canary.
+WRITE_PROBE_TIMEOUT_SEC=8
+
+# --- Output ---
+# Each run creates results/run_YYYYMMDD_HHMMSS_<engine>/ with all logs, CSVs, and a copy of benchmark.conf.
+RESULTS_DIR="results"

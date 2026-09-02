@@ -23,6 +23,27 @@ ui/control/.report_cache/
 .matplotlib_cache/
 .write-test
 foo
+scripts/.venv/
+data/
+secrets/
+sca
+
+# Scaling / backup local artifacts
+scaling-benchmarking/scripts/.venv/
+scaling-benchmarking/benchmark.conf
+scaling-benchmarking/results/
+scaling-benchmarking/reports/
+scaling-benchmarking/reports2/
+scaling-benchmarking/logs/
+scaling-benchmarking/combine_reports.py
+scaling-benchmarking/adv_mysql_backup_and_scaling_2026-06-23.html
+scaling-benchmarking/scripts/download_results.sh
+scaling-benchmarking/scripts/enable_pmm.sh
+scaling-benchmarking/scripts/fetch_temporal_workflow_history.py
+scaling-benchmarking/scripts/upload_kubeconfig.sh
+backup-benchmarking/benchmark.conf
+backup-benchmarking/results/
+backup-benchmarking/reports/
 
 # Local secrets / one-off artifacts (never commit)
 kubeconfig-*
