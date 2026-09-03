@@ -720,7 +720,10 @@ def make_handler(server: ControlServer):
                 if path == "/api/health":
                     qs = parse_qs(parsed.query)
                     host = (qs.get("host") or [""])[0]
-                    backend, _, droplet = server._resolve_report_target(host)
+                    feature = _parse_feature((qs.get("feature") or ["failover"])[0])
+                    backend, _, droplet = server._resolve_report_target(
+                        host, feature=feature
+                    )
                     ok, message = backend.test_connection()
                     self._send_json(
                         {
@@ -728,18 +731,21 @@ def make_handler(server: ControlServer):
                             "message": message,
                             "host": droplet.host,
                             "droplet_name": droplet.name or droplet.host,
+                            "feature": feature,
                         }
                     )
                     return
                 if path == "/api/schema":
                     qs = parse_qs(parsed.query)
                     host = (qs.get("host") or [""])[0]
-                    _, _, droplet = server._resolve_report_target(host)
+                    feature = _parse_feature((qs.get("feature") or ["failover"])[0])
+                    _, _, droplet = server._resolve_report_target(host, feature=feature)
                     self._send_json(
                         {
                             "fields": _field_specs_json(FAILOVER_FIELDS),
                             "droplet": droplet.host,
                             "droplet_name": droplet.name or droplet.host,
+                            "feature": feature,
                         }
                     )
                     return

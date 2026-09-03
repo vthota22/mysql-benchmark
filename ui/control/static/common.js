@@ -166,7 +166,16 @@ const DropletContext = {
   },
 
   hostQuery(prefix = "") {
-    if (!this.host || this.host === this.defaultHost) {
+    if (!this.host) {
+      return "";
+    }
+    // For failover, omit host when it is the configured default (cleaner URLs).
+    // For backup/scaling, always send host — several APIs historically defaulted to
+    // the failover map when feature/host were missing, which showed the wrong droplet.
+    if (
+      this.host === this.defaultHost &&
+      (!FeatureContext.id || FeatureContext.id === "failover")
+    ) {
       return "";
     }
     const lead = prefix || (this.host.includes("?") ? "&" : "?");
