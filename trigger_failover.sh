@@ -461,7 +461,15 @@ EOF
   fi
 
   # Resolve running containerd task for this pod's mysql container.
-  task_id="$("${kubectl[@]}" -n "${ns}" exec -i "${helper}" -- chroot /host /bin/bash -s -- "${pod}" "${container}" <<'FINDTASK'
+  # Retry: ctr task list can be briefly empty right after helper pod Ready on DO nodes.
+  local task_id="" find_attempt=1 find_max=10 find_sleep=2
+  while [[ -z "${task_id}" && "${find_attempt}" -le "${find_max}" ]]; do
+    if [[ "${find_attempt}" -gt 1 ]]; then
+      echo "Retry ${find_attempt}/${find_max}: resolving containerd task for ${pod}/${container}..." \
+        | tee -a "${TRIGGER_LOG}"
+      sleep "${find_sleep}"
+    fi
+    task_id="$("${kubectl[@]}" -n "${ns}" exec -i "${helper}" -- chroot /host /bin/bash -s -- "${pod}" "${container}" <<'FINDTASK'
 set -euo pipefail
 pod="$1"
 cname="$2"
@@ -476,7 +484,9 @@ while read -r id; do
 done < <(ctr -n k8s.io containers ls -q 2>/dev/null)
 exit 1
 FINDTASK
-)"
+)" || task_id=""
+    find_attempt=$((find_attempt + 1))
+  done
 
   if [[ -z "${task_id}" ]]; then
     echo "ERROR: could not find running containerd task for ${pod}/${container}" \
